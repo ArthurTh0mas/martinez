@@ -27,17 +27,9 @@ async fn main() -> anyhow::Result<()> {
                 &chaindata,
                 &martinez::tables::TABLE_MAP,
             )?;
-            let mut sizes = table_sizes(&env.begin_ro_txn()?)?
-                .into_iter()
-                .collect::<Vec<_>>();
-            sizes.sort_by_key(|(_, size)| *size);
-            for (table, size) in &sizes {
-                println!("{} - {}", table, bytesize::ByteSize::b(*size));
+            for (table, size) in table_sizes(&env.begin_ro_txn()?)? {
+                println!("{} - {}", table, size);
             }
-            println!(
-                "TOTAL: {}",
-                bytesize::ByteSize::b(sizes.into_iter().map(|(_, size)| size).sum())
-            );
         }
     }
 
