@@ -1,39 +1,35 @@
 pub mod stage;
 pub mod stages;
-pub mod unwind;
 
 use self::stage::{Stage, StageInput, UnwindInput};
 use crate::{kv::traits::MutableKV, stagedsync::stage::ExecOutput, MutableTransaction};
-use async_trait::async_trait;
-use futures_core::Future;
 use tracing::*;
 
-#[async_trait]
-pub trait SyncActivator: 'static {
-    async fn wait(&self);
+/// Staged synchronization framework
+///
+/// As the name suggests, the gist of this framework is splitting sync into logical _stages_ that are consecutively executed one after another.
+/// It is I/O intensive and even though we have a goal on being able to sync the node on an HDD, we still recommend using fast SSDs.
+///
+/// # How it works
+/// For each peer we learn what the HEAD block is and it executes each stage in order for the missing blocks between the local HEAD block and the peer's head block.
+/// The first stage (downloading headers) sets the local HEAD block.
+/// Each stage is executed in order and a stage N does not stop until the local head is reached for it.
+/// That means, that in the ideal scenario (no network interruptions, the app isn't restarted, etc), for the full initial sync, each stage will be executed exactly once.
+/// After the last stage is finished, the process starts from the beginning, by looking for the new headers to download.
+/// If the app is restarted in between stages, it restarts from the first stage. Absent new blocks, already completed stages are skipped.
+pub struct StagedSync<'db, DB: MutableKV> {
+    stages: Vec<Box<dyn Stage<'db, DB::MutableTx<'db>>>>,
 }
 
-#[async_trait]
-impl<F: Fn() -> Fut + Send + Sync + 'static, Fut: Future<Output = ()> + Send> SyncActivator for F {
-    async fn wait(&self) {
-        (self)().await
+impl<'db, DB: MutableKV> Default for StagedSync<'db, DB> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-pub struct StagedSync<'db, DB: MutableKV> {
-    stages: Vec<Box<dyn Stage<'db, DB::MutableTx<'db>>>>,
-    sync_activator: Box<dyn SyncActivator>,
-}
-
 impl<'db, DB: MutableKV> StagedSync<'db, DB> {
-    pub fn new<A>(sync_activator: A) -> Self
-    where
-        A: SyncActivator,
-    {
-        Self {
-            stages: Vec::new(),
-            sync_activator: Box::new(sync_activator),
-        }
+    pub fn new() -> Self {
+        Self { stages: Vec::new() }
     }
 
     pub fn push<S>(&mut self, stage: S)
@@ -48,9 +44,10 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
 
         let mut unwind_to = None;
         'run_loop: loop {
-            let mut tx = db.begin_mutable().await?;
+            let mut tx = Some(db.begin_mutable().await?);
 
             if let Some(to) = unwind_to.take() {
+                let mut tx = tx.unwrap();
                 for (stage_index, stage) in self.stages.iter().rev().enumerate() {
                     let stage_id = stage.id();
 
@@ -100,7 +97,6 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
             } else {
                 let mut previous_stage = None;
                 let mut timings = vec![];
-                info!("Starting staged sync");
                 for (stage_index, stage) in self.stages.iter().enumerate() {
                     let mut restarted = false;
 
@@ -108,18 +104,25 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
 
                     let start_time = std::time::Instant::now();
                     let done_progress = loop {
-                        let stage_progress = stage_id.get_progress(&tx).await?;
+                        let mut t = tx.take().unwrap();
 
-                        async fn run_stage<'db, Tx: MutableTransaction<'db>>(
-                            stage: &dyn Stage<'db, Tx>,
-                            tx: &mut Tx,
-                            input: StageInput,
-                        ) -> anyhow::Result<ExecOutput> {
-                            if !input.restarted {
+                        let stage_progress = stage_id.get_progress(&t).await?;
+
+                        let exec_output: anyhow::Result<_> = async {
+                            if !restarted {
                                 info!("RUNNING");
                             }
 
-                            let output = stage.execute(tx, input).await?;
+                            let output = stage
+                                .execute(
+                                    &mut t,
+                                    StageInput {
+                                        restarted,
+                                        previous_stage,
+                                        stage_progress,
+                                    },
+                                )
+                                .await?;
 
                             match &output {
                                 ExecOutput::Progress { done, .. } => {
@@ -134,16 +137,6 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
 
                             Ok(output)
                         }
-
-                        let exec_output = run_stage(
-                            stage,
-                            &mut tx,
-                            StageInput {
-                                restarted,
-                                previous_stage,
-                                stage_progress,
-                            },
-                        )
                         .instrument(span!(
                             Level::INFO,
                             "",
@@ -152,14 +145,23 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                             num_stages,
                             AsRef::<str>::as_ref(&stage.id())
                         ))
-                        .await?;
+                        .await;
 
-                        match exec_output {
+                        match exec_output? {
                             stage::ExecOutput::Progress {
                                 stage_progress,
                                 done,
+                                must_commit,
                             } => {
-                                stage_id.save_progress(&tx, stage_progress).await?;
+                                stage_id.save_progress(&t, stage_progress).await?;
+
+                                if must_commit {
+                                    t.commit().await?;
+                                    tx = Some(db.begin_mutable().await?);
+                                } else {
+                                    // Return tx object back
+                                    tx = Some(t);
+                                }
 
                                 if done {
                                     break stage_progress;
@@ -177,7 +179,7 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
 
                     previous_stage = Some((stage_id, done_progress))
                 }
-                tx.commit().await?;
+                tx.unwrap().commit().await?;
 
                 let t = timings
                     .into_iter()
@@ -185,8 +187,6 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                         format!("{} {}={}ms", acc, stage_id, time.as_millis())
                     });
                 info!("Staged sync complete.{}", t);
-
-                self.sync_activator.wait().await;
             }
         }
     }
