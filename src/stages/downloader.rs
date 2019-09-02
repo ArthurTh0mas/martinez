@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crate::{
     stagedsync::stage::{ExecOutput, Stage, StageInput},
-    MutableTransaction, StageId,
+    MutableTransaction, SyncStage,
 };
 use async_trait::async_trait;
 use rand::Rng;
@@ -12,13 +12,13 @@ use tracing::*;
 #[derive(Debug)]
 pub struct HeaderDownload;
 
-#[async_trait]
+#[async_trait(?Send)]
 impl<'db, RwTx> Stage<'db, RwTx> for HeaderDownload
 where
     RwTx: MutableTransaction<'db>,
 {
-    fn id(&self) -> StageId {
-        StageId("HeaderDownload")
+    fn id(&self) -> SyncStage {
+        SyncStage("HeaderDownload")
     }
 
     fn description(&self) -> &'static str {
@@ -31,13 +31,6 @@ where
     {
         let _ = tx;
         let past_progress = input.stage_progress.unwrap_or(0);
-
-        if !input.restarted {
-            info!("Waiting for headers...");
-            let dur = Duration::from_millis(rand::thread_rng().gen_range(3000..6000));
-            sleep(dur).await;
-        }
-
         info!("Processing headers");
 
         let target = past_progress + 100;

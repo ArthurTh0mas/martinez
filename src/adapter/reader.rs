@@ -1,8 +1,9 @@
-use crate::{common, dbutils, kv::*, models::*, Transaction};
+use std::marker::PhantomData;
+
+use crate::{common, dbutils, models::*, tables::*, Transaction};
 use bytes::Bytes;
 use dbutils::plain_generate_composite_storage_key;
 use ethereum_types::Address;
-use std::marker::PhantomData;
 
 pub struct StateReader<'db: 'tx, 'tx, Tx: Transaction<'db> + ?Sized> {
     block_nr: u64,
@@ -36,6 +37,6 @@ impl<'db: 'tx, 'tx, Tx: Transaction<'db> + ?Sized> StateReader<'db, 'tx, Tx> {
         key: common::Hash,
     ) -> anyhow::Result<Option<Bytes<'tx>>> {
         let composite_key = plain_generate_composite_storage_key(address, incarnation, key);
-        self.tx.get(&tables::PlainState, &composite_key).await
+        self.tx.get::<PlainState>(&composite_key).await
     }
 }

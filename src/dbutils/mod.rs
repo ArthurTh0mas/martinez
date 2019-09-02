@@ -1,6 +1,7 @@
 mod composite_keys;
 mod history_index;
-pub use self::{composite_keys::*, history_index::*};
+mod table;
+pub use self::{composite_keys::*, history_index::*, table::*};
 
 pub const fn bytes_mask(fixed_bits: u64) -> (u64, u8) {
     let fixed_bytes = (fixed_bits + 7) / 8;

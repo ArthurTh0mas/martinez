@@ -1,11 +1,11 @@
 pub use super::*;
 
-#[async_trait]
+#[async_trait(?Send)]
 impl ChangeSetTable for tables::AccountChangeSet {
     const TEMPLATE: &'static str = "acc-ind-";
 
     type Key = common::Address;
-    type IndexTable = tables::AccountHistory;
+    type IndexTable = tables::AccountsHistory;
     type EncodedStream<'tx: 'cs, 'cs> = impl EncodedStream<'tx, 'cs>;
 
     async fn find<'tx, C>(

@@ -1,4 +1,4 @@
-use crate::{changeset::*, common, dbutils, dbutils::*, kv::*, models::*, Cursor, Transaction};
+use crate::{changeset::*, common, dbutils, dbutils::*, models::*, Cursor, Transaction};
 use arrayref::array_ref;
 use bytes::Bytes;
 use common::{Hash, Incarnation};
@@ -14,7 +14,7 @@ pub async fn get_account_data_as_of<'db: 'tx, 'tx, Tx: Transaction<'db>>(
         return Ok(Some(v));
     }
 
-    tx.get(&tables::PlainState, address.as_fixed_bytes()).await
+    tx.get::<tables::PlainState>(address.as_fixed_bytes()).await
 }
 
 pub async fn get_storage_as_of<'db: 'tx, 'tx, Tx: Transaction<'db>>(
@@ -29,7 +29,7 @@ pub async fn get_storage_as_of<'db: 'tx, 'tx, Tx: Transaction<'db>>(
         return Ok(Some(v));
     }
 
-    tx.get(&tables::PlainState, &key).await
+    tx.get::<tables::PlainState>(&key).await
 }
 
 pub async fn find_data_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
@@ -37,7 +37,7 @@ pub async fn find_data_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
     key: common::Address,
     timestamp: u64,
 ) -> anyhow::Result<Option<Bytes<'tx>>> {
-    let mut ch = tx.cursor(&tables::AccountHistory).await?;
+    let mut ch = tx.cursor::<tables::AccountsHistory>().await?;
     if let Some((k, v)) = ch
         .seek(&index_chunk_key(key.as_fixed_bytes(), timestamp))
         .await?
@@ -50,8 +50,9 @@ pub async fn find_data_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
             let data = {
                 if let Some(change_set_block) = change_set_block {
                     let data = {
-                        let mut c = tx.cursor_dup_sort(&tables::AccountChangeSet).await?;
-                        tables::AccountChangeSet::find(&mut c, change_set_block, &key).await?
+                        type B = tables::AccountChangeSet;
+                        let mut c = tx.cursor_dup_sort::<B>().await?;
+                        B::find(&mut c, change_set_block, &key).await?
                     };
 
                     if let Some(data) = data {
@@ -68,13 +69,10 @@ pub async fn find_data_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
             if let Some(mut acc) = Account::decode_for_storage(&*data)? {
                 if acc.incarnation > 0 && acc.is_empty_code_hash() {
                     if let Some(code_hash) = tx
-                        .get(
-                            &tables::PlainCodeHash,
-                            &dbutils::plain_generate_storage_prefix(
-                                key.as_fixed_bytes(),
-                                acc.incarnation,
-                            ),
-                        )
+                        .get::<tables::PlainContractCode>(&dbutils::plain_generate_storage_prefix(
+                            key.as_fixed_bytes(),
+                            acc.incarnation,
+                        ))
                         .await?
                     {
                         acc.code_hash = H256(*array_ref![&*code_hash, 0, 32]);
@@ -99,7 +97,7 @@ pub async fn find_storage_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
     key: &PlainCompositeStorageKey,
     timestamp: u64,
 ) -> anyhow::Result<Option<Bytes<'tx>>> {
-    let mut ch = tx.cursor(&tables::StorageHistory).await?;
+    let mut ch = tx.cursor::<tables::StorageHistory>().await?;
     if let Some((k, v)) = ch.seek(&index_chunk_key(key, timestamp)).await? {
         if k[..common::ADDRESS_LENGTH] != key[..common::ADDRESS_LENGTH]
             || k[common::ADDRESS_LENGTH..common::ADDRESS_LENGTH + common::HASH_LENGTH]
@@ -114,8 +112,9 @@ pub async fn find_storage_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
         let data = {
             if let Some(change_set_block) = change_set_block {
                 let data = {
-                    let mut c = tx.cursor_dup_sort(&tables::StorageChangeSet).await?;
-                    storage::find_with_incarnation(&mut c, change_set_block, key).await?
+                    type B = tables::StorageChangeSet;
+                    let mut c = tx.cursor_dup_sort::<B>().await?;
+                    B::find_with_incarnation(&mut c, change_set_block, key).await?
                 };
 
                 if let Some(data) = data {
