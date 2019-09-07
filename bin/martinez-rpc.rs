@@ -1,12 +1,13 @@
-use martinez::stagedsync;
 use structopt::StructOpt;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
 #[derive(StructOpt)]
-#[structopt(name = "Martinez", about = "Ethereum client based on Thorax architecture")]
+#[structopt(name = "Martinez RPC", about = "RPC server for Martinez")]
 pub struct Opt {
     #[structopt(long, env)]
     pub tokio_console: bool,
+    #[structopt(long, env)]
+    pub kv_address: String,
 }
 
 #[tokio::main]
@@ -17,7 +18,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_default()
         .is_empty()
     {
-        EnvFilter::new("martinez=info")
+        EnvFilter::new("martinez=info,rpc=info")
     } else {
         EnvFilter::from_default_env()
     };
@@ -36,13 +37,5 @@ async fn main() -> anyhow::Result<()> {
         registry.with(filter).init();
     }
 
-    let db = martinez::new_mem_database()?;
-
-    let mut staged_sync = stagedsync::StagedSync::new();
-    staged_sync.push(martinez::stages::HeaderDownload);
-    // staged_sync.push(martinez::stages::BlockHashes);
-    // staged_sync.push(martinez::stages::ExecutionStage);
-
-    // stagedsync::StagedSync::new(vec![], vec![]);
-    staged_sync.run(&db).await?;
+    Ok(())
 }
