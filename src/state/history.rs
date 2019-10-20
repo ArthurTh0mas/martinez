@@ -65,7 +65,7 @@ pub async fn find_data_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
 
             //restore codehash
             if let Some(mut acc) = Account::decode_for_storage(&*data)? {
-                if acc.incarnation > 0 && acc.code_hash.is_none() {
+                if acc.incarnation > 0 && acc.code_hash == EMPTY_HASH {
                     if let Some(code_hash) = tx
                         .get(
                             &tables::PlainCodeHash,
@@ -73,10 +73,10 @@ pub async fn find_data_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
                         )
                         .await?
                     {
-                        acc.code_hash = Some(H256(*array_ref![&*code_hash, 0, 32]));
+                        acc.code_hash = H256(*array_ref![&*code_hash, 0, 32]);
                     }
 
-                    let data = acc.encode_for_storage();
+                    let data = acc.encode_for_storage(false);
 
                     return Ok(Some(data.into()));
                 }
@@ -136,12 +136,7 @@ pub async fn find_storage_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
 mod tests {
     use super::*;
     use crate::{
-        bitmapdb, crypto,
-        kv::traits::MutableKV,
-        state::database::{
-            PlainStateReader, PlainStateWriter, StateReader, StateWriter, WriterWithChangesets,
-        },
-        txdb, MutableTransaction,
+        bitmapdb, crypto, kv::traits::MutableKV, state::database::*, txdb, MutableTransaction,
     };
     use pin_utils::pin_mut;
     use std::collections::HashMap;
@@ -149,7 +144,6 @@ mod tests {
 
     fn random_account() -> (Account, Address) {
         let acc = Account {
-            initialised: true,
             balance: rand::random::<u64>().into(),
             ..Default::default()
         };
@@ -247,11 +241,7 @@ mod tests {
 
         for i in 0..num_of_accounts {
             let address = addrs[i];
-            let acc = PlainStateReader::new(&tx)
-                .read_account_data(address)
-                .await
-                .unwrap()
-                .unwrap();
+            let acc = read_account_data(&tx, address).await.unwrap().unwrap();
 
             assert_eq!(acc_state[i], acc);
 
@@ -314,10 +304,7 @@ mod tests {
 
         let mut expected_changeset = AccountChangeSet::new();
         for i in 0..num_of_accounts {
-            let mut c = acc_history[i].clone();
-            c.code_hash = None;
-            c.root = None;
-            let b = c.encode_for_storage();
+            let b = acc_history[i].encode_for_storage(true);
             expected_changeset.insert(Change::new(addrs[i], b.into()));
         }
 
@@ -383,9 +370,8 @@ mod tests {
             addrs.push(addrs_e);
 
             acc_history[i].balance = 100.into();
-            acc_history[i].code_hash = Some(Hash::from_slice(
-                &hex::decode(format!("{:0>64}", 10 + i)).unwrap(),
-            ));
+            acc_history[i].code_hash =
+                Hash::from_slice(&hex::decode(format!("{:0>64}", 10 + i)).unwrap());
             // acc_history[i].root = Some(Hash::from_slice(
             //     &hex::decode(format!("{:0>64}", 10 + i)).unwrap(),
             // ));
@@ -433,5 +419,136 @@ mod tests {
             acc_history,
             acc_history_state_storage,
         )
+    }
+
+    #[tokio::test]
+    async fn walk_as_of_state() {
+        let db = new_mem_database().unwrap();
+        let tx = db.begin_mutable().await.unwrap();
+
+        let empty_val = Value::zero();
+        let block_3_val = Value::from_big_endian(b"block_3");
+        let state_val = Value::from_big_endian(b"state");
+        let key = Hash::from_slice(&hex::decode(&format!("{:0>64}", 123)).unwrap());
+        let addresses = (0..4)
+            .map(|i| format!("0x{:0>40}", i).parse::<Address>().unwrap())
+            .collect::<Vec<_>>();
+
+        let block_2_expected = AccountChangeSet::new();
+        let block_4_expected = AccountChangeSet::new();
+        let block_6_expected = AccountChangeSet::new();
+
+        write_storage_block_data(
+            &mut PlainStateWriter::new(&tx, 3),
+            &[
+                StorageData {
+                    address: addresses[0],
+                    incarnation: DEFAULT_INCARNATION,
+                    key,
+                    old_val: empty_val,
+                    new_val: block_3_val,
+                },
+                StorageData {
+                    address: addresses[2],
+                    incarnation: DEFAULT_INCARNATION,
+                    key,
+                    old_val: empty_val,
+                    new_val: state_val,
+                },
+                StorageData {
+                    address: addresses[3],
+                    incarnation: DEFAULT_INCARNATION,
+                    key,
+                    old_val: empty_val,
+                    new_val: block_3_val,
+                },
+            ],
+        )
+        .await;
+
+        write_storage_block_data(
+            &mut PlainStateWriter::new(&tx, 5),
+            &[
+                StorageData {
+                    address: addresses[0],
+                    incarnation: DEFAULT_INCARNATION,
+                    key,
+                    old_val: block_3_val,
+                    new_val: state_val,
+                },
+                StorageData {
+                    address: addresses[1],
+                    incarnation: DEFAULT_INCARNATION,
+                    key,
+                    old_val: empty_val,
+                    new_val: state_val,
+                },
+                StorageData {
+                    address: addresses[3],
+                    incarnation: DEFAULT_INCARNATION,
+                    key,
+                    old_val: block_3_val,
+                    new_val: empty_val,
+                },
+            ],
+        )
+        .await;
+    }
+
+    struct AccountData {
+        address: Address,
+        old_val: Account,
+        new_val: Option<Account>,
+    }
+
+    async fn write_block_data<'db: 'tx, 'tx, Tx: MutableTransaction<'db>>(
+        block_writer: &mut PlainStateWriter<'db, 'tx, Tx>,
+        data: &[AccountData],
+    ) {
+        for item in data {
+            if let Some(new_val) = &item.new_val {
+                block_writer
+                    .update_account_data(item.address, &item.old_val, new_val)
+                    .await
+                    .unwrap();
+            } else {
+                block_writer
+                    .delete_account(item.address, &item.old_val)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        block_writer.write_changesets().await.unwrap();
+        block_writer.write_history().await.unwrap();
+    }
+
+    struct StorageData {
+        address: Address,
+        incarnation: u64,
+        key: Hash,
+        old_val: Value,
+        new_val: Value,
+    }
+
+    async fn write_storage_block_data<'db: 'tx, 'tx, Tx: MutableTransaction<'db>>(
+        block_writer: &mut PlainStateWriter<'db, 'tx, Tx>,
+        data: &[StorageData],
+    ) {
+        for item in data {
+            block_writer
+                .write_account_storage(
+                    item.address,
+                    item.incarnation,
+                    item.key,
+                    item.old_val,
+                    item.new_val,
+                )
+                .await
+                .unwrap();
+        }
+
+        block_writer.write_changesets().await.unwrap();
+        block_writer.write_history().await.unwrap();
     }
 }
