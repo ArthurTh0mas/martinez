@@ -4,7 +4,7 @@ use crate::downloader::{
 use async_trait::async_trait;
 use ethereum_interfaces::{sentry as grpc_sentry, types as grpc_types};
 use futures_core::Stream;
-use std::{convert::TryFrom, pin::Pin};
+use std::convert::TryFrom;
 use tokio_stream::StreamExt;
 use tracing::*;
 
@@ -46,8 +46,8 @@ impl SentryClient for SentryClientImpl {
         &mut self,
         message: Message,
         peer_filter: PeerFilter,
-    ) -> anyhow::Result<u32> {
-        let message_id = message.eth_id();
+    ) -> anyhow::Result<()> {
+        let message_id = EthMessageId::from(message);
         let message_data = grpc_sentry::OutboundMessageData {
             id: grpc_sentry::MessageId::from(message_id) as i32,
             data: rlp::encode(&message).into(),
@@ -91,27 +91,20 @@ impl SentryClient for SentryClientImpl {
         let sent_peers: grpc_sentry::SentPeers = response.into_inner();
         debug!(
             "SentryClient send_message sent {:?} to: {:?}",
-            message.eth_id(),
+            EthMessageId::from(message),
             sent_peers
         );
-        let sent_peers_count = sent_peers.peers.len() as u32;
-        return Ok(sent_peers_count);
+        return Ok(());
     }
 
     async fn receive_messages(
         &mut self,
-        filter_ids: &[EthMessageId],
-    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<MessageFromPeer>> + Send>>> {
-        let grpc_ids = filter_ids
-            .iter()
-            .map(|id| grpc_sentry::MessageId::from(*id) as i32)
-            .collect::<Vec<_>>();
-        let ids_request = grpc_sentry::MessagesRequest { ids: grpc_ids };
+    ) -> anyhow::Result<Box<dyn Stream<Item = anyhow::Result<MessageFromPeer>> + Unpin>> {
+        let ids_request = grpc_sentry::MessagesRequest { ids: Vec::new() };
         let request = tonic::Request::new(ids_request);
         let response = self.client.messages(request).await?;
         let tonic_stream: tonic::codec::Streaming<grpc_sentry::InboundMessage> =
             response.into_inner();
-        let tonic_stream = tonic_stream_fuse_on_error(tonic_stream);
         debug!("SentryClient receive_messages subscribed to incoming messages");
 
         let stream = tonic_stream.map(|result: Result<grpc_sentry::InboundMessage, tonic::Status>| -> anyhow::Result<MessageFromPeer> {
@@ -129,40 +122,15 @@ impl SentryClient for SentryClientImpl {
                         from_peer_id: peer_id,
                     };
                     debug!("SentryClient receive_messages received a message {:?} from {:?}",
-                        message_from_peer.message.eth_id(),
+                        EthMessageId::from(message_from_peer.message),
                         message_from_peer.from_peer_id);
                     Ok(message_from_peer)
                 },
-                Err(status) => {
-                    if status.message().ends_with("broken pipe") {
-                        Err(anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::BrokenPipe, status)))
-                    } else {
-                        Err(anyhow::Error::new(status))
-                    }
-                }
+                Err(status) => Err(anyhow::anyhow!(status))
             }
         });
-        Ok(Box::pin(stream))
+        Ok(Box::new(stream))
     }
-}
-
-fn tonic_stream_fuse_on_error<T: 'static + Send>(
-    mut tonic_stream: tonic::codec::Streaming<T>,
-) -> Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send>> {
-    let stream = async_stream::stream! {
-        while let Some(result) = tonic_stream.next().await {
-            match result {
-                Ok(item) => {
-                    yield Ok(item);
-                },
-                Err(status) => {
-                    yield Err(status);
-                    break;
-                },
-            }
-        }
-    };
-    Box::pin(stream)
 }
 
 impl From<EthMessageId> for grpc_sentry::MessageId {

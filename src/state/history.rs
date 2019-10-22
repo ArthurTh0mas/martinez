@@ -65,7 +65,7 @@ pub async fn find_data_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
 
             //restore codehash
             if let Some(mut acc) = Account::decode_for_storage(&*data)? {
-                if acc.incarnation > 0 && acc.code_hash == EMPTY_HASH {
+                if acc.incarnation > 0 && acc.code_hash.is_none() {
                     if let Some(code_hash) = tx
                         .get(
                             &tables::PlainCodeHash,
@@ -73,10 +73,10 @@ pub async fn find_data_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
                         )
                         .await?
                     {
-                        acc.code_hash = H256(*array_ref![&*code_hash, 0, 32]);
+                        acc.code_hash = Some(H256(*array_ref![&*code_hash, 0, 32]));
                     }
 
-                    let data = acc.encode_for_storage(false);
+                    let data = acc.encode_for_storage();
 
                     return Ok(Some(data.into()));
                 }
@@ -136,7 +136,12 @@ pub async fn find_storage_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
 mod tests {
     use super::*;
     use crate::{
-        bitmapdb, crypto, kv::traits::MutableKV, state::database::*, txdb, MutableTransaction,
+        bitmapdb, crypto,
+        kv::traits::MutableKV,
+        state::database::{
+            PlainStateReader, PlainStateWriter, StateReader, StateWriter, WriterWithChangesets,
+        },
+        txdb, MutableTransaction,
     };
     use pin_utils::pin_mut;
     use std::collections::HashMap;
@@ -144,6 +149,7 @@ mod tests {
 
     fn random_account() -> (Account, Address) {
         let acc = Account {
+            initialised: true,
             balance: rand::random::<u64>().into(),
             ..Default::default()
         };
@@ -241,7 +247,11 @@ mod tests {
 
         for i in 0..num_of_accounts {
             let address = addrs[i];
-            let acc = read_account_data(&tx, address).await.unwrap().unwrap();
+            let acc = PlainStateReader::new(&tx)
+                .read_account_data(address)
+                .await
+                .unwrap()
+                .unwrap();
 
             assert_eq!(acc_state[i], acc);
 
@@ -304,7 +314,10 @@ mod tests {
 
         let mut expected_changeset = AccountChangeSet::new();
         for i in 0..num_of_accounts {
-            let b = acc_history[i].encode_for_storage(true);
+            let mut c = acc_history[i].clone();
+            c.code_hash = None;
+            c.root = None;
+            let b = c.encode_for_storage();
             expected_changeset.insert(Change::new(addrs[i], b.into()));
         }
 
@@ -370,8 +383,9 @@ mod tests {
             addrs.push(addrs_e);
 
             acc_history[i].balance = 100.into();
-            acc_history[i].code_hash =
-                Hash::from_slice(&hex::decode(format!("{:0>64}", 10 + i)).unwrap());
+            acc_history[i].code_hash = Some(Hash::from_slice(
+                &hex::decode(format!("{:0>64}", 10 + i)).unwrap(),
+            ));
             // acc_history[i].root = Some(Hash::from_slice(
             //     &hex::decode(format!("{:0>64}", 10 + i)).unwrap(),
             // ));

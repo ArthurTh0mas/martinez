@@ -20,9 +20,3 @@ impl ChainsConfig {
         Ok(ChainsConfig(configs))
     }
 }
-
-impl ChainsConfig {
-    pub fn chain_names(&self) -> Vec<&str> {
-        self.0.keys().map(|k| k.as_str()).collect::<Vec<&str>>()
-    }
-}

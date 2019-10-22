@@ -1,11 +1,6 @@
-use crate::{
-    downloader::block_id::BlockId,
-    models::{Block as BlockType, BlockHeader as HeaderType},
-};
-use ethereum_types::H256;
-use rlp_derive::*;
+use crate::downloader::block_id::BlockId;
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, strum::EnumIter)]
+#[derive(Debug)]
 pub enum EthMessageId {
     Status = 0,
     NewBlockHashes = 1,
@@ -24,65 +19,24 @@ pub enum EthMessageId {
     Receipts = 16,
 }
 
-#[derive(RlpEncodable, RlpDecodable, Clone, Copy, PartialEq, Debug)]
-pub struct BlockHashAndNumber {
-    pub hash: H256,
-    pub number: u64,
-}
-
-#[derive(RlpEncodableWrapper, RlpDecodableWrapper, Clone, PartialEq, Debug)]
-pub struct NewBlockHashesMessage {
-    pub ids: Vec<BlockHashAndNumber>,
-}
-
-#[derive(RlpEncodable, RlpDecodable, Clone, Copy, PartialEq, Debug)]
+#[derive(rlp_derive::RlpEncodable, rlp_derive::RlpDecodable, Clone, Copy)]
 pub struct GetBlockHeadersMessage {
     pub request_id: u64,
-    pub params: GetBlockHeadersMessageParams,
-}
-
-#[derive(RlpEncodable, RlpDecodable, Clone, Copy, PartialEq, Debug)]
-pub struct GetBlockHeadersMessageParams {
     pub start_block: BlockId,
     pub limit: u64,
     pub skip: u64,
-    pub reverse: u8,
+    pub reverse: bool,
 }
 
-#[derive(RlpEncodable, RlpDecodable, Clone, PartialEq, Debug)]
-pub struct BlockHeadersMessage {
-    pub request_id: u64,
-    pub headers: Vec<HeaderType>,
-}
-
-#[derive(RlpEncodable, RlpDecodable, Clone, PartialEq, Debug)]
-pub struct NewBlockMessage {
-    pub block: Box<BlockType>,
-    pub total_difficulty: u64,
-}
-
-#[derive(RlpEncodableWrapper, RlpDecodableWrapper, Clone, PartialEq, Debug)]
-pub struct NewPooledTransactionHashesMessage {
-    pub ids: Vec<H256>,
-}
-
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, Copy)]
 pub enum Message {
-    NewBlockHashes(NewBlockHashesMessage),
     GetBlockHeaders(GetBlockHeadersMessage),
-    BlockHeaders(BlockHeadersMessage),
-    NewBlock(NewBlockMessage),
-    NewPooledTransactionHashes(NewPooledTransactionHashesMessage),
 }
 
-impl Message {
-    pub fn eth_id(self: &Message) -> EthMessageId {
-        match self {
-            Message::NewBlockHashes(_) => EthMessageId::NewBlockHashes,
+impl From<Message> for EthMessageId {
+    fn from(message: Message) -> Self {
+        match message {
             Message::GetBlockHeaders(_) => EthMessageId::GetBlockHeaders,
-            Message::BlockHeaders(_) => EthMessageId::BlockHeaders,
-            Message::NewBlock(_) => EthMessageId::NewBlock,
-            Message::NewPooledTransactionHashes(_) => EthMessageId::NewPooledTransactionHashes,
         }
     }
 }

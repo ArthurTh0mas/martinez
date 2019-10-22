@@ -1,7 +1,7 @@
 use http::Uri;
 use std::str::FromStr;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SentryAddress {
     pub addr: Uri,
 }

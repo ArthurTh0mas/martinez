@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use auto_impl::auto_impl;
 use std::fmt::Debug;
 
-#[derive(Debug, PartialEq)]
 pub enum ExecOutput {
     Unwind {
         unwind_to: u64,
@@ -38,15 +37,9 @@ pub trait Stage<'db, RwTx: MutableTransaction<'db>>: Send + Sync + Debug {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub enum PreviousStageInfo {
-    Genesis { genesis_point: u64 },
-    Stage { id: StageId, progress: u64 },
-}
-
-#[derive(Clone, Copy, Debug)]
 pub struct StageInput {
     pub restarted: bool,
-    pub previous_stage: PreviousStageInfo,
+    pub previous_stage: Option<(StageId, u64)>,
     pub stage_progress: Option<u64>,
 }
 

@@ -11,7 +11,6 @@ default-run = "martinez"
 martinez-table-defs = { path = "src/kv/table-defs" }
 anyhow = "1"
 arrayref = "0.3"
-async-recursion = "0.3"
 async-stream = "0.3"
 async-trait = "0.1"
 auto_impl = "0.4"
@@ -21,18 +20,11 @@ bytes = { package = "lifetimed-bytes", git = "https://github.com/vorot93/lifetim
 bytesize = "1"
 clap = "2"
 console-subscriber = { git = "https://github.com/tokio-rs/console" }
-crossterm = { version = "0.20", optional = true }
-derive_more = "0.99"
-ethereum-interfaces = { git = "https://github.com/ledgerwatch/interfaces", features = [
-    "remotekv",
-    "sentry",
-] }
-ethereum-types = "0.12"
-evmodin = { git = "https://github.com/vorot93/evmodin" }
+const_format = "0.2"
+ethereum = "0.7"
+ethereum-interfaces = { git = "https://github.com/ledgerwatch/interfaces", features = ["remotekv", "sentry"] }
+ethereum-types = "0.11"
 futures-core = "0.3"
-futures-util = "0.3"
-hash-db = "0.15"
-hash256-std-hasher = "0.15"
 hex = "0.4"
 hex-literal = "0.3"
 http = "0.2"
@@ -40,33 +32,26 @@ maplit = "1"
 mdbx = { git = "https://github.com/vorot93/mdbx-rs" }
 modular-bitfield = "0.11"
 once_cell = "1"
-parking_lot = "0.11"
 pin-utils = "0.1"
 rand = "0.8"
 rlp = "0.5"
 rlp-derive = "0.1"
 roaring = "0.7"
-secp256k1 = { version = "0.20", features = ["global-context", "recovery"] }
+secp256k1 = { version = "0.20", features = ["global-context"] }
 serde = "1"
 serde_json = "1"
 sha3 = "0.9"
 string = { git = "https://github.com/vorot93/string", branch = "update-bytes" }
 structopt = "0.3"
-strum = { version = "0.21", features = ["derive"] }
 tempfile = "3"
 thiserror = "1"
 tokio = { version = "1", features = ["full"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-stream = "0.1"
 toml = "0.5"
-tonic = { version = "0.5", default-features = false, features = [
-    "codegen",
-    "prost",
-    "transport",
-] }
+tonic = { version = "0.4", default-features = false, features = ["codegen", "prost", "transport"] }
 tracing = "0.1"
 tracing-futures = "0.2"
 tracing-subscriber = "0.2"
-triehash = "0.8"
 
 [build-dependencies]
 martinez-table-defs = { path = "src/kv/table-defs" }
@@ -91,7 +76,3 @@ name = "martinez-rpc"
 [[bin]]
 path = "bin/martinez-toolbox.rs"
 name = "martinez-toolbox"
-
-[[bin]]
-path = "bin/blockhashes_stage.rs"
-name = "blockhashes_stage"
