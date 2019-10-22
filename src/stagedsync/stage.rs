@@ -38,9 +38,15 @@ pub trait Stage<'db, RwTx: MutableTransaction<'db>>: Send + Sync + Debug {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub enum PreviousStageInfo {
+    Genesis { genesis_point: u64 },
+    Stage { id: StageId, progress: u64 },
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct StageInput {
     pub restarted: bool,
-    pub previous_stage: Option<(StageId, u64)>,
+    pub previous_stage: PreviousStageInfo,
     pub stage_progress: Option<u64>,
 }
 

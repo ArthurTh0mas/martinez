@@ -2,7 +2,11 @@ pub mod stage;
 pub mod stages;
 
 use self::stage::{Stage, StageInput, UnwindInput};
-use crate::{kv::traits::MutableKV, stagedsync::stage::ExecOutput, MutableTransaction};
+use crate::{
+    kv::traits::MutableKV,
+    stagedsync::stage::{ExecOutput, PreviousStageInfo},
+    MutableTransaction,
+};
 use tracing::*;
 
 /// Staged synchronization framework
@@ -18,6 +22,7 @@ use tracing::*;
 /// After the last stage is finished, the process starts from the beginning, by looking for the new headers to download.
 /// If the app is restarted in between stages, it restarts from the first stage. Absent new blocks, already completed stages are skipped.
 pub struct StagedSync<'db, DB: MutableKV> {
+    genesis_point: u64,
     stages: Vec<Box<dyn Stage<'db, DB::MutableTx<'db>>>>,
 }
 
@@ -29,7 +34,14 @@ impl<'db, DB: MutableKV> Default for StagedSync<'db, DB> {
 
 impl<'db, DB: MutableKV> StagedSync<'db, DB> {
     pub fn new() -> Self {
-        Self { stages: Vec::new() }
+        Self {
+            stages: Vec::new(),
+            genesis_point: 0,
+        }
+    }
+
+    pub fn set_genesis_point(&mut self, genesis_point: u64) {
+        self.genesis_point = genesis_point;
     }
 
     pub fn push<S>(&mut self, stage: S)
@@ -104,7 +116,9 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
             } else {
                 // Now that we're done with unwind, let's roll.
 
-                let mut previous_stage = None;
+                let mut previous_stage = PreviousStageInfo::Genesis {
+                    genesis_point: self.genesis_point,
+                };
                 let mut timings = vec![];
 
                 // Execute each stage in direct order.
@@ -194,7 +208,10 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                     };
                     timings.push((stage_id, std::time::Instant::now() - start_time));
 
-                    previous_stage = Some((stage_id, done_progress))
+                    previous_stage = PreviousStageInfo::Stage {
+                        id: stage_id,
+                        progress: done_progress,
+                    };
                 }
                 tx.commit().await?;
 
