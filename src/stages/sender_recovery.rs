@@ -5,6 +5,13 @@ use crate::{
 };
 use anyhow::Context;
 use async_trait::async_trait;
+use ethereum::{Transaction, TransactionMessage};
+use ethereum_types::Address;
+use secp256k1::{
+    recovery::{RecoverableSignature, RecoveryId},
+    Message, SECP256K1,
+};
+use sha3::{Digest, Keccak256};
 use std::cmp;
 use thiserror::Error;
 use tracing::error;
@@ -18,6 +25,22 @@ pub enum SenderRecoveryError {
 }
 
 const BUFFER_SIZE: u64 = 5000;
+
+fn recover_sender(tx: &Transaction) -> anyhow::Result<Address> {
+    let mut sig = [0u8; 64];
+    sig[..32].copy_from_slice(tx.signature.r().as_bytes());
+    sig[32..].copy_from_slice(tx.signature.s().as_bytes());
+
+    let rec = RecoveryId::from_i32(tx.signature.standard_v() as i32)?;
+
+    let public = &SECP256K1.recover(
+        &Message::from_slice(TransactionMessage::from(tx.clone()).hash().as_bytes())?,
+        &RecoverableSignature::from_compact(&sig, rec)?,
+    )?;
+
+    let address_slice = &Keccak256::digest(&public.serialize_uncompressed()[1..])[12..];
+    Ok(Address::from_slice(address_slice))
+}
 
 async fn process_block<'db: 'tx, 'tx, RwTx>(tx: &'tx mut RwTx, height: u64) -> anyhow::Result<()>
 where
@@ -33,7 +56,7 @@ where
 
     let mut senders = vec![];
     for tx in &txs {
-        senders.push(tx.recover_sender()?);
+        senders.push(recover_sender(tx)?);
     }
 
     chain::tx_sender::write(tx, body.base_tx_id, &senders).await
@@ -94,9 +117,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{kv::traits::MutableKV, models::*, new_mem_database};
-    use bytes::Bytes;
-    use ethereum_types::*;
+    use crate::{kv::traits::MutableKV, models::BodyForStorage, new_mem_database};
+    use ethereum::{TransactionAction, TransactionSignature};
+    use ethereum_types::{H160, H256};
     use hex_literal::hex;
 
     #[tokio::test]
@@ -117,17 +140,14 @@ mod tests {
         };
 
         let tx1_1 = Transaction {
-            message: TransactionMessage::Legacy {
-                chain_id: Some(1),
-                nonce: 1,
-                gas_price: 1_000_000.into(),
-                gas_limit: 21_000,
-                action: TransactionAction::Call(recipient1),
-                value: 1.into(),
-                input: Bytes::new(),
-            },
+            nonce: 1.into(),
+            gas_limit: 21_000.into(),
+            gas_price: 1_000_000.into(),
+            action: TransactionAction::Call(recipient1),
+            value: 1.into(),
+            input: vec![],
             signature: TransactionSignature::new(
-                false,
+                0x25,
                 H256::from(hex!(
                     "11d244ae19e3bb96d1bb864aa761d48e957984a154329f0de757cd105f9c7ac4"
                 )),
@@ -139,17 +159,14 @@ mod tests {
         };
 
         let tx1_2 = Transaction {
-            message: TransactionMessage::Legacy {
-                chain_id: Some(1),
-                nonce: 2,
-                gas_price: 1_000_000.into(),
-                gas_limit: 21_000,
-                action: TransactionAction::Call(recipient1),
-                value: 0x100.into(),
-                input: Bytes::new(),
-            },
+            nonce: 2.into(),
+            gas_limit: 21_000.into(),
+            gas_price: 1_000_000.into(),
+            action: TransactionAction::Call(recipient1),
+            value: 0x100.into(),
+            input: vec![],
             signature: TransactionSignature::new(
-                true,
+                0x26,
                 H256::from(hex!(
                     "9e8c555909921d359bfb0c2734841c87691eb257cb5f0597ac47501abd8ba0de"
                 )),
@@ -167,17 +184,14 @@ mod tests {
         };
 
         let tx2_1 = Transaction {
-            message: TransactionMessage::Legacy {
-                chain_id: Some(1),
-                nonce: 3,
-                gas_price: 1_000_000.into(),
-                gas_limit: 21_000,
-                action: TransactionAction::Call(recipient1),
-                value: 0x10000.into(),
-                input: Bytes::new(),
-            },
+            nonce: 3.into(),
+            gas_limit: 21_000.into(),
+            gas_price: 1_000_000.into(),
+            action: TransactionAction::Call(recipient1),
+            value: 0x10000.into(),
+            input: vec![],
             signature: TransactionSignature::new(
-                true,
+                0x26,
                 H256::from(hex!(
                     "2450fdbf8fbc1dee15022bfa7392eb15f04277782343258e185972b5b2b8bf79"
                 )),
@@ -189,17 +203,14 @@ mod tests {
         };
 
         let tx2_2 = Transaction {
-            message: TransactionMessage::Legacy {
-                chain_id: Some(1),
-                nonce: 6,
-                gas_price: 1_000_000.into(),
-                gas_limit: 21_000,
-                action: TransactionAction::Call(recipient1),
-                value: 0x10.into(),
-                input: Bytes::new(),
-            },
+            nonce: 6.into(),
+            gas_limit: 21_000.into(),
+            gas_price: 1_000_000.into(),
+            action: TransactionAction::Call(recipient1),
+            value: 0x10.into(),
+            input: vec![],
             signature: TransactionSignature::new(
-                false,
+                0x25,
                 H256::from(hex!(
                     "ac0222c1258eada1f828729186b723eaf3dd7f535c5de7271ea02470cbb1029f"
                 )),
@@ -211,17 +222,14 @@ mod tests {
         };
 
         let tx2_3 = Transaction {
-            message: TransactionMessage::Legacy {
-                chain_id: Some(1),
-                nonce: 2,
-                gas_price: 1_000_000.into(),
-                gas_limit: 21_000,
-                action: TransactionAction::Call(recipient2),
-                value: 2.into(),
-                input: Bytes::new(),
-            },
+            nonce: 2.into(),
+            gas_limit: 21_000.into(),
+            gas_price: 1_000_000.into(),
+            action: TransactionAction::Call(recipient2),
+            value: 2.into(),
+            input: vec![],
             signature: TransactionSignature::new(
-                true,
+                0x26,
                 H256::from(hex!(
                     "e41df92d64612590f72cae9e8895cd34ce0a545109f060879add106336bb5055"
                 )),
