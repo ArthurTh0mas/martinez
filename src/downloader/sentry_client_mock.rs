@@ -1,9 +1,8 @@
 use crate::downloader::{
-    messages::{EthMessageId, Message},
+    messages::Message,
     sentry_client::{MessageFromPeer, PeerFilter, SentryClient, Status},
 };
 use futures_core::Stream;
-use std::{collections::HashSet, pin::Pin};
 use tokio::sync::broadcast;
 use tokio_stream::{wrappers, StreamExt};
 
@@ -36,29 +35,20 @@ impl SentryClient for SentryClientMock {
         &mut self,
         _message: Message,
         _peer_filter: PeerFilter,
-    ) -> anyhow::Result<u32> {
+    ) -> anyhow::Result<()> {
         self.stop_receiving_messages();
-        Ok(1)
+        Ok(())
     }
 
     async fn receive_messages(
         &mut self,
-        filter_ids: &[EthMessageId],
-    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<MessageFromPeer>> + Send>>> {
-        let filter_ids_set = filter_ids
-            .iter()
-            .cloned()
-            .collect::<HashSet<EthMessageId>>();
-
+    ) -> anyhow::Result<Box<dyn Stream<Item = anyhow::Result<MessageFromPeer>> + Unpin>> {
         if let Some(receiver) = self.message_receiver.take() {
             let stream = wrappers::BroadcastStream::new(receiver)
                 .filter_map(|res| res.ok()) // ignore BroadcastStreamRecvError
-                .filter(move |message_from_peer| {
-                    filter_ids_set.contains(&message_from_peer.message.eth_id())
-                })
                 .map(Ok);
 
-            Ok(Box::pin(stream))
+            Ok(Box::new(Box::pin(stream)))
         } else {
             anyhow::bail!("SentryClientMock::receive_messages supports only one receiver")
         }
