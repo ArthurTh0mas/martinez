@@ -21,7 +21,7 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: nightly-2021-10-14
+          toolchain: nightly
           override: true
           components: rustfmt, clippy
 
@@ -38,12 +38,12 @@ jobs:
       - uses: actions-rs/cargo@v1
         with:
           command: hack
-          args: check --workspace --ignore-private --each-feature --no-dev-deps
+          args: check --all --ignore-private --each-feature --no-dev-deps
 
       - uses: actions-rs/cargo@v1
         with:
           command: check
-          args: --workspace --all-targets --all-features
+          args: --all --all-targets --all-features
 
       - uses: actions-rs/cargo@v1
         with:
@@ -52,14 +52,4 @@ jobs:
       - uses: actions-rs/cargo@v1
         with:
           command: clippy
-          args: --workspace --all-targets -- -D warnings
-
-      - uses: actions/checkout@v2
-        with:
-          repository: ethereum/tests
-          submodules: recursive
-          path: ethereum-tests
-          ref: 'v10.2'
-
-      - run: |
-          env RUST_LOG=error cargo run --release --bin consensus-tests -- --tests="./ethereum-tests"
+          args: -- -D warnings

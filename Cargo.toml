@@ -2,107 +2,72 @@
 name = "martinez"
 version = "0.1.0"
 authors = ["Annie Lai <ng8eke@163.com>"]
-edition = "2021"
+edition = "2018"
 description = "Ethereum client based on turbo-geth client architecture"
 license = "Apache-2.0"
 default-run = "martinez"
 
 [dependencies]
+martinez-table-defs = { path = "src/kv/table-defs" }
 anyhow = "1"
 arrayref = "0.3"
-arrayvec = "0.7"
-async-recursion = "1"
 async-stream = "0.3"
 async-trait = "0.1"
-auto_impl = "0.5"
+auto_impl = "0.4"
 byte-unit = "4"
-bytes = "1"
-bytes-literal = { git = "https://github.com/vorot93/bytes-literal" }
+static-bytes = { package = "bytes", version = "1" }
+bytes = { package = "lifetimed-bytes", git = "https://github.com/vorot93/lifetimed-bytes" }
 bytesize = "1"
-clap = { version = "3", features = ["derive"] }
-croaring = { git = "https://github.com/vorot93/croaring-rs", branch = "staging" }
-crossterm = { version = "0.22", optional = true }
-derive_more = "0.99"
-directories = "4.0"
-educe = { version = "0.4", features = ["Debug", "Default"] }
-ethash = { git = "https://github.com/rust-ethereum/ethash", branch = "ethnum" }
-ethereum-interfaces = { git = "https://github.com/ledgerwatch/interfaces", branch = "vorot93/ethnum", features = [
-    "remotekv",
-    "sentry",
-] }
-ethereum-types = { version = "0.12", features = ["codec"] }
-ethnum = { git = "https://github.com/vorot93/ethnum-rs", branch = "staging", features = [
-    "llvm-intrinsics",
-    "rlp",
-    "scale",
-] }
-evmodin = { git = "https://github.com/vorot93/evmodin", branch = "martinez-staging" }
+clap = "2"
+console-subscriber = { git = "https://github.com/tokio-rs/console" }
+const_format = "0.2"
+ethereum = "0.7"
+ethereum-interfaces = { git = "https://github.com/ledgerwatch/interfaces", features = ["remotekv", "sentry"] }
+ethereum-types = "0.11"
 futures-core = "0.3"
-futures-util = "0.3"
-hash-db = "0.15"
-hash256-std-hasher = "0.15"
 hex = "0.4"
 hex-literal = "0.3"
 http = "0.2"
-itertools = "0.10"
-jsonrpsee = { git = "https://github.com/paritytech/jsonrpsee", features = [
-    "server",
-    "macros",
-] }
-lru = "0.7"
 maplit = "1"
-mdbx = { package = "libmdbx", version = "0.1" }
+mdbx = { git = "https://github.com/vorot93/mdbx-rs" }
 modular-bitfield = "0.11"
-num-bigint = "0.4"
-num_cpus = "1.13"
-num-traits = "0.2"
 once_cell = "1"
-parity-scale-codec = { version = "2", features = ["bytes"] }
-parking_lot = "0.11"
+pin-utils = "0.1"
 rand = "0.8"
-rayon = "1"
-ripemd = "0.1"
 rlp = "0.5"
 rlp-derive = "0.1"
-ron = "0.7"
-secp256k1 = { version = "0.21", features = ["global-context", "recovery"] }
+roaring = "0.7"
+secp256k1 = { version = "0.20", features = ["global-context", "recovery"] }
 serde = "1"
 serde_json = "1"
-serde_with = "1"
-sha2 = "0.10"
-sha3 = "0.10"
-string = { git = "https://github.com/carllerche/string" }
-strum = { version = "0.23", features = ["derive"] }
-substrate-bn = "0.6"
+sha3 = "0.9"
+string = { git = "https://github.com/vorot93/string", branch = "update-bytes" }
+structopt = "0.3"
 tempfile = "3"
 thiserror = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 toml = "0.5"
-tonic = { version = "0.6", default-features = false, features = [
-    "codegen",
-    "prost",
-    "transport",
-] }
+tonic = { version = "0.4", default-features = false, features = ["codegen", "prost", "transport"] }
 tracing = "0.1"
 tracing-futures = "0.2"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-triehash = "0.8"
-walkdir = "2"
+tracing-subscriber = "0.2"
 
 [build-dependencies]
-anyhow = "1"
-vergen = "6"
+martinez-table-defs = { path = "src/kv/table-defs" }
+quote = "1"
 
 [dev-dependencies]
 bytes-literal = { git = "https://github.com/vorot93/bytes-literal" }
-proptest = "1.0.0"
 tokio = { version = "1", features = ["full"] }
-tokio-test = "0.4.2"
 
 [[bin]]
 path = "bin/martinez.rs"
 name = "martinez"
+
+[[bin]]
+path = "bin/martinez-ddl.rs"
+name = "martinez-ddl"
 
 [[bin]]
 path = "bin/martinez-rpc.rs"
@@ -111,14 +76,3 @@ name = "martinez-rpc"
 [[bin]]
 path = "bin/martinez-toolbox.rs"
 name = "martinez-toolbox"
-
-[[bin]]
-path = "bin/consensus-tests.rs"
-name = "consensus-tests"
-
-[patch.crates-io]
-parity-scale-codec = { git = "https://github.com/paritytech/parity-scale-codec" }
-
-[profile.release]
-codegen-units = 1
-lto = true
