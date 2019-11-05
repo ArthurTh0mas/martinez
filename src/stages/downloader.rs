@@ -1,16 +1,56 @@
-use std::time::Duration;
-
 use crate::{
-    stagedsync::stage::{ExecOutput, Stage, StageInput},
-    MutableTransaction, StageId,
+    downloader::{
+        sentry_status_provider::SentryStatusProvider, ui::ui_system::UISystem, HeadersDownloader,
+        HeadersDownloaderRunState,
+    },
+    kv::traits::*,
+    models::BlockNumber,
+    sentry::{chain_config::ChainConfig, sentry_client_reactor::SentryClientReactorShared},
+    stagedsync::{stage::*, stages::HEADERS},
+    StageId,
 };
 use async_trait::async_trait;
-use rand::Rng;
-use tokio::time::sleep;
-use tracing::*;
+use std::sync::Arc;
+use tokio::sync::Mutex as AsyncMutex;
 
+/// Download of headers
 #[derive(Debug)]
-pub struct HeaderDownload;
+pub struct HeaderDownload {
+    downloader: HeadersDownloader,
+    batch_size: usize,
+    sentry_status_provider: SentryStatusProvider,
+    previous_run_state: Arc<AsyncMutex<Option<HeadersDownloaderRunState>>>,
+}
+
+impl HeaderDownload {
+    pub fn new(
+        chain_config: ChainConfig,
+        mem_limit: usize,
+        batch_size: usize,
+        sentry: SentryClientReactorShared,
+        sentry_status_provider: SentryStatusProvider,
+    ) -> anyhow::Result<Self> {
+        let verifier = crate::downloader::header_slice_verifier::make_ethash_verifier();
+
+        let downloader = HeadersDownloader::new(chain_config, verifier, mem_limit, sentry)?;
+
+        let instance = Self {
+            downloader,
+            batch_size,
+            sentry_status_provider,
+            previous_run_state: Arc::new(AsyncMutex::new(None)),
+        };
+        Ok(instance)
+    }
+
+    async fn load_previous_run_state(&self) -> Option<HeadersDownloaderRunState> {
+        self.previous_run_state.lock().await.clone()
+    }
+
+    async fn save_run_state(&self, run_state: HeadersDownloaderRunState) {
+        *self.previous_run_state.lock().await = Some(run_state);
+    }
+}
 
 #[async_trait]
 impl<'db, RwTx> Stage<'db, RwTx> for HeaderDownload
@@ -18,63 +58,63 @@ where
     RwTx: MutableTransaction<'db>,
 {
     fn id(&self) -> StageId {
-        StageId("HeaderDownload")
+        HEADERS
     }
 
-    fn description(&self) -> &'static str {
-        "Downloading headers"
-    }
-
-    async fn execute<'tx>(&self, tx: &'tx mut RwTx, input: StageInput) -> anyhow::Result<ExecOutput>
+    async fn execute<'tx>(
+        &mut self,
+        tx: &'tx mut RwTx,
+        input: StageInput,
+    ) -> anyhow::Result<ExecOutput>
     where
         'db: 'tx,
     {
-        let _ = tx;
-        let past_progress = input.stage_progress.unwrap_or(0);
+        self.sentry_status_provider.update(tx).await?;
 
-        if !input.restarted {
-            info!("Waiting for headers...");
-            let dur = Duration::from_millis(rand::thread_rng().gen_range(3000..6000));
-            sleep(dur).await;
-        }
+        let past_progress = input.stage_progress.unwrap_or_default();
 
-        info!("Processing headers");
+        let start_block_num = BlockNumber(past_progress.0 + 1);
+        let previous_run_state = self.load_previous_run_state().await;
 
-        let target = past_progress + 100;
+        let mut ui_system = UISystem::new();
+        ui_system.start()?;
+        let ui_system = Arc::new(AsyncMutex::new(ui_system));
 
-        let commit_block =
-            rand::random::<bool>().then(|| past_progress + rand::thread_rng().gen_range(0..target));
+        let report = self
+            .downloader
+            .run(
+                tx,
+                start_block_num,
+                self.batch_size,
+                previous_run_state,
+                ui_system.clone(),
+            )
+            .await?;
 
-        let mut processed = past_progress;
-        let mut must_commit = false;
-        for block in past_progress..=target {
-            info!(block = block, "(mock) Downloading");
+        ui_system.try_lock()?.stop().await?;
 
-            processed += 1;
+        let final_block_num = report.final_block_num.0;
+        let stage_progress = if final_block_num > 0 {
+            BlockNumber(final_block_num - 1)
+        } else {
+            past_progress
+        };
 
-            if let Some(commit_block) = commit_block {
-                if block == commit_block {
-                    must_commit = true;
-                    break;
-                }
-            }
+        let done = final_block_num >= report.target_final_block_num.0;
 
-            let dur = Duration::from_millis(rand::thread_rng().gen_range(0..500));
-            sleep(dur).await;
-        }
-        info!(highest = target, "Processed");
+        self.save_run_state(report.run_state).await;
+
         Ok(ExecOutput::Progress {
-            stage_progress: processed,
-            done: !must_commit,
-            must_commit,
+            stage_progress,
+            done,
         })
     }
 
     async fn unwind<'tx>(
-        &self,
+        &mut self,
         tx: &'tx mut RwTx,
         input: crate::stagedsync::stage::UnwindInput,
-    ) -> anyhow::Result<()>
+    ) -> anyhow::Result<UnwindOutput>
     where
         'db: 'tx,
     {

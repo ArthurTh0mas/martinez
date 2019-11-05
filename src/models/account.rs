@@ -1,31 +1,46 @@
-use anyhow::bail;
-use ethereum_types::{H256, U256};
+use crate::{kv::tables::VariableVec, models::*, util::*};
+use arrayvec::ArrayVec;
+use bytes::{Buf, Bytes};
+use educe::*;
 use modular_bitfield::prelude::*;
-use static_bytes::Buf;
+use rlp_derive::*;
+use serde::*;
+use std::collections::HashMap;
 
-use crate::common;
-
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Account {
-    pub initialised: bool,
     pub nonce: u64,
     pub balance: U256,
-    pub root: Option<H256>,      // merkle root of the storage trie
-    pub code_hash: Option<H256>, // hash of the bytecode
-    pub incarnation: u64,
+    pub code_hash: H256, // hash of the bytecode
+}
+
+#[derive(Debug, RlpEncodable, RlpDecodable)]
+pub struct RlpAccount {
+    pub nonce: u64,
+    pub balance: U256,
+    pub storage_root: H256,
+    pub code_hash: H256,
 }
 
 impl Default for Account {
     fn default() -> Self {
         Self {
-            initialised: true,
             nonce: 0,
-            balance: U256::zero(),
-            root: None,
-            code_hash: None,
-            incarnation: 0,
+            balance: U256::ZERO,
+            code_hash: EMPTY_HASH,
         }
     }
+}
+
+#[derive(Deserialize, Educe)]
+#[educe(Debug)]
+pub struct SerializedAccount {
+    pub balance: U256,
+    #[serde(with = "hexbytes")]
+    #[educe(Debug(method = "write_hex_string"))]
+    pub code: Bytes,
+    pub nonce: U64,
+    pub storage: HashMap<U256, U256>,
 }
 
 fn bytes_to_u64(buf: &[u8]) -> u64 {
@@ -41,84 +56,44 @@ fn bytes_to_u64(buf: &[u8]) -> u64 {
 #[bitfield]
 #[derive(Clone, Copy, Debug, Default)]
 struct AccountStorageFlags {
-    nonce: bool,
-    balance: bool,
-    incarnation: bool,
+    nonce_len: B4,
     code_hash: bool,
-    dummy: B4,
+    #[skip]
+    unused: B3,
 }
 
+pub const MAX_ACCOUNT_LEN: usize = 1 + (1 + 32) + (1 + 32) + (1 + 8);
+
+pub type EncodedAccount = VariableVec<MAX_ACCOUNT_LEN>;
+
 impl Account {
-    pub fn encoding_length_for_storage(&self) -> usize {
-        let mut struct_length = 1; // 1 byte for fieldset
-
-        if !self.balance.is_zero() {
-            struct_length += 1 + Self::u256_compact_len(self.balance);
-        }
-
-        if self.nonce > 0 {
-            struct_length += 1 + Self::u64_compact_len(self.nonce);
-        }
-
-        if self.code_hash.is_some() {
-            struct_length += 33 // 32-byte array + 1 byte for length
-        }
-
-        if self.incarnation > 0 {
-            struct_length += 1 + Self::u64_compact_len(self.incarnation);
-        }
-
-        struct_length
+    fn write_compact<const LEN: usize>(input: &[u8; LEN]) -> ArrayVec<u8, LEN> {
+        input.iter().copied().skip_while(|v| *v == 0).collect()
     }
 
-    fn u256_compact_len(num: U256) -> usize {
-        (num.bits() + 7) / 8
-    }
-
-    fn u64_compact_len(num: u64) -> usize {
-        ((u64::BITS - num.leading_zeros()) as usize + 7) / 8
-    }
-
-    fn write_compact(input: &[u8], buffer: &mut [u8]) -> usize {
-        let mut written = 0;
-        for &byte in input.iter().skip_while(|v| **v == 0) {
-            written += 1;
-            buffer[written] = byte;
-        }
-        if written > 0 {
-            buffer[0] = written as u8;
-        }
-
-        written
-    }
-
-    pub fn encode_for_storage(&self) -> Vec<u8> {
-        let mut buffer = vec![0; self.encoding_length_for_storage()];
+    pub fn encode_for_storage(&self) -> EncodedAccount {
+        let mut buffer = EncodedAccount::default();
 
         let mut field_set = AccountStorageFlags::default(); // start with first bit set to 0
-        let mut pos = 1;
-        if self.nonce > 0 {
-            field_set.set_nonce(true);
-            pos += 1 + Self::write_compact(&self.nonce.to_be_bytes(), &mut buffer[pos..]);
-        }
-
-        // Encoding balance
-        if !self.balance.is_zero() {
-            field_set.set_balance(true);
-            pos +=
-                1 + Self::write_compact(&common::value_to_bytes(self.balance), &mut buffer[pos..]);
-        }
-
-        if self.incarnation > 0 {
-            field_set.set_incarnation(true);
-            pos += 1 + Self::write_compact(&self.incarnation.to_be_bytes(), &mut buffer[pos..]);
+        buffer.push(0);
+        if self.nonce != 0 {
+            let b = Self::write_compact(&self.nonce.to_be_bytes());
+            field_set.set_nonce_len(b.len().try_into().unwrap());
+            buffer.try_extend_from_slice(&b[..]).unwrap();
         }
 
         // Encoding code hash
-        if let Some(code_hash) = self.code_hash {
+        if self.code_hash != EMPTY_HASH {
             field_set.set_code_hash(true);
-            buffer[pos] = 32;
-            buffer[pos + 1..pos + 33].copy_from_slice(code_hash.as_bytes());
+            buffer
+                .try_extend_from_slice(self.code_hash.as_fixed_bytes())
+                .unwrap();
+        }
+
+        // Encoding balance
+        if self.balance != 0 {
+            let b = Self::write_compact(&self.balance.to_be_bytes());
+            buffer.try_extend_from_slice(&b[..]).unwrap();
         }
 
         let fs = field_set.into_bytes()[0];
@@ -134,64 +109,51 @@ impl Account {
 
         let mut a = Self::default();
 
-        let field_set_flag = enc.get_u8();
-        let field_set = AccountStorageFlags::from_bytes(field_set_flag.to_be_bytes());
+        let field_set = AccountStorageFlags::from_bytes([enc.get_u8()]);
 
-        if field_set.nonce() {
-            let decode_length = enc.get_u8() as usize;
-
-            a.nonce = bytes_to_u64(&enc[..decode_length]);
-            enc.advance(decode_length);
-        }
-
-        if field_set.balance() {
-            let decode_length = enc.get_u8() as usize;
-
-            a.balance = U256::from_big_endian(&enc[..decode_length]);
-            enc.advance(decode_length);
-        }
-
-        if field_set.incarnation() {
-            let decode_length = enc.get_u8() as usize;
-
-            a.incarnation = bytes_to_u64(&enc[..decode_length]);
-            enc.advance(decode_length);
+        let decode_length = field_set.nonce_len();
+        if decode_length > 0 {
+            a.nonce = bytes_to_u64(&enc[..decode_length.into()]);
+            enc.advance(decode_length.into());
         }
 
         if field_set.code_hash() {
-            let decode_length = enc.get_u8() as usize;
-
-            if decode_length != 32 {
-                bail!(
-                    "codehash should be 32 bytes long, got {} instead",
-                    decode_length
-                )
-            }
-
-            a.code_hash = Some(H256::from_slice(&enc[..decode_length]));
-            enc.advance(decode_length);
+            a.code_hash = H256::from_slice(&enc[..KECCAK_LENGTH]);
+            enc.advance(KECCAK_LENGTH);
         }
 
+        a.balance = U256::from_be_bytes(static_left_pad(enc));
+
         Ok(Some(a))
+    }
+
+    pub fn to_rlp(&self, storage_root: H256) -> RlpAccount {
+        RlpAccount {
+            nonce: self.nonce,
+            balance: self.balance,
+            storage_root,
+            code_hash: self.code_hash,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common;
+    use crate::crypto::*;
     use hex_literal::hex;
 
-    fn run_test_storage(original: Account, expected_encoded: &[u8]) {
+    fn run_test_storage<const EXPECTED_LEN: usize>(
+        original: Account,
+        expected_encoded: [u8; EXPECTED_LEN],
+    ) {
         let encoded_account = original.encode_for_storage();
 
-        assert_eq!(encoded_account, expected_encoded);
+        assert_eq!(&encoded_account[..], &expected_encoded[..]);
 
-        let mut decoded = Account::decode_for_storage(&encoded_account)
+        let decoded = Account::decode_for_storage(&encoded_account)
             .unwrap()
             .unwrap();
-
-        decoded.root = original.root;
 
         assert_eq!(original, decoded);
     }
@@ -200,14 +162,11 @@ mod tests {
     fn empty() {
         run_test_storage(
             Account {
-                initialised: true,
                 nonce: 100,
-                balance: U256::zero(),
-                root: None,
-                code_hash: None,
-                incarnation: 5,
+                balance: 0.as_u256(),
+                code_hash: EMPTY_HASH,
             },
-            &hex!("0501640105"),
+            hex!("0164"),
         )
     }
 
@@ -215,79 +174,49 @@ mod tests {
     fn with_code() {
         run_test_storage(
             Account {
-                initialised: true,
                 nonce: 2,
-                balance: 1000.into(),
-                root: Some(H256(hex!(
-                    "0000000000000000000000000000000000000000000000000000000000000021"
-                ))),
-                code_hash: Some(common::hash_data(&[1, 2, 3])),
-                incarnation: 4,
+                balance: 1000.as_u256(),
+                code_hash: keccak256(&[1, 2, 3]),
             },
-            &hex!("0f01020203e8010420f1885eda54b7a053318cd41e2093220dab15d65381b1157a3633a83bfd5c9239"),
+            hex!("1102f1885eda54b7a053318cd41e2093220dab15d65381b1157a3633a83bfd5c923903e8"),
         )
-    }
-
-    #[test]
-    fn with_code_with_storage_size_hack() {
-        run_test_storage(Account {
-            initialised: true,
-            nonce: 2,
-            balance: 1000.into(),
-            root: Some(H256(hex!(
-                "0000000000000000000000000000000000000000000000000000000000000021"
-            ))),
-            code_hash: Some(common::hash_data(&[1, 2, 3])),
-            incarnation: 5,
-        }, &hex!("0f01020203e8010520f1885eda54b7a053318cd41e2093220dab15d65381b1157a3633a83bfd5c9239"))
     }
 
     #[test]
     fn without_code() {
         run_test_storage(
             Account {
-                initialised: true,
                 nonce: 2,
-                balance: 1000.into(),
-                root: None,
-                code_hash: None,
-                incarnation: 5,
+                balance: 1000.as_u256(),
+                code_hash: EMPTY_HASH,
             },
-            &hex!("0701020203e80105"),
+            hex!("010203e8"),
         )
     }
 
     #[test]
-    fn with_empty_balance_non_nil_contract_and_not_zero_incarnation() {
+    fn with_empty_balance_non_nil_contract() {
         run_test_storage(
             Account {
-                initialised: true,
                 nonce: 0,
-                balance: 0.into(),
-                root: Some(H256(hex!(
+                balance: 0.as_u256(),
+                code_hash: H256(hex!(
                     "0000000000000000000000000000000000000000000000000000000000000123"
-                ))),
-                code_hash: Some(H256(hex!(
-                    "0000000000000000000000000000000000000000000000000000000000000123"
-                ))),
-                incarnation: 1,
+                )),
             },
-            &hex!("0c0101200000000000000000000000000000000000000000000000000000000000000123"),
+            hex!("100000000000000000000000000000000000000000000000000000000000000123"),
         )
     }
 
     #[test]
-    fn with_empty_balance_and_not_zero_incarnation() {
+    fn with_empty_balance() {
         run_test_storage(
             Account {
-                initialised: true,
                 nonce: 0,
-                balance: 0.into(),
-                root: None,
-                code_hash: None,
-                incarnation: 1,
+                balance: 0.as_u256(),
+                code_hash: EMPTY_HASH,
             },
-            &hex!("040101"),
+            hex!("00"),
         )
     }
 }

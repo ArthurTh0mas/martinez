@@ -1,35 +1,25 @@
-use crate::downloader::sentry_address::SentryAddress;
-use anyhow::anyhow;
-use structopt::StructOpt;
+use clap::Parser;
 
-#[derive(StructOpt)]
-#[structopt(name = "ddl", about = "test sentry client")]
+#[derive(Parser, Debug)]
 pub struct Opts {
-    #[structopt(
-        long = "sentry.api.addr",
-        help = "Sentry GRPC service URL as 'http://host:port'",
-        default_value = "http://localhost:8000"
+    #[clap(
+        long = "downloader.headers-mem-limit",
+        help = "How much memory in Mb to allocate for the active parallel download window.",
+        default_value = "50"
     )]
-    pub sentry_api_addr: SentryAddress,
-    #[structopt(
-        long = "chain",
-        help = "Name of the testnet to join",
-        default_value = "mainnet"
+    pub headers_mem_limit_mb: u32,
+    #[clap(
+        long = "downloader.headers-batch-size",
+        help = "How many headers to download per stage run.",
+        default_value = "100000"
     )]
-    pub chain_name: String,
+    pub headers_batch_size: usize,
 }
 
 impl Opts {
-    pub fn new(args_opt: Option<Vec<String>>, chain_names: &[&str]) -> anyhow::Result<Self> {
-        let instance: Opts = match args_opt {
-            Some(args) => Opts::from_iter_safe(args)?,
-            None => Opts::from_args_safe()?,
-        };
-
-        if !chain_names.contains(&instance.chain_name.as_str()) {
-            return Err(anyhow!("unknown chain '{}'", instance.chain_name));
-        }
-
-        Ok(instance)
+    pub fn headers_mem_limit(&self) -> usize {
+        byte_unit::n_mib_bytes!(self.headers_mem_limit_mb as u128)
+            .try_into()
+            .unwrap_or(usize::MAX)
     }
 }
