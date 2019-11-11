@@ -83,3 +83,7 @@ name = "martinez-rpc"
 [[bin]]
 path = "bin/martinez-toolbox.rs"
 name = "martinez-toolbox"
+
+[[bin]]
+path = "bin/blockhashes_stage.rs"
+name = "blockhashes_stage"
