@@ -1,14 +1,14 @@
 use super::*;
 use crate::{models::*, zeroless_view, StageId};
-use anyhow::{bail, format_err};
+use anyhow::bail;
 use arrayref::array_ref;
 use arrayvec::ArrayVec;
-use bytes::Bytes;
-use croaring::{treemap::NativeSerializer, Treemap as RoaringTreemap};
 use derive_more::*;
+use ethereum_types::*;
 use maplit::hashmap;
 use modular_bitfield::prelude::*;
 use once_cell::sync::Lazy;
+use roaring::RoaringTreemap;
 use serde::{Deserialize, *};
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 
@@ -24,9 +24,18 @@ where
     type Key = Vec<u8>;
     type Value = Vec<u8>;
     type SeekKey = Vec<u8>;
+    type FusedValue = (Self::Key, Self::Value);
 
     fn db_name(&self) -> string::String<StaticBytes> {
         self.0.db_name()
+    }
+
+    fn fuse_values(key: Self::Key, value: Self::Value) -> anyhow::Result<Self::FusedValue> {
+        Ok((key, value))
+    }
+
+    fn split_fused((key, value): Self::FusedValue) -> (Self::Key, Self::Value) {
+        (key, value)
     }
 }
 
@@ -58,23 +67,31 @@ where
     }
 }
 
-#[macro_export]
 macro_rules! decl_table {
     ($name:ident => $key:ty => $value:ty => $seek_key:ty) => {
         #[derive(Clone, Copy, Debug, Default)]
         pub struct $name;
 
-        impl $crate::kv::traits::Table for $name {
+        impl crate::kv::traits::Table for $name {
             type Key = $key;
             type SeekKey = $seek_key;
             type Value = $value;
+            type FusedValue = (Self::Key, Self::Value);
 
-            fn db_name(&self) -> string::String<bytes::Bytes> {
+            fn db_name(&self) -> string::String<static_bytes::Bytes> {
                 unsafe {
-                    string::String::from_utf8_unchecked(bytes::Bytes::from_static(
+                    string::String::from_utf8_unchecked(static_bytes::Bytes::from_static(
                         Self::const_db_name().as_bytes(),
                     ))
                 }
+            }
+
+            fn fuse_values(key: Self::Key, value: Self::Value) -> anyhow::Result<Self::FusedValue> {
+                Ok((key, value))
+            }
+
+            fn split_fused((key, value): Self::FusedValue) -> (Self::Key, Self::Value) {
+                (key, value)
             }
         }
 
@@ -83,8 +100,8 @@ macro_rules! decl_table {
                 stringify!($name)
             }
 
-            pub const fn erased(self) -> $crate::kv::tables::ErasedTable<Self> {
-                $crate::kv::tables::ErasedTable(self)
+            pub const fn erased(self) -> ErasedTable<Self> {
+                ErasedTable(self)
             }
         }
 
@@ -115,20 +132,6 @@ impl traits::TableEncode for Vec<u8> {
 impl traits::TableDecode for Vec<u8> {
     fn decode(b: &[u8]) -> anyhow::Result<Self> {
         Ok(b.to_vec())
-    }
-}
-
-impl traits::TableEncode for Bytes {
-    type Encoded = Self;
-
-    fn encode(self) -> Self::Encoded {
-        self
-    }
-}
-
-impl traits::TableDecode for Bytes {
-    fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        Ok(b.to_vec().into())
     }
 }
 
@@ -234,6 +237,7 @@ macro_rules! u64_table_object {
 
 u64_table_object!(u64);
 u64_table_object!(BlockNumber);
+u64_table_object!(Incarnation);
 u64_table_object!(TxIndex);
 
 #[derive(
@@ -286,48 +290,48 @@ where
     }
 }
 
-macro_rules! scale_table_object {
+macro_rules! rlp_table_object {
     ($ty:ty) => {
         impl TableEncode for $ty {
-            type Encoded = Vec<u8>;
+            type Encoded = static_bytes::BytesMut;
 
             fn encode(self) -> Self::Encoded {
-                ::parity_scale_codec::Encode::encode(&self)
-            }
-        }
-
-        impl TableDecode for $ty {
-            fn decode(mut b: &[u8]) -> anyhow::Result<Self> {
-                Ok(<Self as ::parity_scale_codec::Decode>::decode(&mut b)?)
-            }
-        }
-    };
-}
-
-scale_table_object!(BodyForStorage);
-scale_table_object!(BlockHeader);
-scale_table_object!(MessageWithSignature);
-scale_table_object!(Vec<crate::models::Log>);
-
-macro_rules! ron_table_object {
-    ($ty:ident) => {
-        impl TableEncode for $ty {
-            type Encoded = String;
-
-            fn encode(self) -> Self::Encoded {
-                ron::to_string(&self).unwrap()
+                rlp::encode(&self)
             }
         }
 
         impl TableDecode for $ty {
             fn decode(b: &[u8]) -> anyhow::Result<Self> {
-                Ok(ron::from_str(std::str::from_utf8(b)?)?)
+                Ok(rlp::decode(b)?)
             }
         }
     };
 }
 
-ron_table_object!(ChainSpec);
+rlp_table_object!(U256);
+rlp_table_object!(BodyForStorage);
+rlp_table_object!(BlockHeader);
+rlp_table_object!(Transaction);
+
+macro_rules! json_table_object {
+    ($ty:ident) => {
+        impl TableEncode for $ty {
+            type Encoded = Vec<u8>;
+
+            fn encode(self) -> Self::Encoded {
+                serde_json::to_vec(&self).unwrap()
+            }
+        }
+
+        impl TableDecode for $ty {
+            fn decode(b: &[u8]) -> anyhow::Result<Self> {
+                Ok(serde_json::from_slice(b)?)
+            }
+        }
+    };
+}
+
+json_table_object!(ChainConfig);
 
 impl TableEncode for Address {
     type Encoded = [u8; ADDRESS_LENGTH];
@@ -343,35 +347,6 @@ impl TableDecode for Address {
             ADDRESS_LENGTH => Ok(Address::from_slice(&*b)),
             other => Err(InvalidLength::<ADDRESS_LENGTH> { got: other }.into()),
         }
-    }
-}
-
-impl TableEncode for Vec<Address> {
-    type Encoded = Vec<u8>;
-
-    fn encode(self) -> Self::Encoded {
-        let mut v = Vec::with_capacity(self.len() * ADDRESS_LENGTH);
-        for addr in self {
-            v.extend_from_slice(&addr.encode());
-        }
-
-        v
-    }
-}
-
-impl TableDecode for Vec<Address> {
-    fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        if b.len() % ADDRESS_LENGTH != 0 {
-            bail!("Slice len should be divisible by {}", ADDRESS_LENGTH);
-        }
-
-        let mut v = Vec::with_capacity(b.len() / ADDRESS_LENGTH);
-        for i in 0..b.len() / ADDRESS_LENGTH {
-            let offset = i * ADDRESS_LENGTH;
-            v.push(Address::decode(&b[offset..offset + ADDRESS_LENGTH])?);
-        }
-
-        Ok(v)
     }
 }
 
@@ -395,71 +370,63 @@ where
     }
 }
 
-impl TableEncode for U256 {
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deref,
+    DerefMut,
+    Default,
+    Display,
+    PartialEq,
+    Eq,
+    From,
+    Into,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+)]
+#[serde(transparent)]
+pub struct ZerolessH256(pub H256);
+
+impl TableEncode for ZerolessH256 {
     type Encoded = VariableVec<KECCAK_LENGTH>;
 
     fn encode(self) -> Self::Encoded {
-        self.to_be_bytes()
-            .into_iter()
-            .skip_while(|&v| v == 0)
-            .collect()
-    }
-}
-
-impl TableDecode for U256 {
-    fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        if b.len() > KECCAK_LENGTH {
-            return Err(TooLong::<KECCAK_LENGTH> { got: b.len() }.into());
-        }
-        let mut v = [0; 32];
-        v[KECCAK_LENGTH - b.len()..].copy_from_slice(b);
-        Ok(Self::from_be_bytes(v))
-    }
-}
-
-impl TableEncode for (H256, U256) {
-    type Encoded = VariableVec<{ KECCAK_LENGTH + KECCAK_LENGTH }>;
-
-    fn encode(self) -> Self::Encoded {
         let mut out = Self::Encoded::default();
-        out.try_extend_from_slice(&self.0.encode()).unwrap();
-        out.try_extend_from_slice(&self.1.encode()).unwrap();
+        out.try_extend_from_slice(zeroless_view(&self.0)).unwrap();
         out
     }
 }
 
-impl TableDecode for (H256, U256) {
+impl TableDecode for ZerolessH256 {
     fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        if b.len() > KECCAK_LENGTH + KECCAK_LENGTH {
-            return Err(TooLong::<{ KECCAK_LENGTH + KECCAK_LENGTH }> { got: b.len() }.into());
+        if b.len() > KECCAK_LENGTH {
+            bail!("too long: {} > {}", b.len(), KECCAK_LENGTH);
         }
 
-        if b.len() < KECCAK_LENGTH {
-            return Err(TooShort::<{ KECCAK_LENGTH }> { got: b.len() }.into());
-        }
-
-        let (location, value) = b.split_at(KECCAK_LENGTH);
-
-        Ok((H256::decode(location)?, U256::decode(value)?))
+        Ok(H256::from_uint(&U256::from_big_endian(b)).into())
     }
 }
 
 impl TableEncode for RoaringTreemap {
     type Encoded = Vec<u8>;
 
-    fn encode(mut self) -> Self::Encoded {
-        self.run_optimize();
-        self.serialize().unwrap()
+    fn encode(self) -> Self::Encoded {
+        let mut out = vec![];
+        self.serialize_into(&mut out).unwrap();
+        out
     }
 }
 
 impl TableDecode for RoaringTreemap {
     fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        Ok(RoaringTreemap::deserialize(b)?)
+        Ok(RoaringTreemap::deserialize_from(b)?)
     }
 }
 
-#[derive(Debug)]
 pub struct BitmapKey<K> {
     pub inner: K,
     pub block_number: BlockNumber,
@@ -563,7 +530,7 @@ where
     }
 }
 
-impl DupSort for Storage {
+impl DupSort for PlainState {
     type SeekBothKey = H256;
 }
 impl DupSort for AccountChangeSet {
@@ -573,7 +540,7 @@ impl DupSort for StorageChangeSet {
     type SeekBothKey = H256;
 }
 impl DupSort for HashedStorage {
-    type SeekBothKey = H256;
+    type SeekBothKey = Vec<u8>;
 }
 impl DupSort for CallTraceSet {
     type SeekBothKey = Vec<u8>;
@@ -581,24 +548,10 @@ impl DupSort for CallTraceSet {
 
 pub type AccountChangeKey = BlockNumber;
 
-impl TableEncode for crate::models::Account {
-    type Encoded = EncodedAccount;
-
-    fn encode(self) -> Self::Encoded {
-        self.encode_for_storage()
-    }
-}
-
-impl TableDecode for crate::models::Account {
-    fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        crate::models::Account::decode_for_storage(b)?.ok_or_else(|| format_err!("cannot be empty"))
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct AccountChange {
     pub address: Address,
-    pub account: Option<crate::models::Account>,
+    pub account: EncodedAccount,
 }
 
 impl TableEncode for AccountChange {
@@ -607,26 +560,20 @@ impl TableEncode for AccountChange {
     fn encode(self) -> Self::Encoded {
         let mut out = Self::Encoded::default();
         out.try_extend_from_slice(&self.address.encode()).unwrap();
-        if let Some(account) = self.account {
-            out.try_extend_from_slice(&account.encode()).unwrap();
-        }
+        out.try_extend_from_slice(&self.account).unwrap();
         out
     }
 }
 
 impl TableDecode for AccountChange {
     fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        if b.len() < ADDRESS_LENGTH {
-            return Err(TooShort::<{ ADDRESS_LENGTH }> { got: b.len() }.into());
+        if b.len() < ADDRESS_LENGTH + 1 {
+            return Err(TooShort::<{ ADDRESS_LENGTH + 1 }> { got: b.len() }.into());
         }
 
         Ok(Self {
-            address: TableDecode::decode(&b[..ADDRESS_LENGTH])?,
-            account: if b.len() > ADDRESS_LENGTH {
-                Some(TableDecode::decode(&b[ADDRESS_LENGTH..])?)
-            } else {
-                None
-            },
+            address: Address::decode(&b[..ADDRESS_LENGTH])?,
+            account: EncodedAccount::decode(&b[ADDRESS_LENGTH..])?,
         })
     }
 }
@@ -635,25 +582,31 @@ impl TableDecode for AccountChange {
 pub struct StorageChangeKey {
     pub block_number: BlockNumber,
     pub address: Address,
+    pub incarnation: Incarnation,
 }
 
 impl TableEncode for StorageChangeKey {
-    type Encoded = [u8; BLOCK_NUMBER_LENGTH + ADDRESS_LENGTH];
+    type Encoded = [u8; BLOCK_NUMBER_LENGTH + ADDRESS_LENGTH + INCARNATION_LENGTH];
 
     fn encode(self) -> Self::Encoded {
-        let mut out = [0; BLOCK_NUMBER_LENGTH + ADDRESS_LENGTH];
+        let mut out = [0; BLOCK_NUMBER_LENGTH + ADDRESS_LENGTH + INCARNATION_LENGTH];
         out[..BLOCK_NUMBER_LENGTH].copy_from_slice(&self.block_number.encode());
-        out[BLOCK_NUMBER_LENGTH..].copy_from_slice(&self.address.encode());
+        out[BLOCK_NUMBER_LENGTH..BLOCK_NUMBER_LENGTH + ADDRESS_LENGTH]
+            .copy_from_slice(&self.address.encode());
+        out[BLOCK_NUMBER_LENGTH + ADDRESS_LENGTH..].copy_from_slice(&self.incarnation.encode());
         out
     }
 }
 
 impl TableDecode for StorageChangeKey {
     fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        if b.len() != BLOCK_NUMBER_LENGTH + ADDRESS_LENGTH {
-            return Err(
-                InvalidLength::<{ BLOCK_NUMBER_LENGTH + ADDRESS_LENGTH }> { got: b.len() }.into(),
-            );
+        if b.len() != BLOCK_NUMBER_LENGTH + ADDRESS_LENGTH + INCARNATION_LENGTH {
+            return Err(InvalidLength::<
+                { BLOCK_NUMBER_LENGTH + ADDRESS_LENGTH + INCARNATION_LENGTH },
+            > {
+                got: b.len(),
+            }
+            .into());
         }
 
         Ok(Self {
@@ -661,14 +614,42 @@ impl TableDecode for StorageChangeKey {
             address: Address::decode(
                 &b[BLOCK_NUMBER_LENGTH..BLOCK_NUMBER_LENGTH + ADDRESS_LENGTH],
             )?,
+            incarnation: Incarnation::decode(&b[BLOCK_NUMBER_LENGTH + ADDRESS_LENGTH..])?,
         })
+    }
+}
+
+pub enum StorageChangeSeekKey {
+    Block(BlockNumber),
+    BlockAndAddress(BlockNumber, Address),
+    Full(StorageChangeKey),
+}
+
+impl TableEncode for StorageChangeSeekKey {
+    type Encoded = VariableVec<{ BLOCK_NUMBER_LENGTH + ADDRESS_LENGTH + INCARNATION_LENGTH }>;
+
+    fn encode(self) -> Self::Encoded {
+        let mut out = Self::Encoded::default();
+        match self {
+            StorageChangeSeekKey::Block(block) => {
+                out.try_extend_from_slice(&block.encode()).unwrap();
+            }
+            StorageChangeSeekKey::BlockAndAddress(block, address) => {
+                out.try_extend_from_slice(&block.encode()).unwrap();
+                out.try_extend_from_slice(&address.encode()).unwrap();
+            }
+            StorageChangeSeekKey::Full(key) => {
+                out.try_extend_from_slice(&key.encode()).unwrap();
+            }
+        }
+        out
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct StorageChange {
     pub location: H256,
-    pub value: U256,
+    pub value: ZerolessH256,
 }
 
 impl TableEncode for StorageChange {
@@ -690,7 +671,7 @@ impl TableDecode for StorageChange {
 
         Ok(Self {
             location: H256::decode(&b[..KECCAK_LENGTH])?,
-            value: U256::decode(&b[KECCAK_LENGTH..])?,
+            value: ZerolessH256::decode(&b[KECCAK_LENGTH..])?,
         })
     }
 }
@@ -708,9 +689,9 @@ struct CallTraceSetFlags {
 
 #[derive(Clone, Copy, Debug)]
 pub struct CallTraceSetEntry {
-    pub address: Address,
-    pub from: bool,
-    pub to: bool,
+    address: Address,
+    from: bool,
+    to: bool,
 }
 
 impl TableEncode for CallTraceSetEntry {
@@ -744,15 +725,204 @@ impl TableDecode for CallTraceSetEntry {
     }
 }
 
-decl_table!(Account => Address => crate::models::Account);
-decl_table!(Storage => Address => (H256, U256));
+#[derive(Clone, Copy, Debug)]
+pub enum PlainStateKey {
+    Account(Address),
+    Storage(Address, Incarnation),
+}
+
+impl TableEncode for PlainStateKey {
+    type Encoded = VariableVec<{ ADDRESS_LENGTH + INCARNATION_LENGTH }>;
+
+    fn encode(self) -> Self::Encoded {
+        let mut out = Self::Encoded::default();
+        match self {
+            PlainStateKey::Account(address) => {
+                out.try_extend_from_slice(&address.encode()).unwrap();
+            }
+            PlainStateKey::Storage(address, incarnation) => {
+                out.try_extend_from_slice(&address.encode()).unwrap();
+                out.try_extend_from_slice(&incarnation.encode()).unwrap();
+            }
+        }
+        out
+    }
+}
+
+impl TableDecode for PlainStateKey {
+    fn decode(b: &[u8]) -> anyhow::Result<Self> {
+        const STORAGE_KEY_LEN: usize = ADDRESS_LENGTH + INCARNATION_LENGTH;
+        Ok(match b.len() {
+            ADDRESS_LENGTH => Self::Account(Address::decode(b)?),
+            STORAGE_KEY_LEN => Self::Storage(
+                Address::decode(&b[..ADDRESS_LENGTH])?,
+                Incarnation::decode(&b[ADDRESS_LENGTH..])?,
+            ),
+            _ => bail!(
+                "invalid length: expected one of [{}, {}], got {}",
+                ADDRESS_LENGTH,
+                STORAGE_KEY_LEN,
+                b.len()
+            ),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum PlainStateSeekKey {
+    Account(Address),
+    StorageAllIncarnations(Address),
+    StorageWithIncarnation(Address, Incarnation),
+}
+
+impl TableEncode for PlainStateSeekKey {
+    type Encoded = VariableVec<{ ADDRESS_LENGTH + INCARNATION_LENGTH }>;
+
+    fn encode(self) -> Self::Encoded {
+        let mut out = Self::Encoded::default();
+        match self {
+            Self::Account(address) | Self::StorageAllIncarnations(address) => {
+                out.try_extend_from_slice(&address.encode()).unwrap();
+            }
+            Self::StorageWithIncarnation(address, incarnation) => {
+                out.try_extend_from_slice(&address.encode()).unwrap();
+                out.try_extend_from_slice(&incarnation.encode()).unwrap();
+            }
+        }
+        out
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum PlainStateFusedValue {
+    Account {
+        address: Address,
+        account: EncodedAccount,
+    },
+    Storage {
+        address: Address,
+        incarnation: Incarnation,
+        location: H256,
+        value: ZerolessH256,
+    },
+}
+
+impl PlainStateFusedValue {
+    pub fn as_account(&self) -> Option<(Address, EncodedAccount)> {
+        if let PlainStateFusedValue::Account { address, account } = self {
+            Some((*address, account.clone()))
+        } else {
+            None
+        }
+    }
+
+    pub fn as_storage(&self) -> Option<(Address, Incarnation, H256, H256)> {
+        if let Self::Storage {
+            address,
+            incarnation,
+            location,
+            value,
+        } = self
+        {
+            Some((*address, *incarnation, *location, (*value).into()))
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlainState;
+
+impl Table for PlainState {
+    type Key = PlainStateKey;
+    type Value = VariableVec<MAX_ACCOUNT_LEN>;
+    type SeekKey = PlainStateSeekKey;
+    type FusedValue = PlainStateFusedValue;
+
+    fn db_name(&self) -> string::String<static_bytes::Bytes> {
+        unsafe {
+            string::String::from_utf8_unchecked(static_bytes::Bytes::from_static(
+                Self::const_db_name().as_bytes(),
+            ))
+        }
+    }
+
+    fn fuse_values(key: Self::Key, value: Self::Value) -> anyhow::Result<Self::FusedValue> {
+        Ok(match key {
+            PlainStateKey::Account(address) => {
+                if value.len() > MAX_ACCOUNT_LEN {
+                    return Err(InvalidLength::<MAX_ACCOUNT_LEN> { got: value.len() }.into());
+                }
+
+                PlainStateFusedValue::Account {
+                    address,
+                    account: value,
+                }
+            }
+            PlainStateKey::Storage(address, incarnation) => {
+                if value.len() > KECCAK_LENGTH + KECCAK_LENGTH {
+                    return Err(
+                        TooLong::<{ KECCAK_LENGTH + KECCAK_LENGTH }> { got: value.len() }.into(),
+                    );
+                }
+
+                PlainStateFusedValue::Storage {
+                    address,
+                    incarnation,
+                    location: H256::decode(&value[..KECCAK_LENGTH])?,
+                    value: ZerolessH256::decode(&value[KECCAK_LENGTH..])?,
+                }
+            }
+        })
+    }
+
+    fn split_fused(fv: Self::FusedValue) -> (Self::Key, Self::Value) {
+        match fv {
+            PlainStateFusedValue::Account { address, account } => {
+                (PlainStateKey::Account(address), account)
+            }
+            PlainStateFusedValue::Storage {
+                address,
+                incarnation,
+                location,
+                value,
+            } => {
+                let mut v = Self::Value::default();
+                v.try_extend_from_slice(&location.encode()).unwrap();
+                v.try_extend_from_slice(&value.encode()).unwrap();
+                (PlainStateKey::Storage(address, incarnation), v)
+            }
+        }
+    }
+}
+
+impl PlainState {
+    pub const fn const_db_name() -> &'static str {
+        "PlainState"
+    }
+
+    pub const fn erased(self) -> ErasedTable<Self> {
+        ErasedTable(self)
+    }
+}
+
+impl std::fmt::Display for PlainState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", Self::const_db_name())
+    }
+}
+
+decl_table!(PlainCodeHash => (Address, Incarnation) => H256);
 decl_table!(AccountChangeSet => AccountChangeKey => AccountChange);
-decl_table!(StorageChangeSet => StorageChangeKey => StorageChange => BlockNumber);
-decl_table!(HashedAccount => H256 => crate::models::Account);
-decl_table!(HashedStorage => H256 => (H256, U256));
+decl_table!(StorageChangeSet => StorageChangeKey => StorageChange => StorageChangeSeekKey);
+decl_table!(HashedAccount => H256 => Vec<u8>);
+decl_table!(HashedStorage => Vec<u8> => Vec<u8>);
 decl_table!(AccountHistory => BitmapKey<Address> => RoaringTreemap);
 decl_table!(StorageHistory => BitmapKey<(Address, H256)> => RoaringTreemap);
-decl_table!(Code => H256 => Bytes);
+decl_table!(Code => H256 => Vec<u8>);
+decl_table!(HashedCodeHash => (H256, Incarnation) => H256);
+decl_table!(IncarnationMap => Address => Incarnation);
 decl_table!(TrieAccount => Vec<u8> => Vec<u8>);
 decl_table!(TrieStorage => Vec<u8> => Vec<u8>);
 decl_table!(DbInfo => Vec<u8> => Vec<u8>);
@@ -760,36 +930,35 @@ decl_table!(SnapshotInfo => Vec<u8> => Vec<u8>);
 decl_table!(BittorrentInfo => Vec<u8> => Vec<u8>);
 decl_table!(HeaderNumber => H256 => BlockNumber);
 decl_table!(CanonicalHeader => BlockNumber => H256);
-decl_table!(Header => HeaderKey => BlockHeader => BlockNumber);
+decl_table!(Header => HeaderKey => BlockHeader);
 decl_table!(HeadersTotalDifficulty => HeaderKey => U256);
 decl_table!(BlockBody => HeaderKey => BodyForStorage => BlockNumber);
-decl_table!(BlockTransaction => TxIndex => MessageWithSignature);
-decl_table!(TotalGas => BlockNumber => u64);
-decl_table!(TotalTx => BlockNumber => u64);
-decl_table!(Log => (BlockNumber, TxIndex) => Vec<crate::models::Log>);
+decl_table!(BlockTransaction => TxIndex => Transaction);
+decl_table!(Receipt => BlockNumber => Vec<u8>);
+decl_table!(TransactionLog => (BlockNumber, TxIndex) => Vec<u8>);
 decl_table!(LogTopicIndex => Vec<u8> => RoaringTreemap);
 decl_table!(LogAddressIndex => Vec<u8> => RoaringTreemap);
 decl_table!(CallTraceSet => BlockNumber => CallTraceSetEntry);
-decl_table!(CallFromIndex => BitmapKey<Address> => RoaringTreemap);
-decl_table!(CallToIndex => BitmapKey<Address> => RoaringTreemap);
+decl_table!(CallFromIndex => Vec<u8> => RoaringTreemap);
+decl_table!(CallToIndex => Vec<u8> => RoaringTreemap);
 decl_table!(BlockTransactionLookup => H256 => TruncateStart<BlockNumber>);
-decl_table!(Config => H256 => ChainSpec);
+decl_table!(Config => H256 => ChainConfig);
 decl_table!(SyncStage => StageId => BlockNumber);
-decl_table!(TxSender => HeaderKey => Vec<Address>);
+decl_table!(TxSender => TxIndex => Address);
 decl_table!(LastBlock => Vec<u8> => Vec<u8>);
 decl_table!(Migration => Vec<u8> => Vec<u8>);
 decl_table!(Sequence => Vec<u8> => Vec<u8>);
-decl_table!(LastHeader => VariableVec<0> => H256);
+decl_table!(LastHeader => Vec<u8> => Vec<u8>);
 decl_table!(Issuance => Vec<u8> => Vec<u8>);
 
 pub type DatabaseChart = Arc<HashMap<&'static str, TableInfo>>;
 
 pub static CHAINDATA_TABLES: Lazy<Arc<HashMap<&'static str, TableInfo>>> = Lazy::new(|| {
     Arc::new(hashmap! {
-        Account::const_db_name() => TableInfo::default(),
-        Storage::const_db_name() => TableInfo {
+        PlainState::const_db_name() => TableInfo {
             dup_sort: true,
         },
+        PlainCodeHash::const_db_name() => TableInfo::default(),
         AccountChangeSet::const_db_name() => TableInfo {
             dup_sort: true,
         },
@@ -803,6 +972,8 @@ pub static CHAINDATA_TABLES: Lazy<Arc<HashMap<&'static str, TableInfo>>> = Lazy:
         AccountHistory::const_db_name() => TableInfo::default(),
         StorageHistory::const_db_name() => TableInfo::default(),
         Code::const_db_name() => TableInfo::default(),
+        HashedCodeHash::const_db_name() => TableInfo::default(),
+        IncarnationMap::const_db_name() => TableInfo::default(),
         TrieAccount::const_db_name() => TableInfo::default(),
         TrieStorage::const_db_name() => TableInfo::default(),
         DbInfo::const_db_name() => TableInfo::default(),
@@ -814,9 +985,8 @@ pub static CHAINDATA_TABLES: Lazy<Arc<HashMap<&'static str, TableInfo>>> = Lazy:
         HeadersTotalDifficulty::const_db_name() => TableInfo::default(),
         BlockBody::const_db_name() => TableInfo::default(),
         BlockTransaction::const_db_name() => TableInfo::default(),
-        TotalGas::const_db_name() => TableInfo::default(),
-        TotalTx::const_db_name() => TableInfo::default(),
-        Log::const_db_name() => TableInfo::default(),
+        Receipt::const_db_name() => TableInfo::default(),
+        TransactionLog::const_db_name() => TableInfo::default(),
         LogTopicIndex::const_db_name() => TableInfo::default(),
         LogAddressIndex::const_db_name() => TableInfo::default(),
         CallTraceSet::const_db_name() => TableInfo {
@@ -835,46 +1005,3 @@ pub static CHAINDATA_TABLES: Lazy<Arc<HashMap<&'static str, TableInfo>>> = Lazy:
         Issuance::const_db_name() => TableInfo::default(),
     })
 });
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use hex_literal::hex;
-
-    #[test]
-    fn u256() {
-        for (fixture, expected) in [
-            (U256::ZERO, vec![]),
-            (
-                U256::from(0xDEADBEEFBAADCAFE_u128),
-                hex!("DEADBEEFBAADCAFE").to_vec(),
-            ),
-            (U256::MAX, hex!("FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF").to_vec()),
-        ] {
-            assert_eq!(fixture.encode().to_vec(), expected);
-            assert_eq!(U256::decode(&expected).unwrap(), fixture);
-        }
-    }
-
-    #[test]
-    fn log() {
-        let input = vec![
-            crate::models::Log {
-                address: Address::from([0; 20]),
-                topics: vec![H256([1; 32]), H256([2; 32])],
-                data: hex!("BAADCAFE").to_vec().into(),
-            },
-            crate::models::Log {
-                address: Address::from([1; 20]),
-                topics: vec![H256([3; 32]), H256([4; 32])],
-                data: hex!("DEADBEEF").to_vec().into(),
-            },
-        ];
-
-        let encoded = input.clone().encode();
-
-        println!("{}", hex::encode(&encoded));
-
-        assert_eq!(Vec::<crate::models::Log>::decode(&encoded).unwrap(), input);
-    }
-}

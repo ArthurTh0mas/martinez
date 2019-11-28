@@ -1,22 +1,19 @@
 use crate::{
-    etl::collector::*,
-    kv::{tables, traits::*},
-    models::BodyForStorage,
-    stagedsync::{stage::*, stages::TX_LOOKUP},
-    StageId,
+    etl::{
+        collector::{Collector, OPTIMAL_BUFFER_CAPACITY},
+        data_provider::Entry,
+    },
+    kv::tables,
+    stagedsync::stage::{ExecOutput, Stage, StageInput, UnwindInput},
+    Cursor, MutableCursor, MutableTransaction, StageId,
 };
 use async_trait::async_trait;
-use std::sync::Arc;
-use tempfile::TempDir;
 use tokio::pin;
 use tokio_stream::StreamExt;
 use tracing::*;
 
-/// Generation of TransactionHash => BlockNumber mapping
 #[derive(Debug)]
-pub struct TxLookup {
-    temp_dir: Arc<TempDir>,
-}
+pub struct TxLookup;
 
 #[async_trait]
 impl<'db, RwTx> Stage<'db, RwTx> for TxLookup
@@ -24,28 +21,28 @@ where
     RwTx: MutableTransaction<'db>,
 {
     fn id(&self) -> StageId {
-        TX_LOOKUP
+        StageId("TxLookup")
     }
 
-    async fn execute<'tx>(
-        &mut self,
-        tx: &'tx mut RwTx,
-        input: StageInput,
-    ) -> anyhow::Result<ExecOutput>
+    fn description(&self) -> &'static str {
+        "Generating TransactionHash => BlockNumber Mapping"
+    }
+
+    async fn execute<'tx>(&self, tx: &'tx mut RwTx, input: StageInput) -> anyhow::Result<ExecOutput>
     where
         'db: 'tx,
     {
-        let mut bodies_cursor = tx.mutable_cursor(tables::BlockBody).await?;
+        let mut bodies_cursor = tx.mutable_cursor(&tables::BlockBody).await?;
         let mut tx_hash_cursor = tx
-            .mutable_cursor(tables::BlockTransactionLookup.erased())
+            .mutable_cursor(&tables::BlockTransactionLookup.erased())
             .await?;
 
-        let mut block_txs_cursor = tx.cursor(tables::BlockTransaction).await?;
+        let mut block_txs_cursor = tx.cursor(&tables::BlockTransaction).await?;
 
-        let mut collector = TableCollector::new(&*self.temp_dir, OPTIMAL_BUFFER_CAPACITY);
+        let mut collector = Collector::new(OPTIMAL_BUFFER_CAPACITY);
 
         let last_processed_block_number = tx
-            .mutable_cursor(tables::BlockTransactionLookup)
+            .mutable_cursor(&tables::BlockTransactionLookup)
             .await?
             .last()
             .await?
@@ -54,18 +51,17 @@ where
 
         let start_block_number = last_processed_block_number + 1;
 
-        let walker_block_body = walk(&mut bodies_cursor, Some(start_block_number));
+        let walker_block_body = bodies_cursor.walk(Some(start_block_number));
         pin!(walker_block_body);
 
         while let Some(((block_number, _), ref body_rpl)) = walker_block_body.try_next().await? {
             let (tx_count, tx_base_id) = (body_rpl.tx_amount, body_rpl.base_tx_id);
 
-            let walker_block_txs =
-                walk(&mut block_txs_cursor, Some(tx_base_id)).take(tx_count.try_into()?);
+            let walker_block_txs = block_txs_cursor.walk(Some(tx_base_id)).take(tx_count);
             pin!(walker_block_txs);
 
             while let Some((_, tx)) = walker_block_txs.try_next().await? {
-                collector.push(tx.hash(), tables::TruncateStart(block_number));
+                collector.collect(Entry::new(tx.hash(), tables::TruncateStart(block_number)));
             }
         }
 
@@ -77,20 +73,21 @@ where
                 .map(|(_, stage)| stage)
                 .unwrap_or_default(),
             done: false,
+            must_commit: true,
         })
     }
 
-    async fn unwind<'tx>(
-        &mut self,
-        tx: &'tx mut RwTx,
-        input: UnwindInput,
-    ) -> anyhow::Result<UnwindOutput>
+    async fn unwind<'tx>(&self, tx: &'tx mut RwTx, input: UnwindInput) -> anyhow::Result<()>
     where
         'db: 'tx,
     {
-        let mut bodies_cursor = tx.mutable_cursor(tables::BlockBody).await?;
-        let mut tx_hash_cursor = tx.mutable_cursor(tables::BlockTransactionLookup).await?;
-        let mut block_txs_cursor = tx.cursor(tables::BlockTransaction).await?;
+        if input.unwind_to >= input.stage_progress {
+            return Ok(());
+        }
+
+        let mut bodies_cursor = tx.mutable_cursor(&tables::BlockBody).await?;
+        let mut tx_hash_cursor = tx.mutable_cursor(&tables::BlockTransactionLookup).await?;
+        let mut block_txs_cursor = tx.cursor(&tables::BlockTransaction).await?;
 
         let start_block_number = input.unwind_to + 1;
 
@@ -99,61 +96,47 @@ where
             input.stage_progress, input.unwind_to
         );
 
-        let walker_block_body = walk(&mut bodies_cursor, Some(start_block_number));
+        let walker_block_body = bodies_cursor.walk(Some(start_block_number));
         pin!(walker_block_body);
 
-        while let Some((
-            _,
-            BodyForStorage {
-                base_tx_id,
-                tx_amount,
-                ..
-            },
-        )) = walker_block_body.try_next().await?
-        {
-            let walker_block_txs = walk(&mut block_txs_cursor, Some(base_tx_id));
+        while let Some((_, body_rpl)) = walker_block_body.try_next().await? {
+            let (tx_count, tx_base_id) = (body_rpl.tx_amount, body_rpl.base_tx_id);
+
+            let walker_block_txs = block_txs_cursor.walk(Some(tx_base_id));
             pin!(walker_block_txs);
 
             let mut num_txs = 1;
 
-            while let Some((_, tx_value)) = walker_block_txs.try_next().await? {
-                if num_txs > tx_amount {
+            while let Some((_tx_key, ref tx_value)) = walker_block_txs.try_next().await? {
+                if num_txs > tx_count {
                     break;
                 }
 
-                if tx_hash_cursor.seek(tx_value.hash()).await?.is_some() {
-                    tx_hash_cursor.delete_current().await?;
+                if let Ok(Some((key, value))) = tx_hash_cursor.seek(tx_value.hash()).await {
+                    tx_hash_cursor.delete((key, value)).await?;
                 }
                 num_txs += 1;
             }
         }
-        Ok(UnwindOutput {
-            stage_progress: input.unwind_to,
-        })
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        accessors::chain,
-        kv::new_mem_database,
-        models::{MessageWithSignature, *},
-    };
+    use crate::{accessors::chain, kv::traits::MutableKV, models::*, new_mem_database};
     use bytes::Bytes;
+    use ethereum_types::*;
     use hex_literal::hex;
-    use std::time::Instant;
-
-    const CHAIN_ID: Option<ChainId> = Some(ChainId(1));
 
     #[tokio::test]
     async fn tx_lookup_stage_with_data() {
         let db = new_mem_database().unwrap();
         let mut tx = db.begin_mutable().await.unwrap();
 
-        let recipient1 = Address::from(hex!("f4148309cc30f2dd4ba117122cad6be1e3ba0e2b"));
-        let recipient2 = Address::from(hex!("d7fa8303df7073290f66ced1add5fe89dac0c462"));
+        let recipient1 = H160::from(hex!("f4148309cc30f2dd4ba117122cad6be1e3ba0e2b"));
+        let recipient2 = H160::from(hex!("d7fa8303df7073290f66ced1add5fe89dac0c462"));
 
         let block1 = BodyForStorage {
             base_tx_id: 1.into(),
@@ -161,17 +144,17 @@ mod tests {
             uncles: vec![],
         };
 
-        let tx1_1 = MessageWithSignature {
-            message: Message::Legacy {
-                chain_id: CHAIN_ID,
+        let tx1_1 = Transaction {
+            message: TransactionMessage::Legacy {
+                chain_id: Some(1),
                 nonce: 1,
-                gas_price: 1_000_000.as_u256(),
+                gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
                 action: TransactionAction::Call(recipient1),
-                value: 1.as_u256(),
+                value: 1.into(),
                 input: Bytes::new(),
             },
-            signature: MessageSignature::new(
+            signature: TransactionSignature::new(
                 false,
                 H256::from(hex!(
                     "11d244ae19e3bb96d1bb864aa761d48e957984a154329f0de757cd105f9c7ac4"
@@ -184,17 +167,17 @@ mod tests {
         };
         let hash1_1 = tx1_1.hash();
 
-        let tx1_2 = MessageWithSignature {
-            message: Message::Legacy {
-                chain_id: CHAIN_ID,
+        let tx1_2 = Transaction {
+            message: TransactionMessage::Legacy {
+                chain_id: Some(1),
                 nonce: 2,
-                gas_price: 1_000_000.as_u256(),
+                gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
                 action: TransactionAction::Call(recipient1),
-                value: 0x100.as_u256(),
+                value: 0x100.into(),
                 input: Bytes::new(),
             },
-            signature: MessageSignature::new(
+            signature: TransactionSignature::new(
                 true,
                 H256::from(hex!(
                     "9e8c555909921d359bfb0c2734841c87691eb257cb5f0597ac47501abd8ba0de"
@@ -213,17 +196,17 @@ mod tests {
             uncles: vec![],
         };
 
-        let tx2_1 = MessageWithSignature {
-            message: Message::Legacy {
-                chain_id: CHAIN_ID,
+        let tx2_1 = Transaction {
+            message: TransactionMessage::Legacy {
+                chain_id: Some(1),
                 nonce: 3,
-                gas_price: 1_000_000.as_u256(),
+                gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
                 action: TransactionAction::Call(recipient1),
-                value: 0x10000.as_u256(),
+                value: 0x10000.into(),
                 input: Bytes::new(),
             },
-            signature: MessageSignature::new(
+            signature: TransactionSignature::new(
                 true,
                 H256::from(hex!(
                     "2450fdbf8fbc1dee15022bfa7392eb15f04277782343258e185972b5b2b8bf79"
@@ -237,17 +220,17 @@ mod tests {
 
         let hash2_1 = tx2_1.hash();
 
-        let tx2_2 = MessageWithSignature {
-            message: Message::Legacy {
-                chain_id: CHAIN_ID,
+        let tx2_2 = Transaction {
+            message: TransactionMessage::Legacy {
+                chain_id: Some(1),
                 nonce: 6,
-                gas_price: 1_000_000.as_u256(),
+                gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
                 action: TransactionAction::Call(recipient1),
-                value: 0x10.as_u256(),
+                value: 0x10.into(),
                 input: Bytes::new(),
             },
-            signature: MessageSignature::new(
+            signature: TransactionSignature::new(
                 false,
                 H256::from(hex!(
                     "ac0222c1258eada1f828729186b723eaf3dd7f535c5de7271ea02470cbb1029f"
@@ -261,17 +244,17 @@ mod tests {
 
         let hash2_2 = tx2_2.hash();
 
-        let tx2_3 = MessageWithSignature {
-            message: Message::Legacy {
-                chain_id: CHAIN_ID,
+        let tx2_3 = Transaction {
+            message: TransactionMessage::Legacy {
+                chain_id: Some(1),
                 nonce: 2,
-                gas_price: 1_000_000.as_u256(),
+                gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
                 action: TransactionAction::Call(recipient2),
-                value: 2.as_u256(),
+                value: 2.into(),
                 input: Bytes::new(),
             },
-            signature: MessageSignature::new(
+            signature: TransactionSignature::new(
                 true,
                 H256::from(hex!(
                     "e41df92d64612590f72cae9e8895cd34ce0a545109f060879add106336bb5055"
@@ -312,13 +295,10 @@ mod tests {
             .await
             .unwrap();
 
-        let mut stage = TxLookup {
-            temp_dir: Arc::new(TempDir::new().unwrap()),
-        };
+        let stage = TxLookup {};
 
         let stage_input = StageInput {
             restarted: false,
-            first_started_at: (Instant::now(), Some(BlockNumber(0))),
             previous_stage: Some((StageId("BodyDownload"), 3.into())),
             stage_progress: Some(0.into()),
         };
@@ -330,6 +310,7 @@ mod tests {
             ExecOutput::Progress {
                 stage_progress: 3.into(),
                 done: false,
+                must_commit: true,
             }
         );
 
@@ -351,13 +332,10 @@ mod tests {
     async fn tx_lookup_stage_without_data() {
         let db = new_mem_database().unwrap();
         let mut tx = db.begin_mutable().await.unwrap();
-        let mut stage = TxLookup {
-            temp_dir: Arc::new(TempDir::new().unwrap()),
-        };
+        let stage = TxLookup {};
 
         let stage_input = StageInput {
             restarted: false,
-            first_started_at: (Instant::now(), Some(BlockNumber(0))),
             previous_stage: Some((StageId("BodyDownload"), 3.into())),
             stage_progress: Some(0.into()),
         };
@@ -369,6 +347,7 @@ mod tests {
             ExecOutput::Progress {
                 stage_progress: 3.into(),
                 done: false,
+                must_commit: true,
             }
         );
     }
@@ -378,8 +357,8 @@ mod tests {
         let db = new_mem_database().unwrap();
         let mut tx = db.begin_mutable().await.unwrap();
 
-        let recipient1 = Address::from(hex!("f4148309cc30f2dd4ba117122cad6be1e3ba0e2b"));
-        let recipient2 = Address::from(hex!("d7fa8303df7073290f66ced1add5fe89dac0c462"));
+        let recipient1 = H160::from(hex!("f4148309cc30f2dd4ba117122cad6be1e3ba0e2b"));
+        let recipient2 = H160::from(hex!("d7fa8303df7073290f66ced1add5fe89dac0c462"));
 
         let block1 = BodyForStorage {
             base_tx_id: 1.into(),
@@ -387,17 +366,17 @@ mod tests {
             uncles: vec![],
         };
 
-        let tx1_1 = MessageWithSignature {
-            message: Message::Legacy {
-                chain_id: CHAIN_ID,
+        let tx1_1 = Transaction {
+            message: TransactionMessage::Legacy {
+                chain_id: Some(1),
                 nonce: 1,
-                gas_price: 1_000_000.as_u256(),
+                gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
                 action: TransactionAction::Call(recipient1),
-                value: 1.as_u256(),
+                value: 1.into(),
                 input: Bytes::new(),
             },
-            signature: MessageSignature::new(
+            signature: TransactionSignature::new(
                 false,
                 H256::from(hex!(
                     "11d244ae19e3bb96d1bb864aa761d48e957984a154329f0de757cd105f9c7ac4"
@@ -410,17 +389,17 @@ mod tests {
         };
         let hash1_1 = tx1_1.hash();
 
-        let tx1_2 = MessageWithSignature {
-            message: Message::Legacy {
-                chain_id: CHAIN_ID,
+        let tx1_2 = Transaction {
+            message: TransactionMessage::Legacy {
+                chain_id: Some(1),
                 nonce: 2,
-                gas_price: 1_000_000.as_u256(),
+                gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
                 action: TransactionAction::Call(recipient1),
-                value: 0x100.as_u256(),
+                value: 0x100.into(),
                 input: Bytes::new(),
             },
-            signature: MessageSignature::new(
+            signature: TransactionSignature::new(
                 true,
                 H256::from(hex!(
                     "9e8c555909921d359bfb0c2734841c87691eb257cb5f0597ac47501abd8ba0de"
@@ -439,17 +418,17 @@ mod tests {
             uncles: vec![],
         };
 
-        let tx2_1 = MessageWithSignature {
-            message: Message::Legacy {
-                chain_id: CHAIN_ID,
+        let tx2_1 = Transaction {
+            message: TransactionMessage::Legacy {
+                chain_id: Some(1),
                 nonce: 3,
-                gas_price: 1_000_000.as_u256(),
+                gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
                 action: TransactionAction::Call(recipient1),
-                value: 0x10000.as_u256(),
+                value: 0x10000.into(),
                 input: Bytes::new(),
             },
-            signature: MessageSignature::new(
+            signature: TransactionSignature::new(
                 true,
                 H256::from(hex!(
                     "2450fdbf8fbc1dee15022bfa7392eb15f04277782343258e185972b5b2b8bf79"
@@ -463,17 +442,17 @@ mod tests {
 
         let hash2_1 = tx2_1.hash();
 
-        let tx2_2 = MessageWithSignature {
-            message: Message::Legacy {
-                chain_id: CHAIN_ID,
+        let tx2_2 = Transaction {
+            message: TransactionMessage::Legacy {
+                chain_id: Some(1),
                 nonce: 6,
-                gas_price: 1_000_000.as_u256(),
+                gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
                 action: TransactionAction::Call(recipient1),
-                value: 0x10.as_u256(),
+                value: 0x10.into(),
                 input: Bytes::new(),
             },
-            signature: MessageSignature::new(
+            signature: TransactionSignature::new(
                 false,
                 H256::from(hex!(
                     "ac0222c1258eada1f828729186b723eaf3dd7f535c5de7271ea02470cbb1029f"
@@ -487,17 +466,17 @@ mod tests {
 
         let hash2_2 = tx2_2.hash();
 
-        let tx2_3 = MessageWithSignature {
-            message: Message::Legacy {
-                chain_id: CHAIN_ID,
+        let tx2_3 = Transaction {
+            message: TransactionMessage::Legacy {
+                chain_id: Some(1),
                 nonce: 2,
-                gas_price: 1_000_000.as_u256(),
+                gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
                 action: TransactionAction::Call(recipient2),
-                value: 2.as_u256(),
+                value: 2.into(),
                 input: Bytes::new(),
             },
-            signature: MessageSignature::new(
+            signature: TransactionSignature::new(
                 true,
                 H256::from(hex!(
                     "e41df92d64612590f72cae9e8895cd34ce0a545109f060879add106336bb5055"
@@ -543,9 +522,7 @@ mod tests {
         chain::tl::write(&tx, hash2_1, 2.into()).await.unwrap();
         chain::tl::write(&tx, hash2_2, 2.into()).await.unwrap();
         chain::tl::write(&tx, hash2_3, 2.into()).await.unwrap();
-        let mut stage = TxLookup {
-            temp_dir: Arc::new(TempDir::new().unwrap()),
-        };
+        let stage = TxLookup {};
         stage
             .unwind(
                 &mut tx,

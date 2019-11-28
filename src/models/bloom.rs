@@ -1,4 +1,5 @@
 use super::*;
+use ethereum_types::Bloom;
 use sha3::{Digest, Keccak256};
 
 pub const BLOOM_BYTE_LENGTH: usize = 256;
@@ -30,6 +31,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use hex_literal::hex;
 
     #[test]
@@ -41,7 +43,7 @@ mod tests {
                     "04491edcd115127caedbd478e2e7895ed80c7847e903431f94f9cfa579cad47f"
                 )
                 .into()],
-                data: vec![].into(),
+                data: Bytes::new(),
             },
             Log {
                 address: hex!("e7fb22dfef11920312e4989a3a2b81e2ebf05986").into(),

@@ -1,19 +1,21 @@
-use crate::{common, dbutils, kv::*, models::*, Transaction};
-use bytes::Bytes;
-use dbutils::plain_generate_composite_storage_key;
-use ethereum_types::Address;
+use crate::{
+    kv::{traits::CursorDupSort, *},
+    models::*,
+    Transaction,
+};
+use ethereum_types::{Address, H256};
 use std::marker::PhantomData;
 
 pub struct StateReader<'db: 'tx, 'tx, Tx: Transaction<'db> + ?Sized> {
-    block_nr: u64,
+    block_number: BlockNumber,
     tx: &'tx Tx,
     _marker: PhantomData<&'db ()>,
 }
 
 impl<'db: 'tx, 'tx, Tx: Transaction<'db> + ?Sized> StateReader<'db, 'tx, Tx> {
-    pub fn new(tx: &'tx Tx, block_nr: u64) -> Self {
+    pub fn new(tx: &'tx Tx, block_number: BlockNumber) -> Self {
         Self {
-            block_nr,
+            block_number,
             tx,
             _marker: PhantomData,
         }
@@ -21,7 +23,7 @@ impl<'db: 'tx, 'tx, Tx: Transaction<'db> + ?Sized> StateReader<'db, 'tx, Tx> {
 
     pub async fn read_account_data(&mut self, address: Address) -> anyhow::Result<Option<Account>> {
         if let Some(enc) =
-            crate::state::get_account_data_as_of(self.tx, address, self.block_nr + 1).await?
+            crate::state::get_account_data_as_of(self.tx, address, self.block_number + 1).await?
         {
             return Account::decode_for_storage(&enc);
         }
@@ -32,10 +34,17 @@ impl<'db: 'tx, 'tx, Tx: Transaction<'db> + ?Sized> StateReader<'db, 'tx, Tx> {
     pub async fn read_account_storage(
         &mut self,
         address: Address,
-        incarnation: common::Incarnation,
-        key: common::Hash,
-    ) -> anyhow::Result<Option<Bytes<'tx>>> {
-        let composite_key = plain_generate_composite_storage_key(address, incarnation, key);
-        self.tx.get(&tables::PlainState, &composite_key).await
+        incarnation: Incarnation,
+        location: H256,
+    ) -> anyhow::Result<Option<H256>> {
+        self.tx
+            .cursor_dup_sort(&tables::PlainState)
+            .await?
+            .seek_both_range(
+                tables::PlainStateKey::Storage(address, incarnation),
+                location,
+            )
+            .await
+            .map(|opt| opt.map(|v| v.as_storage().unwrap().3))
     }
 }

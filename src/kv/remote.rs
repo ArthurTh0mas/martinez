@@ -2,9 +2,7 @@ use self::kv_client::*;
 use super::*;
 use crate::kv::traits;
 use anyhow::Context;
-use async_stream::stream;
 use async_trait::async_trait;
-use bytes::Bytes;
 pub use ethereum_interfaces::remotekv::*;
 use std::{marker::PhantomData, sync::Arc};
 use tokio::sync::{
@@ -12,7 +10,7 @@ use tokio::sync::{
     oneshot::{channel as oneshot, Sender as OneshotSender},
     Mutex as AsyncMutex,
 };
-use tokio_stream::StreamExt;
+use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::{body::BoxBody, client::GrpcService, codegen::Body, Streaming};
 use tracing::*;
 
@@ -20,6 +18,7 @@ use tracing::*;
 #[derive(Debug)]
 pub struct RemoteTransaction {
     // Invariant: cannot send new message until we process response to it.
+    id: u64,
     io: Arc<AsyncMutex<(Sender<Cursor>, Streaming<Pair>)>>,
 }
 
@@ -38,6 +37,10 @@ pub struct RemoteCursor<'tx, B> {
 impl<'env> crate::Transaction<'env> for RemoteTransaction {
     type Cursor<'tx, T: Table> = RemoteCursor<'tx, T>;
     type CursorDupSort<'tx, T: DupSort> = RemoteCursor<'tx, T>;
+
+    fn id(&self) -> u64 {
+        self.id
+    }
 
     async fn cursor<'tx, T>(&'tx self, table: &T) -> anyhow::Result<Self::Cursor<'tx, T>>
     where
@@ -103,6 +106,17 @@ impl<'env> crate::Transaction<'env> for RemoteTransaction {
     {
         self.cursor(table).await
     }
+
+    async fn get<'tx, T>(&'tx self, table: &T, key: T::Key) -> anyhow::Result<Option<T::Value>>
+    where
+        'env: 'tx,
+        T: Table,
+    {
+        self.cursor(table)
+            .await?
+            .op_value(Op::SeekExact, Some(key.encode().as_ref()), None)
+            .await
+    }
 }
 
 impl<'tx, T: Table> RemoteCursor<'tx, T> {
@@ -111,7 +125,7 @@ impl<'tx, T: Table> RemoteCursor<'tx, T> {
         op: Op,
         key: Option<&[u8]>,
         value: Option<&[u8]>,
-    ) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>> {
+    ) -> anyhow::Result<Option<Pair>> {
         let mut io = self.transaction.io.lock().await;
 
         io.0.send(Cursor {
@@ -126,38 +140,104 @@ impl<'tx, T: Table> RemoteCursor<'tx, T> {
 
         let rsp = io.1.message().await?.context("no response")?;
 
-        Ok((!rsp.k.is_empty() || !rsp.v.is_empty()).then_some((rsp.k.into(), rsp.v.into())))
+        Ok((!rsp.k.is_empty() || !rsp.v.is_empty()).then_some(rsp))
+    }
+
+    async fn op_none(
+        &mut self,
+        op: Op,
+        key: Option<&[u8]>,
+        value: Option<&[u8]>,
+    ) -> anyhow::Result<()> {
+        self.op(op, key, value).await?;
+
+        Ok(())
+    }
+
+    async fn op_value(
+        &mut self,
+        op: Op,
+        key: Option<&[u8]>,
+        value: Option<&[u8]>,
+    ) -> anyhow::Result<Option<T::Value>> {
+        if let Some(rsp) = self.op(op, key, value).await? {
+            return Ok(Some(T::Value::decode(&*rsp.v)?));
+        }
+
+        Ok(None)
+    }
+
+    async fn op_kv(
+        &mut self,
+        op: Op,
+        key: Option<&[u8]>,
+        value: Option<&[u8]>,
+    ) -> anyhow::Result<Option<T::FusedValue>>
+    where
+        T::Key: TableDecode,
+    {
+        if let Some(rsp) = self.op(op, key, value).await? {
+            return Ok(Some(T::fuse_values(
+                T::Key::decode(&*rsp.k)?,
+                T::Value::decode(&*rsp.v)?,
+            )?));
+        }
+
+        Ok(None)
     }
 }
 
 #[async_trait]
 impl<'tx, T: Table> traits::Cursor<'tx, T> for RemoteCursor<'tx, T> {
-    async fn first(&mut self) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>> {
-        self.op(Op::First, None, None).await
+    async fn first(&mut self) -> anyhow::Result<Option<T::FusedValue>>
+    where
+        T::Key: TableDecode,
+    {
+        self.op_kv(Op::First, None, None).await
     }
 
-    async fn seek(&mut self, key: &[u8]) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>> {
-        self.op(Op::Seek, Some(key), None).await
+    async fn seek(&mut self, key: T::SeekKey) -> anyhow::Result<Option<T::FusedValue>>
+    where
+        T::Key: TableDecode,
+    {
+        self.op_kv(Op::Seek, Some(key.encode().as_ref()), None)
+            .await
     }
 
-    async fn seek_exact(&mut self, key: &[u8]) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>> {
-        self.op(Op::SeekExact, Some(key), None).await
+    async fn seek_exact(&mut self, key: T::Key) -> anyhow::Result<Option<T::FusedValue>>
+    where
+        T::Key: TableDecode,
+    {
+        self.op_kv(Op::SeekExact, Some(key.encode().as_ref()), None)
+            .await
     }
 
-    async fn next(&mut self) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>> {
-        self.op(Op::Next, None, None).await
+    async fn next(&mut self) -> anyhow::Result<Option<T::FusedValue>>
+    where
+        T::Key: TableDecode,
+    {
+        self.op_kv(Op::Next, None, None).await
     }
 
-    async fn prev(&mut self) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>> {
-        self.op(Op::Prev, None, None).await
+    async fn prev(&mut self) -> anyhow::Result<Option<T::FusedValue>>
+    where
+        T::Key: TableDecode,
+    {
+        self.op_kv(Op::Prev, None, None).await
     }
 
-    async fn last(&mut self) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>> {
-        self.op(Op::Last, None, None).await
+    async fn last(&mut self) -> anyhow::Result<Option<T::FusedValue>>
+    where
+        T::Key: TableDecode,
+    {
+        self.op_kv(Op::Last, None, None).await
     }
 
-    async fn current(&mut self) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>> {
-        self.op(Op::Current, None, None).await
+    async fn current(&mut self) -> anyhow::Result<Option<T::FusedValue>>
+    where
+        T::Key: TableDecode,
+    {
+        self.op_kv(Op::Current, None, None).await
     }
 }
 
@@ -165,20 +245,34 @@ impl<'tx, T: Table> traits::Cursor<'tx, T> for RemoteCursor<'tx, T> {
 impl<'tx, T: DupSort> traits::CursorDupSort<'tx, T> for RemoteCursor<'tx, T> {
     async fn seek_both_range(
         &mut self,
-        key: &[u8],
-        value: &[u8],
-    ) -> anyhow::Result<Option<Bytes<'tx>>> {
+        key: T::Key,
+        value: T::SeekBothKey,
+    ) -> anyhow::Result<Option<T::FusedValue>>
+    where
+        T::Key: Clone,
+    {
         Ok(self
-            .op(Op::SeekBoth, Some(key), Some(value))
+            .op_value(
+                Op::SeekBoth,
+                Some(key.clone().encode().as_ref()),
+                Some(value.encode().as_ref()),
+            )
             .await?
-            .map(|(_, v)| v))
+            .map(move |value| T::fuse_values(key, value))
+            .transpose()?)
     }
 
-    async fn next_dup(&mut self) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>> {
-        self.op(Op::NextDup, None, None).await
+    async fn next_dup(&mut self) -> anyhow::Result<Option<T::FusedValue>>
+    where
+        T::Key: TableDecode,
+    {
+        self.op_kv(Op::NextDup, None, None).await
     }
-    async fn next_no_dup(&mut self) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>> {
-        self.op(Op::NextNoDup, None, None).await
+    async fn next_no_dup(&mut self) -> anyhow::Result<Option<T::FusedValue>>
+    where
+        T::Key: TableDecode,
+    {
+        self.op_kv(Op::NextNoDup, None, None).await
     }
 }
 
@@ -191,43 +285,16 @@ impl RemoteTransaction {
             Into<Box<(dyn std::error::Error + Send + Sync + 'static)>> + Send,
     {
         trace!("Opening transaction");
-        let (sender, mut rx) = channel(1);
-        let mut receiver = client
-            .tx(stream! {
-                // Just a dummy message, workaround for
-                // https://github.com/hyperium/tonic/issues/515
-                yield Cursor {
-                    op: Op::Open as i32,
-                    bucket_name: "DUMMY".into(),
-                    cursor: Default::default(),
-                    k: Default::default(),
-                    v: Default::default(),
-                };
-                while let Some(v) = rx.recv().await {
-                    yield v;
-                }
-            })
-            .await?
-            .into_inner();
+        let (sender, rx) = channel(1);
+        let mut receiver = client.tx(ReceiverStream::new(rx)).await?.into_inner();
 
-        // https://github.com/hyperium/tonic/issues/515
-        let cursor = receiver.message().await?.context("no response")?.cursor_id;
-
-        sender
-            .send(Cursor {
-                op: Op::Close as i32,
-                cursor,
-                bucket_name: Default::default(),
-                k: Default::default(),
-                v: Default::default(),
-            })
-            .await?;
-
-        let _ = receiver.try_next().await?;
+        // First message with txid
+        let id = receiver.message().await?.context("no response")?.tx_id;
 
         trace!("Acquired transaction receiver");
 
         Ok(Self {
+            id,
             io: Arc::new(AsyncMutex::new((sender, receiver))),
         })
     }
