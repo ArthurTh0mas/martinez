@@ -1,4 +1,4 @@
-use martinez::{kv::traits::KV, stagedsync};
+use martinez::{mdbx_table_sizes, stagedsync};
 use std::path::PathBuf;
 use structopt::StructOpt;
 
@@ -23,10 +23,10 @@ pub enum Opt {
 }
 
 async fn blockhashes(chaindata: PathBuf) -> anyhow::Result<()> {
-    let env = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_rw(
+    let env = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
         mdbx::Environment::new(),
         &chaindata,
-        martinez::kv::tables::CHAINDATA_TABLES.clone(),
+        &martinez::kv::tables::TABLE_MAP,
     )?;
 
     let mut staged_sync = stagedsync::StagedSync::new();
@@ -38,12 +38,9 @@ async fn table_sizes(chaindata: PathBuf, csv: bool) -> anyhow::Result<()> {
     let env = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
         mdbx::Environment::new(),
         &chaindata,
-        Default::default(),
+        &martinez::kv::tables::TABLE_MAP,
     )?;
-    let mut sizes = env
-        .begin(0)
-        .await?
-        .table_sizes()?
+    let mut sizes = mdbx_table_sizes(&env.begin_ro_txn()?)?
         .into_iter()
         .collect::<Vec<_>>();
     sizes.sort_by_key(|(_, size)| *size);

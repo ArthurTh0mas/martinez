@@ -1,6 +1,7 @@
 use super::{address::*, precompiled};
 use crate::{
     chain::protocol_param::{fee, param},
+    common::{self, ADDRESS_LENGTH},
     models::*,
     IntraBlockState, State,
 };
@@ -13,8 +14,7 @@ use evmodin::{
     host::*,
     CallKind, CreateMessage, Message, Output, Revision, StatusCode,
 };
-use sha3::{Digest, Keccak256};
-use std::{cmp::min, convert::TryFrom};
+use std::cmp::min;
 
 pub struct CallResult {
     /// EVM exited with this status code.
@@ -25,21 +25,21 @@ pub struct CallResult {
     pub output_data: Bytes<'static>,
 }
 
-struct Evm<'r, 'state, 'h, 'c, 't, B>
+struct Evm<'storage, 'r, 'state, 'h, 'c, 't, B>
 where
-    B: State,
+    B: State<'storage>,
 {
-    state: &'state mut IntraBlockState<'r, B>,
-    header: &'h PartialHeader,
+    state: &'state mut IntraBlockState<'storage, 'r, B>,
+    header: &'h BlockHeader,
     revision: Revision,
     chain_config: &'c ChainConfig,
     txn: &'t TransactionWithSender,
     address_stack: Vec<Address>,
 }
 
-pub async fn execute<B: State>(
-    state: &mut IntraBlockState<'_, B>,
-    header: &PartialHeader,
+pub async fn execute<'storage, 'r, B: State<'storage>>(
+    state: &mut IntraBlockState<'storage, 'r, B>,
+    header: &BlockHeader,
     chain_config: &ChainConfig,
     txn: &TransactionWithSender,
     gas: u64,
@@ -54,14 +54,14 @@ pub async fn execute<B: State>(
         address_stack: Vec::new(),
     };
 
-    let res = if let TransactionAction::Call(to) = txn.action() {
+    let res = if let TransactionAction::Call(to) = txn.action {
         evm.call(Message {
             kind: CallKind::Call,
             is_static: false,
             depth: 0,
             sender: txn.sender,
-            input_data: txn.input().clone().into(),
-            value: txn.value(),
+            input_data: txn.input.clone().into(),
+            value: txn.value,
             gas: gas as i64,
             destination: to,
         })
@@ -71,8 +71,8 @@ pub async fn execute<B: State>(
             depth: 0,
             gas: gas as i64,
             sender: txn.sender,
-            initcode: txn.input().clone().into(),
-            endowment: txn.value(),
+            initcode: txn.input.clone().into(),
+            endowment: txn.value,
             salt: None,
         })
         .await?
@@ -85,9 +85,9 @@ pub async fn execute<B: State>(
     })
 }
 
-impl<'r, 'state, 'h, 'c, 't, B> Evm<'r, 'state, 'h, 'c, 't, B>
+impl<'storage, 'r, 'state, 'h, 'c, 't, B> Evm<'storage, 'r, 'state, 'h, 'c, 't, B>
 where
-    B: State,
+    B: State<'storage>,
 {
     #[async_recursion]
     async fn create(&mut self, message: CreateMessage) -> anyhow::Result<Output> {
@@ -112,7 +112,7 @@ where
                 create2_address(
                     message.sender,
                     salt,
-                    H256::from_slice(&Keccak256::digest(&message.initcode[..])[..]),
+                    common::hash_data(message.initcode.as_ref()),
                 )
             } else {
                 create_address(message.sender, nonce)
@@ -122,7 +122,7 @@ where
         self.state.access_account(contract_addr);
 
         if self.state.get_nonce(contract_addr).await? != 0
-            || self.state.get_code_hash(contract_addr).await? != EMPTY_HASH
+            || self.state.get_code_hash(contract_addr).await? != common::EMPTY_HASH
         {
             // https://github.com/ethereum/EIPs/issues/684
             res.status_code = StatusCode::InvalidInstruction;
@@ -171,7 +171,7 @@ where
             } else if res.gas_left >= 0 && res.gas_left as u64 >= code_deploy_gas {
                 res.gas_left -= code_deploy_gas as i64;
                 self.state
-                    .set_code(contract_addr, res.output_data.clone())
+                    .set_code(contract_addr, res.output_data.clone().into())
                     .await?;
             } else if self.revision >= Revision::Homestead {
                 res.status_code = StatusCode::OutOfGas;
@@ -242,20 +242,15 @@ where
             let num = code_address.0[ADDRESS_LENGTH - 1] as usize;
             let contract = &precompiled::CONTRACTS[num - 1];
             let input = message.input_data;
-            if let Some(gas) = (contract.gas)(input.clone().into(), self.revision)
-                .and_then(|g| i64::try_from(g).ok())
-            {
-                if gas > message.gas {
-                    res.status_code = StatusCode::OutOfGas;
-                } else if let Some(output) = (contract.run)(input.into()) {
-                    res.status_code = StatusCode::Success;
-                    res.gas_left = message.gas - gas;
-                    res.output_data = output.into();
-                } else {
-                    res.status_code = StatusCode::PrecompileFailure;
-                }
-            } else {
+            let gas = (contract.gas)(input.as_ref(), self.revision) as i64;
+            if gas < 0 || gas > message.gas {
                 res.status_code = StatusCode::OutOfGas;
+            } else if let Some(output) = (contract.run)(input.into()) {
+                res.status_code = StatusCode::Success;
+                res.gas_left = message.gas - gas;
+                res.output_data = output.into();
+            } else {
+                res.status_code = StatusCode::PrecompileFailure;
             }
         } else {
             let code = self.state.get_code(code_address).await?.unwrap_or_default();
@@ -443,7 +438,11 @@ where
 
                     let mut buffer = vec![0; max_size];
 
-                    let code = self.state.get_code(address).await?.unwrap_or_default();
+                    let code = self
+                        .state
+                        .get_code(address)
+                        .await?
+                        .unwrap_or_else(bytes::Bytes::new);
 
                     let mut copied = 0;
                     if offset < code.len() {
@@ -492,7 +491,7 @@ where
                     let tx_gas_price = self.txn.effective_gas_price(base_fee_per_gas);
                     let tx_origin = self.txn.sender;
                     let block_coinbase = self.header.beneficiary;
-                    let block_number = self.header.number.0;
+                    let block_number = self.header.number;
                     let block_timestamp = self.header.timestamp;
                     let block_gas_limit = self.header.gas_limit;
                     let block_difficulty = self.header.difficulty;
@@ -517,7 +516,7 @@ where
                     let n = i.data().block_number;
 
                     let base_number = self.header.number;
-                    let distance = base_number.0 - n;
+                    let distance = base_number - n;
                     assert!(distance <= 256);
 
                     let mut hash = self.header.parent_hash;
@@ -526,7 +525,7 @@ where
                         hash = self
                             .state
                             .db()
-                            .read_header(BlockNumber(base_number.0 - i), hash)
+                            .read_header(base_number - i, hash)
                             .await?
                             .context("no header")?
                             .parent_hash;
@@ -606,12 +605,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{chain::config::MAINNET_CONFIG, util::test_util::run_test, InMemoryState};
+    use crate::{
+        chain::config::MAINNET_CONFIG, common::ETHER, util::test_util::run_test, InMemoryState,
+    };
     use hex_literal::hex;
 
-    async fn execute<B: State>(
-        state: &mut IntraBlockState<'_, B>,
-        header: &PartialHeader,
+    async fn execute<'storage, 'r, B: State<'storage>>(
+        state: &mut IntraBlockState<'storage, 'r, B>,
+        header: &BlockHeader,
         txn: &TransactionWithSender,
         gas: u64,
     ) -> CallResult {
@@ -623,9 +624,9 @@ mod tests {
     #[test]
     fn value_transfer() {
         run_test(async {
-            let header = PartialHeader {
-                number: 10_336_006.into(),
-                ..PartialHeader::empty()
+            let header = BlockHeader {
+                number: 10_336_006,
+                ..BlockHeader::empty()
             };
 
             let sender = hex!("0a6bb546b9208cfab9e8fa2b9b2c042b18df7030").into();
@@ -639,17 +640,11 @@ mod tests {
             assert_eq!(state.get_balance(to).await.unwrap(), U256::zero());
 
             let txn = TransactionWithSender {
-                message: TransactionMessage::Legacy {
-                    action: TransactionAction::Call(to),
-                    value,
-
-                    chain_id: Default::default(),
-                    nonce: Default::default(),
-                    gas_price: Default::default(),
-                    gas_limit: Default::default(),
-                    input: Default::default(),
-                },
+                tx_type: TxType::Legacy,
                 sender,
+                action: TransactionAction::Call(to),
+                value,
+                ..TransactionWithSender::empty()
             };
 
             let gas = 0;
@@ -658,13 +653,16 @@ mod tests {
             assert_eq!(res.status_code, StatusCode::InsufficientBalance);
             assert_eq!(res.output_data, []);
 
-            state.add_to_balance(sender, *ETHER).await.unwrap();
+            state.add_to_balance(sender, ETHER).await.unwrap();
 
             let res = execute(&mut state, &header, &txn, gas).await;
             assert_eq!(res.status_code, StatusCode::Success);
             assert_eq!(res.output_data, []);
 
-            assert_eq!(state.get_balance(sender).await.unwrap(), *ETHER - value);
+            assert_eq!(
+                state.get_balance(sender).await.unwrap(),
+                U256::from(ETHER) - value
+            );
             assert_eq!(state.get_balance(to).await.unwrap(), value);
         })
     }
@@ -672,9 +670,9 @@ mod tests {
     #[test]
     fn smart_contract_with_storage() {
         run_test(async {
-            let header = PartialHeader {
-                number: 10_336_006.into(),
-                ..PartialHeader::empty()
+            let header = BlockHeader {
+                number: 10_336_006,
+                ..BlockHeader::empty()
             };
             let caller = hex!("0a6bb546b9208cfab9e8fa2b9b2c042b18df7030").into();
 
@@ -705,28 +703,19 @@ mod tests {
             let mut db = InMemoryState::default();
             let mut state = IntraBlockState::new(&mut db);
 
-            let txn = |action, input| TransactionWithSender {
-                message: TransactionMessage::Legacy {
-                    input,
-                    action,
-
-                    chain_id: Default::default(),
-                    nonce: Default::default(),
-                    gas_price: Default::default(),
-                    gas_limit: Default::default(),
-                    value: Default::default(),
-                },
+            let mut txn = TransactionWithSender {
                 sender: caller,
+                input: code.to_vec().into(),
+                ..TransactionWithSender::empty()
             };
 
-            let t = (txn)(TransactionAction::Create, code.to_vec().into());
             let gas = 0;
-            let res = execute(&mut state, &header, &t, gas).await;
+            let res = execute(&mut state, &header, &txn, gas).await;
             assert_eq!(res.status_code, StatusCode::OutOfGas);
             assert_eq!(res.output_data, Bytes::new());
 
             let gas = 50_000;
-            let res = execute(&mut state, &header, &t, gas).await;
+            let res = execute(&mut state, &header, &txn, gas).await;
             assert_eq!(res.status_code, StatusCode::Success);
             assert_eq!(res.output_data, hex!("600035600055"));
 
@@ -741,17 +730,10 @@ mod tests {
             );
 
             let new_val = H256::from_low_u64_be(0xf5);
+            txn.action = TransactionAction::Call(contract_address);
+            txn.input = new_val.0.to_vec().into();
 
-            let res = execute(
-                &mut state,
-                &header,
-                &(txn)(
-                    TransactionAction::Call(contract_address),
-                    new_val.0.to_vec().into(),
-                ),
-                gas,
-            )
-            .await;
+            let res = execute(&mut state, &header, &txn, gas).await;
             assert_eq!(res.status_code, StatusCode::Success);
             assert_eq!(res.output_data, []);
             assert_eq!(
@@ -767,9 +749,9 @@ mod tests {
     #[test]
     fn maximum_call_depth() {
         run_test(async {
-            let header = PartialHeader {
-                number: 1_431_916.into(),
-                ..PartialHeader::empty()
+            let header = BlockHeader {
+                number: 1_431_916,
+                ..BlockHeader::empty()
             };
             let caller = hex!("8e4d1ea201b908ab5e1f5a1c3f9f1b4f6c1e9cf1").into();
             let contract = hex!("3589d05a1ec4af9f65b0e5554e645707775ee43c").into();
@@ -815,44 +797,26 @@ mod tests {
                 .await
                 .unwrap();
 
-            let txn = |input| TransactionWithSender {
+            let mut txn = TransactionWithSender {
                 sender: caller,
-                message: TransactionMessage::Legacy {
-                    action: TransactionAction::Call(contract),
-                    input,
-
-                    chain_id: Default::default(),
-                    nonce: Default::default(),
-                    gas_price: Default::default(),
-                    gas_limit: Default::default(),
-                    value: Default::default(),
-                },
+                action: TransactionAction::Call(contract),
+                ..TransactionWithSender::empty()
             };
 
             let gas = 1_000_000;
-            let res = execute(&mut state, &header, &(txn)(Default::default()), gas).await;
+            let res = execute(&mut state, &header, &txn, gas).await;
             assert_eq!(res.status_code, StatusCode::Success);
             assert_eq!(res.output_data, []);
 
             let num_of_recursions = 0x0400;
-            let res = execute(
-                &mut state,
-                &header,
-                &(txn)(H256::from_low_u64_be(num_of_recursions).0.to_vec().into()),
-                gas,
-            )
-            .await;
+            txn.input = H256::from_low_u64_be(num_of_recursions).0.to_vec().into();
+            let res = execute(&mut state, &header, &txn, gas).await;
             assert_eq!(res.status_code, StatusCode::Success);
             assert_eq!(res.output_data, []);
 
             let num_of_recursions = 0x0401;
-            let res = execute(
-                &mut state,
-                &header,
-                &(txn)(H256::from_low_u64_be(num_of_recursions).0.to_vec().into()),
-                gas,
-            )
-            .await;
+            txn.input = H256::from_low_u64_be(num_of_recursions).0.to_vec().into();
+            let res = execute(&mut state, &header, &txn, gas).await;
             assert_eq!(res.status_code, StatusCode::InvalidInstruction);
             assert_eq!(res.output_data, []);
         })
@@ -861,9 +825,9 @@ mod tests {
     #[test]
     fn delegatecall() {
         run_test(async {
-            let header = PartialHeader {
-                number: 1_639_560.into(),
-                ..PartialHeader::empty()
+            let header = BlockHeader {
+                number: 1_639_560,
+                ..BlockHeader::empty()
             };
             let caller_address = hex!("8e4d1ea201b908ab5e1f5a1c3f9f1b4f6c1e9cf1").into();
             let callee_address = hex!("3589d05a1ec4af9f65b0e5554e645707775ee43c").into();
@@ -900,17 +864,10 @@ mod tests {
                 .unwrap();
 
             let txn = TransactionWithSender {
-                message: TransactionMessage::Legacy {
-                    action: TransactionAction::Call(caller_address),
-                    input: H256::from(callee_address).0.to_vec().into(),
-
-                    chain_id: Default::default(),
-                    nonce: Default::default(),
-                    gas_price: Default::default(),
-                    gas_limit: Default::default(),
-                    value: Default::default(),
-                },
                 sender: caller_address,
+                action: TransactionAction::Call(caller_address),
+                input: H256::from(callee_address).0.to_vec().into(),
+                ..TransactionWithSender::empty()
             };
 
             let gas = 1_000_000;
@@ -933,9 +890,9 @@ mod tests {
     #[test]
     fn create_should_only_return_on_failure() {
         run_test(async {
-            let header = PartialHeader {
-                number: 4_575_910.into(),
-                ..PartialHeader::empty()
+            let header = BlockHeader {
+                number: 4_575_910,
+                ..BlockHeader::empty()
             };
             let caller = hex!("f466859ead1932d743d622cb74fc058882e8648a").into();
 
@@ -977,17 +934,9 @@ mod tests {
             let mut state = IntraBlockState::new(&mut db);
 
             let txn = TransactionWithSender {
-                message: TransactionMessage::Legacy {
-                    action: TransactionAction::Create,
-                    input: code.to_vec().into(),
-
-                    chain_id: Default::default(),
-                    nonce: Default::default(),
-                    gas_price: Default::default(),
-                    gas_limit: Default::default(),
-                    value: Default::default(),
-                },
                 sender: caller,
+                input: code.to_vec().into(),
+                ..TransactionWithSender::empty()
             };
 
             let gas = 150_000;
@@ -1011,9 +960,9 @@ mod tests {
     #[test]
     fn contract_overwrite() {
         run_test(async {
-            let header = PartialHeader {
-                number: 7_753_545.into(),
-                ..PartialHeader::empty()
+            let header = BlockHeader {
+                number: 7_753_545,
+                ..BlockHeader::empty()
             };
 
             let old_code = hex!("6000");
@@ -1031,17 +980,9 @@ mod tests {
                 .unwrap();
 
             let txn = TransactionWithSender {
-                message: TransactionMessage::Legacy {
-                    action: TransactionAction::Create,
-                    input: new_code.to_vec().into(),
-
-                    chain_id: Default::default(),
-                    nonce: Default::default(),
-                    gas_price: Default::default(),
-                    gas_limit: Default::default(),
-                    value: Default::default(),
-                },
                 sender: caller,
+                input: new_code.to_vec().into(),
+                ..TransactionWithSender::empty()
             };
 
             let gas = 100_000;
@@ -1056,56 +997,47 @@ mod tests {
     #[test]
     fn eip3541() {
         run_test(async {
-            let header = PartialHeader {
-                number: 13_500_000.into(),
-                ..PartialHeader::empty()
+            let header = BlockHeader {
+                number: 13_500_000,
+                ..BlockHeader::empty()
             };
 
             let mut db = InMemoryState::default();
             let mut state = IntraBlockState::new(&mut db);
 
-            let t = |input| TransactionWithSender {
-                message: TransactionMessage::Legacy {
-                    action: TransactionAction::Create,
-                    input,
-
-                    chain_id: Default::default(),
-                    nonce: Default::default(),
-                    gas_price: Default::default(),
-                    gas_limit: Default::default(),
-                    value: Default::default(),
-                },
+            let mut txn = TransactionWithSender {
                 sender: hex!("1000000000000000000000000000000000000000").into(),
+                ..TransactionWithSender::empty()
             };
 
             let gas = 50_000;
 
             // https://eips.ethereum.org/EIPS/eip-3541#test-cases
-            let txn = (t)(hex!("60ef60005360016000f3").to_vec().into());
+            txn.input = hex!("60ef60005360016000f3").to_vec().into();
             assert_eq!(
                 execute(&mut state, &header, &txn, gas).await.status_code,
                 StatusCode::ContractValidationFailure
             );
 
-            let txn = (t)(hex!("60ef60005360026000f3").to_vec().into());
+            txn.input = hex!("60ef60005360026000f3").to_vec().into();
             assert_eq!(
                 execute(&mut state, &header, &txn, gas).await.status_code,
                 StatusCode::ContractValidationFailure
             );
 
-            let txn = (t)(hex!("60ef60005360036000f3").to_vec().into());
+            txn.input = hex!("60ef60005360036000f3").to_vec().into();
             assert_eq!(
                 execute(&mut state, &header, &txn, gas).await.status_code,
                 StatusCode::ContractValidationFailure
             );
 
-            let txn = (t)(hex!("60ef60005360206000f3").to_vec().into());
+            txn.input = hex!("60ef60005360206000f3").to_vec().into();
             assert_eq!(
                 execute(&mut state, &header, &txn, gas).await.status_code,
                 StatusCode::ContractValidationFailure
             );
 
-            let txn = (t)(hex!("60fe60005360016000f3").to_vec().into());
+            txn.input = hex!("60fe60005360016000f3").to_vec().into();
             assert_eq!(
                 execute(&mut state, &header, &txn, gas).await.status_code,
                 StatusCode::Success

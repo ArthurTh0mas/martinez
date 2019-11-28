@@ -1,57 +1,54 @@
-use crate::{
-    kv::{tables::BitmapKey, traits::ttw, Table, TableDecode},
-    models::*,
-    Cursor, Transaction,
-};
+use std::iter::Peekable;
+
+use crate::{common, kv::Table, txdb, Transaction};
+use arrayref::array_ref;
 use pin_utils::pin_mut;
 use roaring::RoaringTreemap;
-use std::iter::Peekable;
 use tokio_stream::StreamExt;
 
 // Size beyond which we get MDBX overflow pages: 4096 / 2 - (key_size + 8)
 pub const CHUNK_LIMIT: usize = 1950;
 
-pub async fn get<'db, Tx, T, K>(
+pub async fn get<'db, Tx, T>(
     tx: &Tx,
     table: &T,
-    key: K,
-    from: impl Into<BlockNumber>,
-    to: impl Into<BlockNumber>,
+    key: &[u8],
+    from: u64,
+    to: u64,
 ) -> anyhow::Result<RoaringTreemap>
 where
     Tx: Transaction<'db>,
-    K: Clone + PartialEq + Send,
-    BitmapKey<K>: TableDecode,
-    T: Table<
-        Key = BitmapKey<K>,
-        Value = RoaringTreemap,
-        FusedValue = (BitmapKey<K>, RoaringTreemap),
-        SeekKey = BitmapKey<K>,
-    >,
+    T: Table,
 {
     let mut out: Option<RoaringTreemap> = None;
-    let from = from.into();
-    let to = to.into();
+
+    let from_key = key
+        .iter()
+        .chain(&from.to_be_bytes())
+        .copied()
+        .collect::<Vec<_>>();
 
     let mut c = tx.cursor(table).await?;
 
-    let s = c
-        .walk(Some(BitmapKey {
-            inner: key.clone(),
-            block_number: from,
-        }))
-        .take_while(ttw(|(BitmapKey { inner, .. }, _)| *inner == key));
+    let s = txdb::walk(&mut c, &from_key, (key.len() * 8) as u64);
 
     pin_mut!(s);
 
-    while let Some((BitmapKey { block_number, .. }, v)) = s.try_next().await? {
+    while let Some((k, v)) = s.try_next().await? {
+        let v = RoaringTreemap::deserialize_from(v.as_ref())?;
+
         if out.is_some() {
             out = Some(out.unwrap() | v);
         } else {
             out = Some(v);
         }
 
-        if block_number >= to {
+        if u64::from_be_bytes(*array_ref!(
+            k[k.len() - common::BLOCK_NUMBER_LENGTH..],
+            0,
+            common::BLOCK_NUMBER_LENGTH
+        )) >= to
+        {
             break;
         }
     }
@@ -112,32 +109,39 @@ impl Chunks {
         Self { bm, size_limit }
     }
 
-    pub fn with_keys(self) -> ChunksWithKeys {
-        ChunksWithKeys {
+    pub fn with_keys(self, k: &[u8]) -> ChunkWithKeys<'_> {
+        ChunkWithKeys {
             inner: self.peekable(),
+            k,
         }
     }
 }
 
-pub struct ChunksWithKeys {
+pub struct ChunkWithKeys<'a> {
     inner: Peekable<Chunks>,
+    k: &'a [u8],
 }
 
-impl Iterator for ChunksWithKeys {
-    type Item = (BlockNumber, RoaringTreemap);
+impl<'a> Iterator for ChunkWithKeys<'a> {
+    type Item = (Vec<u8>, RoaringTreemap);
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(|chunk| {
-            (
-                BlockNumber({
-                    if self.inner.peek().is_none() {
+            let chunk_key = self
+                .k
+                .iter()
+                .chain(
+                    &if self.inner.peek().is_none() {
                         u64::MAX
                     } else {
                         chunk.max().unwrap()
                     }
-                }),
-                chunk,
-            )
+                    .to_be_bytes(),
+                )
+                .copied()
+                .collect();
+
+            (chunk_key, chunk)
         })
     }
 }

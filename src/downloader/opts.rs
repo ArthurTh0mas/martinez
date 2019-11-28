@@ -17,12 +17,6 @@ pub struct Opts {
         default_value = "mainnet"
     )]
     pub chain_name: String,
-    #[structopt(
-        long = "datadir",
-        help = "Database directory path",
-        default_value = "data"
-    )]
-    pub data_dir: std::path::PathBuf,
 }
 
 impl Opts {

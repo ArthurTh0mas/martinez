@@ -1,9 +1,12 @@
 use super::{delta::*, object::*, *};
-use crate::{crypto::*, models::*};
+use crate::{
+    common::{self, EMPTY_HASH},
+    models::*,
+};
+use bytes::Bytes;
 use ethereum_types::*;
 use evmodin::host::AccessStatus;
 use hex_literal::hex;
-use static_bytes::Bytes;
 use std::collections::*;
 
 #[derive(Debug)]
@@ -14,18 +17,18 @@ pub struct Snapshot {
 }
 
 #[derive(Debug)]
-pub struct IntraBlockState<'db, S>
+pub struct IntraBlockState<'storage, 'r, S>
 where
-    S: State,
+    S: State<'storage>,
 {
-    db: &'db mut S,
+    db: &'r mut S,
 
     pub(crate) objects: HashMap<Address, Object>,
     pub(crate) storage: HashMap<Address, Storage>,
 
     // pointer stability?
-    pub(crate) existing_code: HashMap<H256, Bytes>,
-    pub(crate) new_code: HashMap<H256, Bytes>,
+    pub(crate) existing_code: HashMap<H256, Bytes<'storage>>,
+    pub(crate) new_code: HashMap<H256, Bytes<'storage>>,
 
     pub(crate) journal: Vec<Delta>,
 
@@ -39,7 +42,7 @@ where
     pub(crate) accessed_storage_keys: HashMap<Address, HashSet<H256>>,
 }
 
-async fn get_object<'m, 'db, S: State>(
+async fn get_object<'m, 'storage, 'r, S: State<'storage>>(
     db: &S,
     objects: &'m mut HashMap<Address, Object>,
     address: Address,
@@ -61,7 +64,7 @@ async fn get_object<'m, 'db, S: State>(
     })
 }
 
-async fn ensure_object<'m: 'j, 'j, S: State>(
+async fn ensure_object<'storage: 'm, 'm: 'j, 'j, S: State<'storage>>(
     db: &S,
     objects: &'m mut HashMap<Address, Object>,
     journal: &'j mut Vec<Delta>,
@@ -86,7 +89,7 @@ async fn ensure_object<'m: 'j, 'j, S: State>(
     Ok(())
 }
 
-async fn get_or_create_object<'m: 'j, 'j, S: State>(
+async fn get_or_create_object<'storage: 'm, 'm: 'j, 'j, S: State<'storage>>(
     db: &S,
     objects: &'m mut HashMap<Address, Object>,
     journal: &'j mut Vec<Delta>,
@@ -96,7 +99,7 @@ async fn get_or_create_object<'m: 'j, 'j, S: State>(
     Ok(objects.get_mut(&address).unwrap())
 }
 
-impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
+impl<'storage, 'r, S: State<'storage>> IntraBlockState<'storage, 'r, S> {
     pub fn new(db: &'r mut S) -> Self {
         Self {
             db,
@@ -149,7 +152,7 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
         let mut current = Account::default();
         let mut initial = None;
 
-        let mut prev_incarnation: Option<Incarnation> = None;
+        let mut prev_incarnation: Option<u64> = None;
         self.journal.push({
             if let Some(prev) = get_object(self.db, &mut self.objects, address).await? {
                 initial = prev.initial.clone();
@@ -168,8 +171,8 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
             }
         });
 
-        let mut prev_incarnation = prev_incarnation.unwrap_or(Incarnation(0));
-        if prev_incarnation.0 == 0 {
+        let mut prev_incarnation = prev_incarnation.unwrap_or(0);
+        if prev_incarnation == 0 {
             prev_incarnation = self.db.previous_incarnation(address).await?;
         }
 
@@ -247,13 +250,11 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
     ) -> anyhow::Result<()> {
         let obj =
             get_or_create_object(self.db, &mut self.objects, &mut self.journal, address).await?;
-
-        let current = obj.current.as_mut().unwrap();
-        self.journal.push(Delta::UpdateBalance {
+        self.journal.push(Delta::Update {
             address,
-            previous: current.balance,
+            previous: obj.clone(),
         });
-        current.balance = value.into();
+        obj.current.as_mut().unwrap().balance = value.into();
         self.touch(address);
 
         Ok(())
@@ -265,13 +266,11 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
     ) -> anyhow::Result<()> {
         let obj =
             get_or_create_object(self.db, &mut self.objects, &mut self.journal, address).await?;
-
-        let current = obj.current.as_mut().unwrap();
-        self.journal.push(Delta::UpdateBalance {
+        self.journal.push(Delta::Update {
             address,
-            previous: current.balance,
+            previous: obj.clone(),
         });
-        current.balance += addend.into();
+        obj.current.as_mut().unwrap().balance += addend.into();
         self.touch(address);
 
         Ok(())
@@ -283,13 +282,11 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
     ) -> anyhow::Result<()> {
         let obj =
             get_or_create_object(self.db, &mut self.objects, &mut self.journal, address).await?;
-
-        let current = obj.current.as_mut().unwrap();
-        self.journal.push(Delta::UpdateBalance {
+        self.journal.push(Delta::Update {
             address,
-            previous: current.balance,
+            previous: obj.clone(),
         });
-        current.balance -= subtrahend;
+        obj.current.as_mut().unwrap().balance -= subtrahend;
         self.touch(address);
 
         Ok(())
@@ -327,7 +324,7 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
         Ok(())
     }
 
-    pub async fn get_code(&mut self, address: Address) -> anyhow::Result<Option<Bytes>> {
+    pub async fn get_code(&mut self, address: Address) -> anyhow::Result<Option<Bytes<'storage>>> {
         let obj = get_object(self.db, &mut self.objects, address).await?;
 
         if let Some(obj) = obj {
@@ -362,14 +359,18 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
         Ok(EMPTY_HASH)
     }
 
-    pub async fn set_code(&mut self, address: Address, code: Bytes) -> anyhow::Result<()> {
+    pub async fn set_code(
+        &mut self,
+        address: Address,
+        code: Bytes<'storage>,
+    ) -> anyhow::Result<()> {
         let obj =
             get_or_create_object(self.db, &mut self.objects, &mut self.journal, address).await?;
         self.journal.push(Delta::Update {
             address,
             previous: obj.clone(),
         });
-        obj.current.as_mut().unwrap().code_hash = keccak256(&code);
+        obj.current.as_mut().unwrap().code_hash = common::hash_data(&code);
 
         // Don't overwrite already existing code so that views of it
         // that were previously returned by get_code() are still valid.
@@ -490,7 +491,7 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
         Ok(())
     }
 
-    pub async fn write_to_db(self, block_number: BlockNumber) -> anyhow::Result<()> {
+    pub async fn write_to_db(self, block_number: u64) -> anyhow::Result<()> {
         self.db.begin_block(block_number);
 
         for (address, storage) in self.storage {

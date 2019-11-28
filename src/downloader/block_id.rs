@@ -1,10 +1,9 @@
-use crate::models::BlockNumber;
 use ethereum_types::H256;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum BlockId {
     Hash(H256),
-    Number(BlockNumber),
+    Number(u64),
 }
 
 impl rlp::Decodable for BlockId {

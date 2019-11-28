@@ -1,8 +1,7 @@
-use super::BlockNumber;
-use crate::crypto::*;
 use bytes::Bytes;
 use ethereum_types::*;
 use rlp::*;
+use sha3::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// Ethereum block header definition.
@@ -15,7 +14,7 @@ pub struct BlockHeader {
     pub receipts_root: H256,
     pub logs_bloom: Bloom,
     pub difficulty: U256,
-    pub number: BlockNumber,
+    pub number: u64,
     pub gas_limit: u64,
     pub gas_used: u64,
     pub timestamp: u64,
@@ -134,7 +133,7 @@ impl BlockHeader {
             receipts_root: H256::zero(),
             logs_bloom: Bloom::zero(),
             difficulty: U256::zero(),
-            number: BlockNumber(0),
+            number: 0,
             gas_limit: 0,
             gas_used: 0,
             timestamp: 0,
@@ -147,7 +146,7 @@ impl BlockHeader {
 
     #[must_use]
     pub fn hash(&self) -> H256 {
-        keccak256(&rlp::encode(self)[..])
+        H256::from_slice(Keccak256::digest(&rlp::encode(self)).as_slice())
     }
 }
 
@@ -160,7 +159,7 @@ pub struct PartialHeader {
     pub receipts_root: H256,
     pub logs_bloom: Bloom,
     pub difficulty: U256,
-    pub number: BlockNumber,
+    pub number: u64,
     pub gas_limit: u64,
     pub gas_used: u64,
     pub timestamp: u64,
@@ -187,28 +186,6 @@ impl From<BlockHeader> for PartialHeader {
             mix_hash: header.mix_hash,
             nonce: header.nonce,
             base_fee_per_gas: header.base_fee_per_gas,
-        }
-    }
-}
-
-impl PartialHeader {
-    #[cfg(test)]
-    pub(crate) const fn empty() -> Self {
-        Self {
-            parent_hash: H256::zero(),
-            beneficiary: Address::zero(),
-            state_root: H256::zero(),
-            receipts_root: H256::zero(),
-            logs_bloom: Bloom::zero(),
-            difficulty: U256::zero(),
-            number: BlockNumber(0),
-            gas_limit: 0,
-            gas_used: 0,
-            timestamp: 0,
-            extra_data: Bytes::new(),
-            mix_hash: H256::zero(),
-            nonce: H64::zero(),
-            base_fee_per_gas: None,
         }
     }
 }

@@ -1,8 +1,5 @@
 use crate::{
     accessors::chain,
-    etl::collector::{Collector, OPTIMAL_BUFFER_CAPACITY},
-    kv::tables,
-    models::*,
     stagedsync::stage::{ExecOutput, Stage, StageInput, UnwindInput},
     MutableTransaction, StageId,
 };
@@ -15,18 +12,14 @@ use tracing::error;
 #[derive(Error, Debug)]
 pub enum SenderRecoveryError {
     #[error("Canonical hash for block {0} not found")]
-    HashNotFound(BlockNumber),
+    HashNotFound(u64),
     #[error("Block body for block {0} not found")]
-    BlockBodyNotFound(BlockNumber),
+    BlockBodyNotFound(u64),
 }
 
 const BUFFER_SIZE: u64 = 5000;
 
-async fn process_block<'db: 'tx, 'tx, RwTx>(
-    tx: &'tx mut RwTx,
-    collector: &mut Collector<tables::TxSender>,
-    height: BlockNumber,
-) -> anyhow::Result<()>
+async fn process_block<'db: 'tx, 'tx, RwTx>(tx: &'tx mut RwTx, height: u64) -> anyhow::Result<()>
 where
     RwTx: MutableTransaction<'db>,
 {
@@ -43,9 +36,7 @@ where
         senders.push(tx.recover_sender()?);
     }
 
-    chain::tx_sender::write_to_etl(collector, body.base_tx_id, &senders);
-
-    Ok(())
+    chain::tx_sender::write(tx, body.base_tx_id, &senders).await
 }
 
 #[derive(Debug)]
@@ -68,30 +59,25 @@ where
     where
         'db: 'tx,
     {
-        let from_height = input.stage_progress.unwrap_or_default();
-        let max_height = input
-            .previous_stage
-            .map(|(_, height)| height)
-            .unwrap_or_default();
+        let from_height = input.stage_progress.unwrap_or(0);
+        let max_height = if let Some((_, height)) = input.previous_stage {
+            height
+        } else {
+            0
+        };
         let to_height = cmp::min(max_height, from_height + BUFFER_SIZE);
 
-        let made_progress = to_height > from_height;
-
-        if made_progress {
-            let mut collector = Collector::new(OPTIMAL_BUFFER_CAPACITY);
-
-            for height in from_height + 1..=to_height {
-                process_block(tx, &mut collector, height)
-                    .await
-                    .with_context(|| format!("Failed to recover senders for block {}", height))?;
-            }
-
-            let mut write_cursor = tx.mutable_cursor(&tables::TxSender.erased()).await?;
-            collector.load(&mut write_cursor).await?;
+        let mut height = from_height;
+        while height < to_height {
+            process_block(tx, height + 1)
+                .await
+                .with_context(|| format!("Failed to recover senders for block {}", height + 1))?;
+            height += 1;
         }
 
+        let made_progress = height > from_height;
         Ok(ExecOutput::Progress {
-            stage_progress: to_height,
+            stage_progress: height,
             done: !made_progress,
             must_commit: made_progress,
         })
@@ -108,7 +94,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{kv::traits::MutableKV, new_mem_database};
+    use crate::{kv::traits::MutableKV, models::*, new_mem_database};
     use bytes::Bytes;
     use ethereum_types::*;
     use hex_literal::hex;
@@ -125,7 +111,7 @@ mod tests {
         let recipient2 = H160::from(hex!("d7fa8303df7073290f66ced1add5fe89dac0c462"));
 
         let block1 = BodyForStorage {
-            base_tx_id: 1.into(),
+            base_tx_id: 1,
             tx_amount: 2,
             uncles: vec![],
         };
@@ -175,7 +161,7 @@ mod tests {
         };
 
         let block2 = BodyForStorage {
-            base_tx_id: 3.into(),
+            base_tx_id: 3,
             tx_amount: 3,
             uncles: vec![],
         };
@@ -247,7 +233,7 @@ mod tests {
         };
 
         let block3 = BodyForStorage {
-            base_tx_id: 6.into(),
+            base_tx_id: 6,
             tx_amount: 0,
             uncles: vec![],
         };
@@ -281,8 +267,8 @@ mod tests {
 
         let stage_input = StageInput {
             restarted: false,
-            previous_stage: Some((StageId("BodyDownload"), 3.into())),
-            stage_progress: Some(0.into()),
+            previous_stage: Some((StageId("BodyDownload"), 3)),
+            stage_progress: Some(0),
         };
 
         let output: ExecOutput = stage.execute(&mut tx, stage_input).await.unwrap();
@@ -290,7 +276,7 @@ mod tests {
         assert_eq!(
             output,
             ExecOutput::Progress {
-                stage_progress: 3.into(),
+                stage_progress: 3,
                 done: false,
                 must_commit: true,
             }

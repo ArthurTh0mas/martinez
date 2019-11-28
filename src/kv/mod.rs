@@ -1,37 +1,26 @@
 pub mod mdbx;
 pub mod remote;
 pub mod server;
-pub mod tables;
 pub mod traits;
 
-pub use traits::{DupSort, Table, TableDecode, TableEncode, TableObject};
-
-use crate::kv::tables::CHAINDATA_TABLES;
 use ::mdbx::{Geometry, WriteMap};
 use async_trait::async_trait;
-use byte_unit::{n_mib_bytes, n_tib_bytes};
+use byte_unit::n_mb_bytes;
 use static_bytes::Bytes as StaticBytes;
-use std::{fmt::Debug, ops::Deref};
+use std::fmt::Debug;
+
+pub trait Table: Send + Sync + Debug + 'static {
+    fn db_name(&self) -> string::String<StaticBytes>;
+}
+
+pub trait DupSort: Table {}
 
 #[derive(Debug)]
 pub struct CustomTable(pub string::String<StaticBytes>);
 
 impl Table for CustomTable {
-    type Key = Vec<u8>;
-    type Value = Vec<u8>;
-    type SeekKey = Vec<u8>;
-    type FusedValue = (Self::Key, Self::Value);
-
     fn db_name(&self) -> string::String<StaticBytes> {
         self.0.clone()
-    }
-
-    fn fuse_values(key: Self::Key, value: Self::Value) -> anyhow::Result<Self::FusedValue> {
-        Ok((key, value))
-    }
-
-    fn split_fused((key, value): Self::FusedValue) -> (Self::Key, Self::Value) {
-        (key, value)
     }
 }
 
@@ -41,13 +30,15 @@ impl From<String> for CustomTable {
     }
 }
 
-impl DupSort for CustomTable {
-    type SeekBothKey = Vec<u8>;
+impl DupSort for CustomTable {}
+
+pub mod tables {
+    include!(concat!(env!("OUT_DIR"), "/tables.rs"));
 }
 
 pub struct MemoryKv {
     inner: mdbx::Environment<WriteMap>,
-    _tmpdir: Option<tempfile::TempDir>,
+    _tmpdir: tempfile::TempDir,
 }
 
 #[async_trait]
@@ -70,36 +61,18 @@ impl traits::MutableKV for MemoryKv {
 
 pub fn new_mem_database() -> anyhow::Result<impl traits::MutableKV> {
     let tmpdir = tempfile::tempdir()?;
-    Ok(MemoryKv {
-        inner: new_environment(tmpdir.path(), n_mib_bytes!(64), 0)?,
-        _tmpdir: Some(tmpdir),
-    })
-}
-
-pub fn new_database(path: &std::path::Path) -> anyhow::Result<impl traits::MutableKV> {
-    Ok(MemoryKv {
-        inner: new_environment(path, n_tib_bytes!(64), n_mib_bytes!(8) as usize)?,
-        _tmpdir: None,
-    })
-}
-
-fn new_environment(
-    path: &std::path::Path,
-    size_upper_limit: u128,
-    growth_step: usize,
-) -> anyhow::Result<mdbx::Environment<WriteMap>> {
-    if size_upper_limit > usize::MAX as u128 {
-        anyhow::bail!("size_upper_limit too big")
-    }
-    let size_upper_limit_sz = size_upper_limit as usize;
-
     let mut builder = ::mdbx::Environment::<WriteMap>::new();
-    builder.set_max_dbs(CHAINDATA_TABLES.len());
+    builder.set_max_dbs(tables::TABLE_MAP.len());
     builder.set_geometry(Geometry {
-        size: Some(0..size_upper_limit_sz),
-        growth_step: Some(growth_step as isize),
+        size: Some(0..n_mb_bytes!(64) as usize),
+        growth_step: None,
         shrink_threshold: None,
         page_size: None,
     });
-    mdbx::Environment::open_rw(builder, path, CHAINDATA_TABLES.deref().clone())
+    let inner = mdbx::Environment::open_rw(builder, tmpdir.path(), &tables::TABLE_MAP)?;
+
+    Ok(MemoryKv {
+        inner,
+        _tmpdir: tmpdir,
+    })
 }

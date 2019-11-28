@@ -1,65 +1,74 @@
-use crate::{
-    kv::{tables::BitmapKey, *},
-    models::*,
-    CursorDupSort,
-};
+use crate::{common, kv::*, CursorDupSort, *};
+use arrayref::array_ref;
 use async_trait::async_trait;
-use roaring::RoaringTreemap;
+use bytes::Bytes;
 use std::{collections::BTreeSet, fmt::Debug};
 
 mod account;
 mod storage;
 
-pub const DEFAULT_INCARNATION: Incarnation = Incarnation(1);
+pub const DEFAULT_INCARNATION: common::Incarnation = 1;
 
 pub struct AccountHistory;
 pub struct StorageHistory;
 
-pub type AccountChangeSet = ChangeSet<AccountHistory>;
-pub type StorageChangeSet = ChangeSet<StorageHistory>;
+pub type AccountChangeSet<'tx> = ChangeSet<'tx, AccountHistory>;
+pub type StorageChangeSet<'tx> = ChangeSet<'tx, StorageHistory>;
+pub use storage::find_with_incarnation as find_storage_with_incarnation;
 
-pub trait EncodedStream<'cs, T: Table>: Iterator<Item = (T::Key, T::Value)> + Send + 'cs {}
-impl<'cs, S, T> EncodedStream<'cs, T> for S
-where
-    S: Iterator<Item = (T::Key, T::Value)> + Send + 'cs,
-    T: Table,
+pub trait EncodedStream<'tx, 'cs>: Iterator<Item = (Bytes<'tx>, Bytes<'tx>)> + Send + 'cs {}
+impl<'tx: 'cs, 'cs, T> EncodedStream<'tx, 'cs> for T where
+    T: Iterator<Item = (Bytes<'tx>, Bytes<'tx>)> + Send + 'cs
 {
 }
 
-pub trait ChangeKey: Eq + Ord + Debug {}
-impl<T> ChangeKey for T where T: Eq + Ord + Debug {}
+pub trait ChangeKey: Eq + Ord + AsRef<[u8]> {}
+impl<T> ChangeKey for T where T: Eq + Ord + AsRef<[u8]> {}
 
-pub type Change<K, V> = (K, V);
+#[derive(Clone, PartialEq, PartialOrd, Eq, Ord)]
+pub struct Change<'tx, Key: ChangeKey> {
+    pub key: Key,
+    pub value: Bytes<'tx>,
+}
 
-pub type ChangeSet<K> = BTreeSet<Change<<K as HistoryKind>::Key, <K as HistoryKind>::Value>>;
+impl<'tx, Key: ChangeKey> Debug for Change<'tx, Key> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Change")
+            .field("key", &hex::encode(self.key.as_ref()))
+            .field("value", &hex::encode(&self.value))
+            .finish()
+    }
+}
+
+impl<'tx, Key: ChangeKey> Change<'tx, Key> {
+    pub fn new(key: Key, value: Bytes<'tx>) -> Self {
+        Self { key, value }
+    }
+}
+
+pub type ChangeSet<'tx, K> = BTreeSet<Change<'tx, <K as HistoryKind>::Key>>;
 
 #[async_trait]
 pub trait HistoryKind: Send {
-    type Key: Eq + Ord + Sync;
-    type Value: Debug + Sync;
     type ChangeSetTable: DupSort;
-    type IndexChunkKey: Clone + PartialEq + Send + Sync;
-    type IndexTable: Table<
-            Key = BitmapKey<Self::IndexChunkKey>,
-            Value = RoaringTreemap,
-            FusedValue = (BitmapKey<Self::IndexChunkKey>, RoaringTreemap),
-            SeekKey = BitmapKey<Self::IndexChunkKey>,
-        > + Default;
-    type EncodedStream<'cs>: EncodedStream<'cs, Self::ChangeSetTable>;
+    type Key: Eq + Ord + AsRef<[u8]> + Sync;
+    type IndexChunkKey: Eq + Ord + AsRef<[u8]>;
+    type IndexTable: Table + Default;
+    type EncodedStream<'tx: 'cs, 'cs>: EncodedStream<'tx, 'cs>;
 
-    fn index_chunk_key(key: Self::Key) -> Self::IndexChunkKey;
+    fn index_chunk_key(key: Self::Key, block_number: u64) -> Self::IndexChunkKey;
     async fn find<'tx, C>(
         cursor: &mut C,
-        block_number: BlockNumber,
-        needle: Self::Key,
-    ) -> anyhow::Result<Option<Self::Value>>
+        block_number: u64,
+        needle: &Self::Key,
+    ) -> anyhow::Result<Option<Bytes<'tx>>>
     where
         C: CursorDupSort<'tx, Self::ChangeSetTable>;
     /// Encode changes into DB keys and values
-    fn encode(block_number: BlockNumber, changes: &ChangeSet<Self>) -> Self::EncodedStream<'_>;
+    fn encode<'cs, 'tx: 'cs>(
+        block_number: u64,
+        changes: &'cs ChangeSet<'tx, Self>,
+    ) -> Self::EncodedStream<'tx, 'cs>;
     /// Decode `Change` from DB keys and values
-    fn decode(
-        k: <Self::ChangeSetTable as Table>::Key,
-        v: <Self::ChangeSetTable as Table>::Value,
-    ) -> (BlockNumber, Change<Self::Key, Self::Value>);
+    fn decode<'tx>(k: Bytes<'tx>, v: Bytes<'tx>) -> (u64, Change<'tx, Self::Key>);
 }

@@ -1,55 +1,61 @@
-use crate::kv::tables::AccountChange;
-
 use super::*;
 
 #[async_trait]
 impl HistoryKind for AccountHistory {
-    type Key = Address;
-    type Value = EncodedAccount;
-    type IndexChunkKey = Address;
+    type Key = common::Address;
+    type IndexChunkKey = [u8; common::ADDRESS_LENGTH + common::BLOCK_NUMBER_LENGTH];
     type IndexTable = tables::AccountHistory;
     type ChangeSetTable = tables::AccountChangeSet;
-    type EncodedStream<'cs> = impl EncodedStream<'cs, Self::ChangeSetTable>;
+    type EncodedStream<'tx: 'cs, 'cs> = impl EncodedStream<'tx, 'cs>;
 
-    fn index_chunk_key(key: Self::Key) -> Self::IndexChunkKey {
-        key
+    fn index_chunk_key(key: Self::Key, block_number: u64) -> Self::IndexChunkKey {
+        let mut v = Self::IndexChunkKey::default();
+        v[..key.as_ref().len()].copy_from_slice(key.as_ref());
+        v[key.as_ref().len()..].copy_from_slice(&block_number.to_be_bytes());
+        v
     }
     async fn find<'tx, C>(
         cursor: &mut C,
-        block_number: BlockNumber,
-        needle: Self::Key,
-    ) -> anyhow::Result<Option<Self::Value>>
+        block_number: u64,
+        needle: &Self::Key,
+    ) -> anyhow::Result<Option<Bytes<'tx>>>
     where
         C: CursorDupSort<'tx, Self::ChangeSetTable>,
     {
-        if let Some((_, v)) = cursor.seek_both_range(block_number, needle).await? {
-            let (_, (address, account)) = Self::decode(block_number, v);
+        let k = dbutils::encode_block_number(block_number);
+        if let Some(v) = cursor.seek_both_range(&k, needle.as_bytes()).await? {
+            let (_, Change { key, value }) = Self::decode(k.to_vec().into(), v);
 
-            if address == needle {
-                return Ok(Some(account));
+            if key == *needle {
+                return Ok(Some(value));
             }
         }
 
         Ok(None)
     }
 
-    fn encode(block_number: BlockNumber, s: &ChangeSet<Self>) -> Self::EncodedStream<'_> {
-        s.iter().map(move |(address, account)| {
-            (
-                block_number,
-                AccountChange {
-                    address: *address,
-                    account: account.clone(),
-                },
-            )
+    fn encode<'cs, 'tx: 'cs>(
+        block_number: u64,
+        s: &'cs ChangeSet<'tx, Self>,
+    ) -> Self::EncodedStream<'tx, 'cs> {
+        let k = dbutils::encode_block_number(block_number);
+
+        s.iter().map(move |cs| {
+            let mut new_v = vec![0; cs.key.as_ref().len() + cs.value.len()];
+            new_v[..cs.key.as_ref().len()].copy_from_slice(cs.key.as_ref());
+            new_v[cs.key.as_ref().len()..].copy_from_slice(&*cs.value);
+
+            (Bytes::from(k.to_vec()), new_v.into())
         })
     }
 
-    fn decode(
-        block_number: <Self::ChangeSetTable as Table>::Key,
-        AccountChange { address, account }: <Self::ChangeSetTable as Table>::Value,
-    ) -> (BlockNumber, Change<Self::Key, Self::Value>) {
-        (block_number, (address, account))
+    fn decode<'tx>(db_key: Bytes<'tx>, db_value: Bytes<'tx>) -> (u64, Change<'tx, Self::Key>) {
+        let block_n = u64::from_be_bytes(*array_ref!(db_key, 0, common::BLOCK_NUMBER_LENGTH));
+
+        let mut k = db_value;
+        let value = k.split_off(common::ADDRESS_LENGTH);
+
+        (block_n, Change::new(common::Address::from_slice(&k), value))
     }
 }
 
@@ -57,16 +63,15 @@ impl HistoryKind for AccountHistory {
 mod tests {
     use super::*;
     use ethereum_types::Address;
-    use hex_literal::hex;
 
     #[test]
     fn account_encoding() {
         let mut ch = ChangeSet::<AccountHistory>::default();
 
         for (i, val) in vec![
-            &hex!("f7f6db1eb17c6d582078e0ffdd0c") as &[u8],
-            &hex!("b1e9b5c16355eede662031dd621d08faf4ea") as &[u8],
-            &hex!("862cf52b74f1cea41ddd8ffa4b3e7c7790") as &[u8],
+            "f7f6db1eb17c6d582078e0ffdd0c".into(),
+            "b1e9b5c16355eede662031dd621d08faf4ea".into(),
+            "862cf52b74f1cea41ddd8ffa4b3e7c7790".into(),
         ]
         .into_iter()
         .enumerate()
@@ -75,12 +80,12 @@ mod tests {
                 .parse::<Address>()
                 .unwrap();
 
-            ch.insert((address, val.iter().copied().collect()));
+            ch.insert(Change::new(address, val));
         }
 
         let mut ch2 = AccountChangeSet::new();
 
-        for (k, v) in AccountHistory::encode(1.into(), &ch) {
+        for (k, v) in AccountHistory::encode(1, &ch) {
             let (_, change) = AccountHistory::decode(k, v);
 
             ch2.insert(change);

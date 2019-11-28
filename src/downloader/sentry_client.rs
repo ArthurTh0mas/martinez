@@ -21,7 +21,7 @@ pub enum PeerFilter {
     All,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct MessageFromPeer {
     pub message: Message,
     pub from_peer_id: Option<ethereum_types::H512>,

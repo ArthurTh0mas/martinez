@@ -1,6 +1,6 @@
 use super::{intra_block_state::IntraBlockState, object::Object};
 use crate::{State, Storage};
-use ethereum_types::*;
+use ethereum_types::{Address, H256};
 use std::fmt::Debug;
 
 /// Reversible change made to `IntraBlockState`.
@@ -12,10 +12,6 @@ pub enum Delta {
     Update {
         address: Address,
         previous: Object,
-    },
-    UpdateBalance {
-        address: Address,
-        previous: U256,
     },
     Selfdestruct {
         address: Address,
@@ -35,6 +31,7 @@ pub enum Delta {
     StorageCreate {
         address: Address,
     },
+
     StorageAccess {
         address: Address,
         key: H256,
@@ -45,9 +42,9 @@ pub enum Delta {
 }
 
 impl Delta {
-    pub fn revert<R>(self, state: &mut IntraBlockState<'_, R>)
+    pub fn revert<'storage, 'r, R>(self, state: &mut IntraBlockState<'storage, 'r, R>)
     where
-        R: State,
+        R: State<'storage>,
     {
         match self {
             Delta::Create { address } => {
@@ -55,16 +52,6 @@ impl Delta {
             }
             Delta::Update { address, previous } => {
                 state.objects.insert(address, previous);
-            }
-            Delta::UpdateBalance { address, previous } => {
-                state
-                    .objects
-                    .get_mut(&address)
-                    .unwrap()
-                    .current
-                    .as_mut()
-                    .unwrap()
-                    .balance = previous;
             }
             Delta::Selfdestruct { address } => {
                 state.self_destructs.remove(&address);
