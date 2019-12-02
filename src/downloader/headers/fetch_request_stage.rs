@@ -1,22 +1,18 @@
-use crate::{
-    downloader::{
-        block_id,
-        headers::{
-            header_slices,
-            header_slices::{HeaderSliceStatus, HeaderSlices},
-        },
-        messages::{GetBlockHeadersMessage, GetBlockHeadersMessageParams, Message},
-        sentry_client::PeerFilter,
-        sentry_client_reactor::{SendMessageError, SentryClientReactor},
+use crate::downloader::{
+    block_id,
+    headers::{
+        header_slices,
+        header_slices::{HeaderSliceStatus, HeaderSlices},
     },
-    models::BlockNumber,
+    messages::{GetBlockHeadersMessage, GetBlockHeadersMessageParams, Message},
+    sentry_client::PeerFilter,
+    sentry_client_reactor::{SendMessageError, SentryClientReactor},
 };
 use parking_lot::{lock_api::RwLockUpgradableReadGuard, RwLock};
 use std::{
     cell::{Cell, RefCell},
     ops::DerefMut,
     sync::Arc,
-    time,
 };
 use tokio::sync::watch;
 use tracing::*;
@@ -62,17 +58,6 @@ impl FetchRequestStage {
             self.pending_count()
         );
         self.request_pending()?;
-
-        // in case of SendQueueFull, await for extra capacity
-        if self.pending_count() > 0 {
-            // obtain the sentry lock, and release it before awaiting
-            let capacity_future = {
-                let sentry = self.sentry.read();
-                sentry.reserve_capacity_in_send_queue()
-            };
-            capacity_future.await?;
-        }
-
         debug!("FetchRequestStage: done");
         Ok(())
     }
@@ -91,16 +76,12 @@ impl FetchRequestStage {
                 let result = self.request(request_id, block_num, limit);
                 match result {
                     Err(error) => match error.downcast_ref::<SendMessageError>() {
-                        Some(SendMessageError::SendQueueFull) => {
-                            debug!("FetchRequestStage: request send queue is full");
-                            return Some(Ok(()));
-                        }
+                        Some(SendMessageError::SendQueueFull) => return Some(Ok(())),
                         Some(SendMessageError::ReactorStopped) => return Some(Err(error)),
                         None => return Some(Err(error)),
                     },
                     Ok(_) => {
                         let mut slice = RwLockUpgradableReadGuard::upgrade(slice);
-                        slice.request_time = Some(time::Instant::now());
                         self.header_slices
                             .set_slice_status(slice.deref_mut(), HeaderSliceStatus::Waiting);
                     }
@@ -110,7 +91,7 @@ impl FetchRequestStage {
         })
     }
 
-    fn request(&self, request_id: u64, block_num: BlockNumber, limit: u64) -> anyhow::Result<()> {
+    fn request(&self, request_id: u64, block_num: u64, limit: u64) -> anyhow::Result<()> {
         let message = GetBlockHeadersMessage {
             request_id,
             params: GetBlockHeadersMessageParams {

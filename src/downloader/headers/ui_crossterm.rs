@@ -24,7 +24,6 @@ impl UIView for HeaderSlicesView {
         let counters = self.header_slices.status_counters();
         let min_block_num = self.header_slices.min_block_num();
         let max_block_num = self.header_slices.max_block_num();
-        let final_block_num = self.header_slices.final_block_num();
 
         let mut stdout = stdout();
 
@@ -37,10 +36,9 @@ impl UIView for HeaderSlicesView {
 
         // overall progress
         let progress_desc = std::format!(
-            "downloading headers {} - {} of {} ...",
-            min_block_num.0,
-            max_block_num.0,
-            final_block_num.0,
+            "downloading headers {} - {} ...",
+            min_block_num,
+            max_block_num
         );
         stdout.queue(style::Print(progress_desc))?;
         stdout.queue(terminal::Clear(terminal::ClearType::UntilNewLine))?;

@@ -7,7 +7,7 @@ use crate::{
         messages::{BlockHeadersMessage, EthMessageId, Message},
         sentry_client_reactor::SentryClientReactor,
     },
-    models::{BlockHeader as Header, BlockNumber},
+    models::BlockHeader as Header,
 };
 use futures_core::Stream;
 use parking_lot::RwLock;
@@ -77,15 +77,19 @@ impl FetchReceiveStage {
         }
         let start_block_num = headers[0].number;
 
-        let slice_lock_opt = self.header_slices.find_by_start_block_num(start_block_num);
-        self.update_slice(slice_lock_opt, headers, start_block_num);
+        self.header_slices.find(
+            start_block_num,
+            move |slice_lock_opt: Option<&RwLock<HeaderSlice>>| {
+                self.update_slice(slice_lock_opt, headers, start_block_num);
+            },
+        );
     }
 
     fn update_slice(
         &self,
-        slice_lock_opt: Option<Arc<RwLock<HeaderSlice>>>,
+        slice_lock_opt: Option<&RwLock<HeaderSlice>>,
         headers: Vec<Header>,
-        start_block_num: BlockNumber,
+        start_block_num: u64,
     ) {
         match slice_lock_opt {
             Some(slice_lock) => {
@@ -97,13 +101,13 @@ impl FetchReceiveStage {
                             .set_slice_status(slice.deref_mut(), HeaderSliceStatus::Downloaded);
                     }
                     unexpected_status => {
-                        debug!("FetchReceiveStage ignores a headers slice that we didn't request starting at: {:?}; status = {:?}", start_block_num, unexpected_status);
+                        warn!("FetchReceiveStage ignores a headers slice that we didn't request starting at: {}; status = {:?}", start_block_num, unexpected_status);
                     }
                 }
             }
             None => {
-                debug!(
-                    "FetchReceiveStage ignores a headers slice that we didn't request starting at: {:?}",
+                warn!(
+                    "FetchReceiveStage ignores a headers slice that we didn't request starting at: {}",
                     start_block_num
                 );
             }
