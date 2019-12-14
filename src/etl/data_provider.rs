@@ -2,74 +2,78 @@ use anyhow;
 use std::{
     cmp::Ord,
     fs::File,
-    io::{prelude::*, SeekFrom},
+    io::{prelude::*, BufReader, BufWriter, SeekFrom},
+    path::Path,
 };
-use tempfile::tempfile;
-
-pub trait Provider {
-    fn new(buffer: Vec<Entry>, id: usize) -> anyhow::Result<Self, std::io::Error>
-    where
-        Self: Sized;
-    fn to_next(&mut self) -> anyhow::Result<(Vec<u8>, Vec<u8>)>;
-}
+use tempfile::tempfile_in;
 
 #[derive(Eq, Clone, PartialEq, PartialOrd, Ord)]
-pub struct Entry {
-    pub key: Vec<u8>,
-    pub value: Vec<u8>,
-    pub id: usize,
+pub struct Entry<Key, Value> {
+    pub key: Key,
+    pub value: Value,
+}
+
+impl<Key, Value> Entry<Key, Value> {
+    pub fn new(key: Key, value: Value) -> Self {
+        Self { key, value }
+    }
 }
 
 pub struct DataProvider {
-    pub file: File,
-    pub id: usize,
+    file: BufReader<File>,
+    len: usize,
 }
 
-impl Provider for DataProvider {
-    fn new(buffer: Vec<Entry>, id: usize) -> anyhow::Result<DataProvider, std::io::Error>
+impl DataProvider {
+    pub fn new<Key, Value>(
+        dir: &Path,
+        buffer: Vec<Entry<Key, Value>>,
+    ) -> anyhow::Result<DataProvider, std::io::Error>
     where
         Self: Sized,
+        Key: AsRef<[u8]>,
+        Value: AsRef<[u8]>,
     {
-        let mut file = tempfile()?;
-        for entry in buffer {
-            file.write(&entry.key.len().to_be_bytes())?;
-            file.write(&entry.value.len().to_be_bytes())?;
-            file.write(&entry.key)?;
-            file.write(&entry.value)?;
+        let file = tempfile_in(dir)?;
+        let mut w = BufWriter::new(file);
+        for entry in &buffer {
+            let k = entry.key.as_ref();
+            let v = entry.value.as_ref();
+
+            w.write_all(&k.len().to_be_bytes())?;
+            w.write_all(&v.len().to_be_bytes())?;
+            w.write_all(k)?;
+            w.write_all(v)?;
         }
-        // Reset position at 0 byte
+
+        let mut file = BufReader::new(w.into_inner()?);
         file.seek(SeekFrom::Start(0))?;
-        Ok(DataProvider { file, id })
+        let len = buffer.len();
+        Ok(DataProvider { file, len })
     }
 
     #[allow(clippy::wrong_self_convention)]
-    fn to_next(&mut self) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    pub fn to_next(&mut self) -> anyhow::Result<Option<(Vec<u8>, Vec<u8>)>> {
+        if self.len == 0 {
+            return Ok(None);
+        }
+
         let mut buffer_key_length = [0; 8];
         let mut buffer_value_length = [0; 8];
 
-        // EOF reached
-        if self.file.read(&mut buffer_key_length[..])? == 0 {
-            return Ok((Vec::new(), Vec::new()));
-        }
-        // EOF reached
-        if self.file.read(&mut buffer_value_length[..])? == 0 {
-            return Ok((Vec::new(), Vec::new()));
-        }
+        self.file.read_exact(&mut buffer_key_length)?;
+        self.file.read_exact(&mut buffer_value_length)?;
 
         let key_length = usize::from_be_bytes(buffer_key_length);
         let value_length = usize::from_be_bytes(buffer_value_length);
         let mut key = vec![0; key_length];
         let mut value = vec![0; value_length];
 
-        // EOF reached
-        if self.file.read(&mut key[..])? == 0 {
-            return Ok((Vec::new(), Vec::new()));
-        }
+        self.file.read_exact(&mut key)?;
+        self.file.read_exact(&mut value)?;
 
-        // EOF reached
-        if self.file.read(&mut value[..])? == 0 {
-            return Ok((Vec::new(), Vec::new()));
-        }
-        Ok((key, value))
+        self.len -= 1;
+
+        Ok(Some((key, value)))
     }
 }

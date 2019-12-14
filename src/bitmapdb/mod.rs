@@ -1,94 +1,57 @@
-use std::iter::Peekable;
-
-use crate::{common, kv::Table, txdb, Transaction};
-use arrayref::array_ref;
-use pin_utils::pin_mut;
-use roaring::RoaringTreemap;
+use crate::{
+    kv::{tables::BitmapKey, traits::*},
+    models::*,
+};
+use croaring::{treemap::NativeSerializer, Treemap as RoaringTreemap};
+use std::{iter::Peekable, ops::RangeInclusive};
+use tokio::pin;
 use tokio_stream::StreamExt;
 
 // Size beyond which we get MDBX overflow pages: 4096 / 2 - (key_size + 8)
 pub const CHUNK_LIMIT: usize = 1950;
 
-pub async fn get<'db, Tx, T>(
+pub async fn get<'db, Tx, T, K>(
     tx: &Tx,
-    table: &T,
-    key: &[u8],
-    from: u64,
-    to: u64,
+    table: T,
+    key: K,
+    range: RangeInclusive<BlockNumber>,
 ) -> anyhow::Result<RoaringTreemap>
 where
     Tx: Transaction<'db>,
-    T: Table,
+    K: Clone + PartialEq + Send,
+    BitmapKey<K>: TableDecode,
+    T: Table<Key = BitmapKey<K>, Value = RoaringTreemap, SeekKey = BitmapKey<K>>,
 {
     let mut out: Option<RoaringTreemap> = None;
-
-    let from_key = key
-        .iter()
-        .chain(&from.to_be_bytes())
-        .copied()
-        .collect::<Vec<_>>();
+    let from = *range.start();
+    let to = *range.end();
 
     let mut c = tx.cursor(table).await?;
 
-    let s = txdb::walk(&mut c, &from_key, (key.len() * 8) as u64);
+    let s = walk(
+        &mut c,
+        Some(BitmapKey {
+            inner: key.clone(),
+            block_number: from,
+        }),
+    )
+    .take_while(ttw(|(BitmapKey { inner, .. }, _)| *inner == key));
 
-    pin_mut!(s);
+    pin!(s);
 
-    while let Some((k, v)) = s.try_next().await? {
-        let v = RoaringTreemap::deserialize_from(v.as_ref())?;
-
+    while let Some((BitmapKey { block_number, .. }, v)) = s.try_next().await? {
         if out.is_some() {
             out = Some(out.unwrap() | v);
         } else {
             out = Some(v);
         }
 
-        if u64::from_be_bytes(*array_ref!(
-            k[k.len() - common::BLOCK_NUMBER_LENGTH..],
-            0,
-            common::BLOCK_NUMBER_LENGTH
-        )) >= to
-        {
+        if block_number >= to {
             break;
         }
     }
 
     Ok(out.unwrap_or_default())
-}
-
-fn cut_left(bm: &mut RoaringTreemap, size_limit: usize) -> Option<RoaringTreemap> {
-    if bm.is_empty() {
-        return None;
-    }
-
-    let sz = bm.serialized_size();
-    if sz <= size_limit {
-        let v = std::mem::replace(bm, RoaringTreemap::new());
-
-        return Some(v);
-    }
-
-    let mut v = RoaringTreemap::new();
-
-    let mut it = bm.iter().peekable();
-
-    let mut min_n = None;
-    while let Some(n) = it.peek() {
-        v.push(*n);
-        if v.serialized_size() > size_limit {
-            v.remove(*n);
-            min_n = Some(*n);
-            break;
-        }
-        it.next();
-    }
-
-    if let Some(n) = min_n {
-        bm.remove_range(0..n);
-        Some(v)
-    } else {
-        Some(std::mem::replace(bm, RoaringTreemap::new()))
-    }
 }
 
 pub struct Chunks {
@@ -100,7 +63,45 @@ impl Iterator for Chunks {
     type Item = RoaringTreemap;
 
     fn next(&mut self) -> Option<Self::Item> {
-        cut_left(&mut self.bm, self.size_limit)
+        if self.bm.is_empty() {
+            return None;
+        }
+
+        let sz = self.bm.get_serialized_size_in_bytes();
+        if sz <= self.size_limit {
+            return Some(std::mem::replace(&mut self.bm, RoaringTreemap::create()));
+        }
+
+        let mut v = RoaringTreemap::create();
+
+        let mut it = self.bm.iter().peekable();
+
+        let mut min_n = None;
+        while let Some(n) = it.peek() {
+            v.add(*n);
+            if v.get_serialized_size_in_bytes() > self.size_limit {
+                v.remove(*n);
+                min_n = Some(*n);
+                break;
+            }
+            it.next();
+        }
+
+        drop(it);
+
+        if let Some(min_n) = min_n {
+            let to_remove = self
+                .bm
+                .iter()
+                .take_while(|&n| n < min_n)
+                .collect::<Vec<_>>();
+            for element in to_remove {
+                self.bm.remove(element);
+            }
+            Some(v)
+        } else {
+            Some(std::mem::replace(&mut self.bm, RoaringTreemap::create()))
+        }
     }
 }
 
@@ -109,39 +110,32 @@ impl Chunks {
         Self { bm, size_limit }
     }
 
-    pub fn with_keys(self, k: &[u8]) -> ChunkWithKeys<'_> {
-        ChunkWithKeys {
+    pub fn with_keys(self) -> ChunksWithKeys {
+        ChunksWithKeys {
             inner: self.peekable(),
-            k,
         }
     }
 }
 
-pub struct ChunkWithKeys<'a> {
+pub struct ChunksWithKeys {
     inner: Peekable<Chunks>,
-    k: &'a [u8],
 }
 
-impl<'a> Iterator for ChunkWithKeys<'a> {
-    type Item = (Vec<u8>, RoaringTreemap);
+impl Iterator for ChunksWithKeys {
+    type Item = (BlockNumber, RoaringTreemap);
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next().map(|chunk| {
-            let chunk_key = self
-                .k
-                .iter()
-                .chain(
-                    &if self.inner.peek().is_none() {
+            (
+                BlockNumber({
+                    if self.inner.peek().is_none() {
                         u64::MAX
                     } else {
-                        chunk.max().unwrap()
+                        chunk.maximum().unwrap()
                     }
-                    .to_be_bytes(),
-                )
-                .copied()
-                .collect();
-
-            (chunk_key, chunk)
+                }),
+                chunk,
+            )
         })
     }
 }
@@ -151,21 +145,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cut_left() {
+    fn chunks() {
         for &n in &[1024, 2048] {
-            let mut bm = RoaringTreemap::new();
+            let mut bm = RoaringTreemap::create();
 
             for j in (0..10_000).filter(|j| j % 20 == 0) {
-                bm.append(j..j + 10);
+                for e in j..j + 10 {
+                    bm.add(e);
+                }
             }
 
-            while !bm.is_empty() {
-                let lft = super::cut_left(&mut bm, n).unwrap();
-                let lft_size = lft.serialized_size();
-                if !bm.is_empty() {
+            let mut iter = Chunks::new(bm, n).peekable();
+            while let Some(lft) = iter.next() {
+                let lft_size = lft.get_serialized_size_in_bytes();
+                if iter.peek().is_some() {
                     assert!(lft_size > n - 256 && lft_size < n + 256);
                 } else {
-                    assert!(lft.serialized_size() > 0);
+                    assert!(lft.get_serialized_size_in_bytes() > 0);
                     assert!(lft_size < n + 256);
                 }
             }
@@ -173,18 +169,17 @@ mod tests {
 
         const N: usize = 2048;
         {
-            let mut bm = RoaringTreemap::new();
-            bm.push(1);
-            let lft = super::cut_left(&mut bm, N).unwrap();
-            assert!(lft.serialized_size() > 0);
-            assert_eq!(lft.len(), 1);
-            assert_eq!(bm.len(), 0);
+            let mut bm = RoaringTreemap::create();
+            bm.add(1);
+            let mut iter = Chunks::new(bm, N);
+
+            let v = iter.next().unwrap();
+            assert_eq!(v.cardinality(), 1);
+            assert!(v.get_serialized_size_in_bytes() > 0);
+
+            assert_eq!(iter.next(), None);
         }
 
-        {
-            let mut bm = RoaringTreemap::new();
-            assert_eq!(super::cut_left(&mut bm, N), None);
-            assert_eq!(bm.len(), 0);
-        }
+        assert_eq!(Chunks::new(RoaringTreemap::create(), N).next(), None);
     }
 }

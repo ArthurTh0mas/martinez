@@ -1,21 +1,20 @@
+#![feature(let_else)]
 #![allow(clippy::suspicious_else_formatting)]
 use martinez::{
-    chain::{
-        blockchain::Blockchain,
-        config::*,
-        consensus::{Consensus, NoProof},
-        difficulty::canonical_difficulty,
-        validity::pre_validate_transaction,
+    consensus::{
+        difficulty::{canonical_difficulty, BlockDifficultyBombData},
+        *,
     },
     crypto::keccak256,
     models::*,
+    res::chainspec::*,
     *,
 };
-use anyhow::*;
+use anyhow::{bail, ensure, format_err};
 use bytes::Bytes;
+use clap::Parser;
 use educe::Educe;
-use ethereum_types::*;
-use maplit::hashmap;
+use maplit::*;
 use once_cell::sync::Lazy;
 use serde::{de, Deserialize};
 use serde_json::{Map, Value};
@@ -27,15 +26,27 @@ use std::{
     ops::AddAssign,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::Arc,
+    time::Instant,
 };
-use structopt::StructOpt;
+use tokio::runtime::Builder;
 use tracing::*;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
-pub static DIFFICULTY_DIR: Lazy<PathBuf> = Lazy::new(|| Path::new("BasicTests").to_path_buf());
+pub static DIFFICULTY_DIR: Lazy<PathBuf> = Lazy::new(|| Path::new("DifficultyTests").to_path_buf());
 pub static BLOCKCHAIN_DIR: Lazy<PathBuf> = Lazy::new(|| Path::new("BlockchainTests").to_path_buf());
 pub static TRANSACTION_DIR: Lazy<PathBuf> =
     Lazy::new(|| Path::new("TransactionTests").to_path_buf());
+
+pub static IGNORED_TX_EXCEPTIONS: Lazy<HashSet<String>> = Lazy::new(|| {
+    hashset! {
+        // This is not checked for now.
+        "InvalidVRS".to_string(),
+
+        // Post-intrinsic gas calculation is part of execution, not pre-validation.
+        "TR_IntrinsicGas".to_string()
+    }
+});
 
 pub static EXCLUDED_TESTS: Lazy<Vec<PathBuf>> = Lazy::new(|| {
     vec![
@@ -43,6 +54,10 @@ pub static EXCLUDED_TESTS: Lazy<Vec<PathBuf>> = Lazy::new(|| {
         BLOCKCHAIN_DIR
             .join("GeneralStateTests")
             .join("stTimeConsuming"),
+        BLOCKCHAIN_DIR
+            .join("GeneralStateTests")
+            .join("VMTests")
+            .join("vmPerformance"),
         // We do not have extra data check
         BLOCKCHAIN_DIR
             .join("TransitionTests")
@@ -73,6 +88,20 @@ pub static EXCLUDED_TESTS: Lazy<Vec<PathBuf>> = Lazy::new(|| {
         TRANSACTION_DIR
             .join("ttRSValue")
             .join("TransactionWithSvalueLargerThan_c_secp256k1n_x05.json"),
+        // Edge case unlikely to be reached ever
+        TRANSACTION_DIR
+            .join("ttNonce")
+            .join("TransactionWithHighNonce64Minus1.json"),
+        // Should be fixed in rlp crate
+        TRANSACTION_DIR
+            .join("ttWrongRLP")
+            .join("TRANSCT__RandomByteAtTheEnd.json"),
+        TRANSACTION_DIR
+            .join("ttWrongRLP")
+            .join("TRANSCT__RandomByteAtRLP_9.json"),
+        TRANSACTION_DIR
+            .join("ttWrongRLP")
+            .join("TRANSCT__ZeroByteAtRLP_9.json"),
     ]
 });
 
@@ -95,6 +124,7 @@ enum Network {
     ByzantiumToConstantinopleFixAt5,
     BerlinToLondonAt5,
     EIP2384,
+    ArrowGlacier,
 }
 
 impl FromStr for Network {
@@ -119,216 +149,287 @@ impl FromStr for Network {
             "ByzantiumToConstantinopleFixAt5" => Self::ByzantiumToConstantinopleFixAt5,
             "BerlinToLondonAt5" => Self::BerlinToLondonAt5,
             "EIP2384" => Self::EIP2384,
+            "ArrowGlacier" => Self::ArrowGlacier,
             _ => return Err(()),
         })
     }
 }
 
-static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
-    hashmap! {
-        Network::Frontier => ChainConfig {
-            chain_id: 1,
-            ..ChainConfig::default()
-        },
-        Network::Homestead => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            ..ChainConfig::default()
-        },
-        Network::EIP150 => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(0.into()),
-            ..ChainConfig::default()
-        },
-        Network::EIP158 => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(0.into()),
-            spurious_block: Some(0.into()),
-            ..ChainConfig::default()
-        },
-        Network::Byzantium => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(0.into()),
-            spurious_block: Some(0.into()),
-            byzantium_block: Some(0.into()),
-            ..ChainConfig::default()
-        },
-        Network::Constantinople => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(0.into()),
-            spurious_block: Some(0.into()),
-            byzantium_block: Some(0.into()),
-            constantinople_block: Some(0.into()),
-            ..ChainConfig::default()
-        },
-        Network::ConstantinopleFix => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(0.into()),
-            spurious_block: Some(0.into()),
-            byzantium_block: Some(0.into()),
-            constantinople_block: Some(0.into()),
-            petersburg_block: Some(0.into()),
-            ..ChainConfig::default()
-        },
-        Network::Istanbul => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(0.into()),
-            spurious_block: Some(0.into()),
-            byzantium_block: Some(0.into()),
-            constantinople_block: Some(0.into()),
-            petersburg_block: Some(0.into()),
-            istanbul_block: Some(0.into()),
-            ..ChainConfig::default()
-        },
-        Network::Berlin => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(0.into()),
-            spurious_block: Some(0.into()),
-            byzantium_block: Some(0.into()),
-            constantinople_block: Some(0.into()),
-            petersburg_block: Some(0.into()),
-            istanbul_block: Some(0.into()),
-            muir_glacier_block: Some(0.into()),
-            berlin_block: Some(0.into()),
-            ..ChainConfig::default()
-        },
-        Network::London => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(0.into()),
-            spurious_block: Some(0.into()),
-            byzantium_block: Some(0.into()),
-            constantinople_block: Some(0.into()),
-            petersburg_block: Some(0.into()),
-            istanbul_block: Some(0.into()),
-            muir_glacier_block: Some(0.into()),
-            berlin_block: Some(0.into()),
-            london_block: Some(0.into()),
-            ..ChainConfig::default()
-        },
-        Network::FrontierToHomesteadAt5 => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(5.into()),
-            ..ChainConfig::default()
-        },
-        Network::HomesteadToEIP150At5 => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(5.into()),
-            ..ChainConfig::default()
-        },
-        Network::HomesteadToDaoAt5 => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            dao_fork: Some(DaoConfig {
-                block_number: 5.into(),
-                ..MAINNET_CONFIG.dao_fork.clone().unwrap()
-            }),
-            ..ChainConfig::default()
-        },
-        Network::EIP158ToByzantiumAt5 => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(0.into()),
-            spurious_block: Some(0.into()),
-            byzantium_block: Some(5.into()),
-            ..ChainConfig::default()
-        },
-        Network::ByzantiumToConstantinopleFixAt5 => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(0.into()),
-            spurious_block: Some(0.into()),
-            byzantium_block: Some(0.into()),
-            constantinople_block: Some(5.into()),
-            petersburg_block: Some(5.into()),
-            ..ChainConfig::default()
-        },
-        Network::BerlinToLondonAt5 => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(0.into()),
-            spurious_block: Some(0.into()),
-            byzantium_block: Some(0.into()),
-            constantinople_block: Some(0.into()),
-            petersburg_block: Some(0.into()),
-            istanbul_block: Some(0.into()),
-            muir_glacier_block: Some(0.into()),
-            berlin_block: Some(0.into()),
-            london_block: Some(5.into()),
-            ..ChainConfig::default()
-        },
-        Network::EIP2384 => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(0.into()),
-            spurious_block: Some(0.into()),
-            byzantium_block: Some(0.into()),
-            constantinople_block: Some(0.into()),
-            petersburg_block: Some(0.into()),
-            istanbul_block: Some(0.into()),
-            muir_glacier_block: Some(0.into()),
-            ..ChainConfig::default()
-        },
-    }
-});
+fn testconfig(
+    name: Network,
+    upgrades: Upgrades,
+    dao_block: Option<BlockNumber>,
+    bomb_delay: BlockNumber,
+) -> ChainSpec {
+    let mut spec = MAINNET.clone();
+    spec.name = format!("{:?}", name);
+    spec.consensus.eip1559_block = upgrades.london;
+    let SealVerificationParams::Ethash { difficulty_bomb, skip_pow_verification, homestead_formula, byzantium_formula,.. } = &mut spec.consensus.seal_verification else { unreachable!() };
+    *difficulty_bomb = Some(DifficultyBomb {
+        delays: btreemap! { BlockNumber(0) => bomb_delay },
+    });
+    *skip_pow_verification = true;
+    *homestead_formula = upgrades.homestead;
+    *byzantium_formula = upgrades.byzantium;
+    spec.upgrades = upgrades;
 
-pub static DIFFICULTY_CONFIG: Lazy<HashMap<String, ChainConfig>> = Lazy::new(|| {
-    hashmap! {
-        "difficulty.json".to_string() => MAINNET_CONFIG.clone(),
-        "difficultyByzantium.json".to_string() => NETWORK_CONFIG[&Network::Byzantium].clone(),
-        "difficultyConstantinople.json".to_string() => NETWORK_CONFIG[&Network::Constantinople].clone(),
-        "difficultyCustomMainNetwork.json".to_string() => MAINNET_CONFIG.clone(),
-        "difficultyEIP2384_random_to20M.json".to_string() => NETWORK_CONFIG[&Network::EIP2384].clone(),
-        "difficultyEIP2384_random.json".to_string() => NETWORK_CONFIG[&Network::EIP2384].clone(),
-        "difficultyEIP2384.json".to_string() => NETWORK_CONFIG[&Network::EIP2384].clone(),
-        "difficultyFrontier.json".to_string() => NETWORK_CONFIG[&Network::Frontier].clone(),
-        "difficultyHomestead.json".to_string() => NETWORK_CONFIG[&Network::Homestead].clone(),
-        "difficultyMainNetwork.json".to_string() => MAINNET_CONFIG.clone(),
-        "difficultyRopsten.json".to_string() => ROPSTEN_CONFIG.clone(),
+    let mainnet_dao_fork_block_num = BlockNumber(1_920_000);
+    let dao_data = spec.balances.remove(&mainnet_dao_fork_block_num).unwrap();
+    spec.balances.clear();
+    if let Some(dao_block) = dao_block {
+        spec.balances.insert(dao_block, dao_data);
     }
+
+    spec
+}
+
+static NETWORK_CONFIG: Lazy<HashMap<Network, ChainSpec>> = Lazy::new(|| {
+    vec![
+        (Network::Frontier, Upgrades::default(), None, 0),
+        (
+            Network::Homestead,
+            Upgrades {
+                homestead: Some(0.into()),
+                ..Default::default()
+            },
+            None,
+            0,
+        ),
+        (
+            Network::EIP150,
+            Upgrades {
+                homestead: Some(0.into()),
+                tangerine: Some(0.into()),
+                ..Default::default()
+            },
+            None,
+            0,
+        ),
+        (
+            Network::EIP158,
+            Upgrades {
+                homestead: Some(0.into()),
+                tangerine: Some(0.into()),
+                spurious: Some(0.into()),
+                ..Default::default()
+            },
+            None,
+            0,
+        ),
+        (
+            Network::Byzantium,
+            Upgrades {
+                homestead: Some(0.into()),
+                tangerine: Some(0.into()),
+                spurious: Some(0.into()),
+                byzantium: Some(0.into()),
+                ..Default::default()
+            },
+            None,
+            3000000,
+        ),
+        (
+            Network::Constantinople,
+            Upgrades {
+                homestead: Some(0.into()),
+                tangerine: Some(0.into()),
+                spurious: Some(0.into()),
+                byzantium: Some(0.into()),
+                constantinople: Some(0.into()),
+                ..Default::default()
+            },
+            None,
+            5000000,
+        ),
+        (
+            Network::ConstantinopleFix,
+            Upgrades {
+                homestead: Some(0.into()),
+                tangerine: Some(0.into()),
+                spurious: Some(0.into()),
+                byzantium: Some(0.into()),
+                constantinople: Some(0.into()),
+                petersburg: Some(0.into()),
+                ..Default::default()
+            },
+            None,
+            5000000,
+        ),
+        (
+            Network::Istanbul,
+            Upgrades {
+                homestead: Some(0.into()),
+                tangerine: Some(0.into()),
+                spurious: Some(0.into()),
+                byzantium: Some(0.into()),
+                constantinople: Some(0.into()),
+                petersburg: Some(0.into()),
+                istanbul: Some(0.into()),
+                ..Default::default()
+            },
+            None,
+            9000000,
+        ),
+        (
+            Network::Berlin,
+            Upgrades {
+                homestead: Some(0.into()),
+                tangerine: Some(0.into()),
+                spurious: Some(0.into()),
+                byzantium: Some(0.into()),
+                constantinople: Some(0.into()),
+                petersburg: Some(0.into()),
+                istanbul: Some(0.into()),
+                berlin: Some(0.into()),
+                ..Default::default()
+            },
+            None,
+            9000000,
+        ),
+        (
+            Network::London,
+            Upgrades {
+                homestead: Some(0.into()),
+                tangerine: Some(0.into()),
+                spurious: Some(0.into()),
+                byzantium: Some(0.into()),
+                constantinople: Some(0.into()),
+                petersburg: Some(0.into()),
+                istanbul: Some(0.into()),
+                berlin: Some(0.into()),
+                london: Some(0.into()),
+            },
+            None,
+            9700000,
+        ),
+        (
+            Network::FrontierToHomesteadAt5,
+            Upgrades {
+                homestead: Some(5.into()),
+                ..Default::default()
+            },
+            None,
+            0,
+        ),
+        (
+            Network::HomesteadToEIP150At5,
+            Upgrades {
+                homestead: Some(0.into()),
+                tangerine: Some(5.into()),
+                ..Default::default()
+            },
+            None,
+            0,
+        ),
+        (
+            Network::HomesteadToDaoAt5,
+            Upgrades {
+                homestead: Some(0.into()),
+                ..Default::default()
+            },
+            Some(5.into()),
+            0,
+        ),
+        (
+            Network::EIP158ToByzantiumAt5,
+            Upgrades {
+                homestead: Some(0.into()),
+                tangerine: Some(0.into()),
+                spurious: Some(0.into()),
+                byzantium: Some(5.into()),
+                ..Default::default()
+            },
+            None,
+            3000000,
+        ),
+        (
+            Network::ByzantiumToConstantinopleFixAt5,
+            Upgrades {
+                homestead: Some(0.into()),
+                tangerine: Some(0.into()),
+                spurious: Some(0.into()),
+                byzantium: Some(0.into()),
+                constantinople: Some(5.into()),
+                petersburg: Some(5.into()),
+                ..Default::default()
+            },
+            None,
+            5000000,
+        ),
+        (
+            Network::BerlinToLondonAt5,
+            Upgrades {
+                homestead: Some(0.into()),
+                tangerine: Some(0.into()),
+                spurious: Some(0.into()),
+                byzantium: Some(0.into()),
+                constantinople: Some(0.into()),
+                petersburg: Some(0.into()),
+                istanbul: Some(0.into()),
+                berlin: Some(0.into()),
+                london: Some(5.into()),
+            },
+            None,
+            9700000,
+        ),
+        (
+            Network::EIP2384,
+            Upgrades {
+                homestead: Some(0.into()),
+                tangerine: Some(0.into()),
+                spurious: Some(0.into()),
+                byzantium: Some(0.into()),
+                constantinople: Some(0.into()),
+                petersburg: Some(0.into()),
+                istanbul: Some(0.into()),
+                ..Default::default()
+            },
+            None,
+            9000000,
+        ),
+        (
+            Network::ArrowGlacier,
+            Upgrades {
+                homestead: Some(0.into()),
+                tangerine: Some(0.into()),
+                spurious: Some(0.into()),
+                byzantium: Some(0.into()),
+                constantinople: Some(0.into()),
+                petersburg: Some(0.into()),
+                istanbul: Some(0.into()),
+                berlin: Some(0.into()),
+                london: Some(0.into()),
+            },
+            None,
+            10700000,
+        ),
+    ]
+    .into_iter()
+    .map(|(network, upgrades, dao_block, bomb_delay)| {
+        (
+            network,
+            testconfig(network, upgrades, dao_block, bomb_delay.into()),
+        )
+    })
+    .collect()
 });
 
 #[derive(Deserialize, Educe)]
 #[educe(Debug)]
 pub struct AccountState {
     pub balance: U256,
-    #[serde(deserialize_with = "deserialize_str_as_bytes")]
+    #[serde(with = "hexbytes")]
     #[educe(Debug(method = "write_hex_string"))]
-    pub code: Bytes<'static>,
+    pub code: Bytes,
     pub nonce: U64,
     pub storage: HashMap<U256, U256>,
-}
-
-fn deserialize_str_as_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: de::Deserializer<'de>,
-{
-    let s = String::deserialize(deserializer)?;
-
-    let d = if let Some(stripped) = s.strip_prefix("0x") {
-        u64::from_str_radix(stripped, 16)
-    } else {
-        s.parse()
-    }
-    .map_err(|e| format!("{}/{}", e, s))
-    .unwrap();
-
-    Ok(d)
 }
 
 fn deserialize_str_as_blocknumber<'de, D>(deserializer: D) -> Result<BlockNumber, D::Error>
 where
     D: de::Deserializer<'de>,
 {
-    deserialize_str_as_u64(deserializer).map(BlockNumber)
+    deserialize_hexstr_as_u64(deserializer).map(BlockNumber)
 }
 
 fn deserialize_str_as_u128<'de, D>(deserializer: D) -> Result<u128, D::Error>
@@ -352,13 +453,13 @@ where
 #[serde(rename_all = "camelCase")]
 struct DifficultyTest {
     /// Timestamp of a previous block
-    #[serde(deserialize_with = "deserialize_str_as_u64")]
+    #[serde(deserialize_with = "deserialize_hexstr_as_u64")]
     parent_timestamp: u64,
     /// Difficulty of a previous block
     #[serde(deserialize_with = "deserialize_str_as_u128")]
     parent_difficulty: u128,
     /// Timestamp of a current block
-    #[serde(deserialize_with = "deserialize_str_as_u64")]
+    #[serde(deserialize_with = "deserialize_hexstr_as_u64")]
     current_timestamp: u64,
     /// Number of a current block (previous block number = currentBlockNumber - 1)
     #[serde(deserialize_with = "deserialize_str_as_blocknumber")]
@@ -367,7 +468,7 @@ struct DifficultyTest {
     #[serde(deserialize_with = "deserialize_str_as_u128")]
     current_difficulty: u128,
     #[serde(default)]
-    parent_uncles: Option<H256>,
+    parent_uncles: U256,
 }
 
 #[derive(Debug, Deserialize)]
@@ -385,9 +486,9 @@ struct BlockchainTest {
     seal_engine: SealEngine,
     network: Network,
     pre: HashMap<Address, AccountState>,
-    #[serde(rename = "genesisRLP", deserialize_with = "deserialize_str_as_bytes")]
+    #[serde(rename = "genesisRLP", with = "hexbytes")]
     #[educe(Debug(method = "write_hex_string"))]
-    genesis_rlp: Bytes<'static>,
+    genesis_rlp: Bytes,
     blocks: Vec<Map<String, Value>>,
     #[serde(default)]
     post_state_hash: Option<H256>,
@@ -426,33 +527,18 @@ async fn init_pre_state<S: State>(pre: &HashMap<Address, AccountState>, state: &
         };
 
         if !j.code.is_empty() {
-            account.incarnation = DEFAULT_INCARNATION;
             account.code_hash = keccak256(&*j.code);
             state
-                .update_account_code(
-                    *address,
-                    account.incarnation,
-                    account.code_hash,
-                    j.code.clone().into(),
-                )
+                .update_code(account.code_hash, j.code.clone())
                 .await
                 .unwrap();
         }
 
-        state
-            .update_account(*address, None, Some(account.clone()))
-            .await
-            .unwrap();
+        state.update_account(*address, None, Some(account));
 
         for (&key, &value) in &j.storage {
             state
-                .update_storage(
-                    *address,
-                    account.incarnation,
-                    u256_to_h256(key),
-                    H256::zero(),
-                    u256_to_h256(value),
-                )
+                .update_storage(*address, key, U256::ZERO, value)
                 .await
                 .unwrap();
         }
@@ -466,39 +552,32 @@ struct BlockCommon {
     #[serde(default)]
     expect_exception: Option<String>,
     #[educe(Debug(method = "write_hex_string"))]
-    #[serde(deserialize_with = "deserialize_str_as_bytes")]
-    rlp: Bytes<'static>,
+    #[serde(with = "hexbytes")]
+    rlp: Bytes,
 }
 
 #[instrument(skip(block_common, blockchain))]
-async fn run_block<'state, S, C>(
-    consensus: &C,
+async fn run_block<'state>(
     block_common: &BlockCommon,
-    blockchain: &mut Blockchain<'state, S>,
-) -> anyhow::Result<()>
-where
-    S: State,
-    C: Consensus,
-{
+    blockchain: &mut Blockchain<'state>,
+) -> anyhow::Result<()> {
     let block = rlp::decode::<Block>(&block_common.rlp)?;
 
     debug!("Running block {:?}", block);
 
     let check_state_root = true;
 
-    blockchain
-        .insert_block(consensus, block, check_state_root)
-        .await?;
+    blockchain.insert_block(block, check_state_root).await?;
 
     Ok(())
 }
 
 #[instrument]
-async fn post_check<S: State>(
-    state: &S,
+async fn post_check(
+    state: &InMemoryState,
     expected: &HashMap<Address, AccountState>,
 ) -> anyhow::Result<()> {
-    let number_of_accounts = state.number_of_accounts().await.unwrap();
+    let number_of_accounts = state.number_of_accounts();
     let expected_number_of_accounts: u64 = expected.len().try_into().unwrap();
     if number_of_accounts != expected_number_of_accounts {
         bail!(
@@ -513,7 +592,7 @@ async fn post_check<S: State>(
             .read_account(address)
             .await
             .unwrap()
-            .ok_or_else(|| anyhow!("Missing account {}", address))?;
+            .ok_or_else(|| format_err!("Missing account {}", address))?;
 
         ensure!(
             account.balance == expected_account_state.balance,
@@ -540,10 +619,7 @@ async fn post_check<S: State>(
             hex::encode(&expected_account_state.code)
         );
 
-        let storage_size = state
-            .storage_size(address, account.incarnation)
-            .await
-            .unwrap();
+        let storage_size = state.storage_size(address);
 
         let expected_storage_size: u64 = expected_account_state.storage.len().try_into().unwrap();
         ensure!(
@@ -555,12 +631,9 @@ async fn post_check<S: State>(
         );
 
         for (&key, &expected_value) in &expected_account_state.storage {
-            let actual_value = state
-                .read_storage(address, account.incarnation, u256_to_h256(key))
-                .await
-                .unwrap();
+            let actual_value = state.read_storage(address, key).await.unwrap();
             ensure!(
-                actual_value == u256_to_h256(expected_value),
+                actual_value == expected_value,
                 "Storage mismatch for {} at {}:\n{} != {}",
                 address,
                 key,
@@ -586,13 +659,11 @@ fn result_is_expected(
 
 /// https://ethereum-tests.readthedocs.io/en/latest/test_types/blockchain_tests.html
 #[instrument(skip(testdata))]
-async fn blockchain_test(testdata: BlockchainTest, _: Option<ChainConfig>) -> anyhow::Result<()> {
+async fn blockchain_test(testdata: BlockchainTest) -> anyhow::Result<()> {
     let genesis_block = rlp::decode::<Block>(&*testdata.genesis_rlp).unwrap();
 
     let mut state = InMemoryState::default();
     let config = NETWORK_CONFIG[&testdata.network].clone();
-
-    let consensus = NoProof;
 
     init_pre_state(&testdata.pre, &mut state).await;
 
@@ -604,13 +675,13 @@ async fn blockchain_test(testdata: BlockchainTest, _: Option<ChainConfig>) -> an
         let block_common =
             serde_json::from_value::<BlockCommon>(Value::Object(block.clone())).unwrap();
         result_is_expected(
-            run_block(&consensus, &block_common, &mut blockchain).await,
+            run_block(&block_common, &mut blockchain).await,
             block_common.expect_exception,
         )?;
     }
 
     if let Some(expected_hash) = testdata.post_state_hash {
-        let state_root = state.state_root_hash().await.unwrap();
+        let state_root = state.state_root_hash();
 
         ensure!(
             state_root == expected_hash,
@@ -632,119 +703,137 @@ async fn blockchain_test(testdata: BlockchainTest, _: Option<ChainConfig>) -> an
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum TransactionTestResult {
+    Correct { hash: H256, sender: Address },
+    Incorrect { exception: String },
+}
+
+#[derive(Debug, Deserialize)]
 pub struct TransactionTest {
-    #[serde(default)]
-    pub hash: Option<String>,
-    #[serde(default)]
-    pub sender: Option<String>,
+    pub result: HashMap<String, TransactionTestResult>,
+    #[serde(with = "hexbytes")]
+    pub txbytes: Bytes,
 }
 
 // https://ethereum-tests.readthedocs.io/en/latest/test_types/transaction_tests.html
 #[instrument(skip(testdata))]
-async fn transaction_test(
-    testdata: HashMap<String, Value>,
-    _: Option<ChainConfig>,
-) -> anyhow::Result<()> {
-    let txn = &hex::decode(
-        testdata["rlp"]
-            .as_str()
-            .unwrap()
-            .strip_prefix("0x")
-            .unwrap(),
-    )
-    .map_err(anyhow::Error::new)
-    .and_then(|v| Ok(rlp::decode::<martinez::models::Transaction>(&v)?));
+async fn transaction_test(testdata: TransactionTest) -> anyhow::Result<()> {
+    let txn = rlp::decode::<martinez::models::MessageWithSignature>(&testdata.txbytes);
 
-    for (key, tdvalue) in testdata {
-        if key == "rlp" || key == "_info" {
-            continue;
-        }
-
-        let t = serde_json::from_value::<TransactionTest>(tdvalue).unwrap();
-
-        let valid = t.sender.is_some();
-
-        match &txn {
-            Err(e) => {
-                if valid {
-                    return Err(anyhow::Error::msg(format!("{:?}", e))
-                        .context("Failed to decode valid transaction"));
-                }
+    for (key, t) in testdata.result {
+        match (&txn, t) {
+            (Err(e), TransactionTestResult::Correct { .. }) => {
+                return Err(anyhow::Error::msg(format!("{:?}", e))
+                    .context("Failed to decode valid transaction"));
             }
-            Ok(txn) => {
+            (Ok(txn), t) => {
                 let config = &NETWORK_CONFIG[&key.parse().unwrap()];
 
-                if let Err(e) = pre_validate_transaction(txn, 0, config, None) {
-                    if valid {
-                        return Err(anyhow::Error::new(e).context("Validation error"));
-                    } else {
-                        continue;
+                if let Err(e) = pre_validate_transaction(txn, config.params.chain_id, None) {
+                    match t {
+                        TransactionTestResult::Correct { hash, sender } => {
+                            return Err(anyhow::Error::new(e).context(format!(
+                                "Unexpected validation error (tx hash {:?}, sender {:?})",
+                                hash, sender
+                            )));
+                        }
+                        TransactionTestResult::Incorrect { .. } => {
+                            continue;
+                        }
                     }
                 }
 
-                match txn.recover_sender() {
-                    Err(e) => {
-                        if valid {
-                            return Err(e.context("Failed to recover sender"));
+                match (txn.recover_sender(), t) {
+                    (Err(e), TransactionTestResult::Correct { hash, sender }) => {
+                        return Err(e.context(format!(
+                            "Failed to recover sender (tx hash {:?}, sender {:?})",
+                            hash, sender
+                        )));
+                    }
+                    (Ok(_), TransactionTestResult::Incorrect { exception }) => {
+                        if !IGNORED_TX_EXCEPTIONS.contains(&exception) {
+                            bail!(
+                                "Sender recovered for invalid transaction (exception {})",
+                                exception
+                            )
                         }
                     }
-                    Ok(sender) => {
-                        if !valid {
-                            bail!("Sender recovered for invalid transaction")
-                        }
-
+                    (Ok(recovered_sender), TransactionTestResult::Correct { sender, hash }) => {
                         ensure!(
-                            hex::encode(sender.0) == *t.sender.as_ref().unwrap(),
+                            recovered_sender == sender,
                             "Sender mismatch for {:?}: {:?} != {:?}",
-                            t.hash.as_ref().unwrap(),
-                            t.sender.as_ref().unwrap(),
-                            sender
+                            hash,
+                            sender,
+                            recovered_sender
                         );
                     }
+                    (Err(_), TransactionTestResult::Incorrect { .. }) => {}
                 }
             }
+            _ => continue,
         }
     }
 
     Ok(())
 }
 
-#[instrument(skip(config))]
-async fn difficulty_test(
-    testdata: DifficultyTest,
-    config: Option<ChainConfig>,
-) -> anyhow::Result<()> {
-    let parent_has_uncles = testdata
-        .parent_uncles
-        .map(|hash| hash != EMPTY_LIST_HASH)
-        .unwrap_or(false);
+type NetworkDifficultyTests = HashMap<String, DifficultyTest>;
 
-    let calculated_difficulty = canonical_difficulty(
-        testdata.current_block_number,
-        testdata.current_timestamp,
-        testdata.parent_difficulty.into(),
-        testdata.parent_timestamp,
-        parent_has_uncles,
-        &config.unwrap(),
-    );
+#[instrument(skip(testdata))]
+async fn difficulty_test(testdata: HashMap<String, Value>) -> anyhow::Result<()> {
+    for (network, testdata) in testdata {
+        if network == "_info" {
+            continue;
+        }
 
-    ensure!(
-        calculated_difficulty.as_u128() == testdata.current_difficulty,
-        "Difficulty mismatch for block {}\n{} != {}",
-        testdata.current_block_number,
-        calculated_difficulty,
-        testdata.current_difficulty
-    );
+        let network =
+            Network::from_str(&network).map_err(|_| format_err!("Unknown network: {}", network))?;
+        let testdata = serde_json::from_value::<NetworkDifficultyTests>(testdata)?;
+
+        for (_, testdata) in testdata {
+            let parent_has_uncles = if testdata.parent_uncles == 0 {
+                false
+            } else if testdata.parent_uncles == 1 {
+                true
+            } else {
+                bail!("Invalid parentUncles: {}", testdata.parent_uncles);
+            };
+
+            let config = NETWORK_CONFIG[&network].clone();
+            let SealVerificationParams::Ethash { homestead_formula, byzantium_formula, difficulty_bomb, .. } = config.consensus.seal_verification else {unreachable!()};
+
+            let calculated_difficulty = canonical_difficulty(
+                testdata.current_block_number,
+                testdata.current_timestamp,
+                testdata.parent_difficulty.into(),
+                testdata.parent_timestamp,
+                parent_has_uncles,
+                switch_is_active(byzantium_formula, testdata.current_block_number),
+                switch_is_active(homestead_formula, testdata.current_block_number),
+                difficulty_bomb.map(|b| BlockDifficultyBombData {
+                    delay_to: b.get_delay_to(testdata.current_block_number),
+                }),
+            );
+
+            ensure!(
+                calculated_difficulty.as_u128() == testdata.current_difficulty,
+                "Difficulty mismatch for block {}\n{} != {}",
+                testdata.current_block_number,
+                calculated_difficulty,
+                testdata.current_difficulty
+            );
+        }
+    }
 
     Ok(())
 }
 
-#[instrument(skip(f, config))]
+#[instrument(skip(f))]
 async fn run_test_file<Test, Fut>(
     path: &Path,
     test_names: &HashSet<String>,
-    f: fn(Test, Option<ChainConfig>) -> Fut,
-    config: Option<ChainConfig>,
+    f: fn(Test) -> Fut,
 ) -> RunResults
 where
     Fut: Future<Output = anyhow::Result<()>>,
@@ -760,8 +849,8 @@ where
 
         debug!("Running test {}", test_name);
         out.push({
-            if let Err(e) = (f)(test, config.clone()).await {
-                error!("{}: {}", test_name, e);
+            if let Err(e) = (f)(test).await {
+                error!("{}: {}: {}", path.to_string_lossy(), test_name, e);
                 Status::Failed
             } else {
                 Status::Passed
@@ -772,16 +861,14 @@ where
     out
 }
 
-#[derive(StructOpt)]
-#[structopt(name = "Consensus tests", about = "Run consensus tests against Martinez.")]
+#[derive(Parser)]
+#[clap(name = "Consensus tests", about = "Run consensus tests against Martinez.")]
 pub struct Opt {
     /// Path to consensus tests
-    #[structopt(long, env)]
+    #[clap(long)]
     pub tests: PathBuf,
-    #[structopt(long, env)]
+    #[clap(long)]
     pub test_names: Vec<String>,
-    #[structopt(long, env)]
-    pub tokio_console: bool,
 }
 
 #[derive(Debug, Default)]
@@ -822,11 +909,12 @@ fn exclude_test(p: &Path, root: &Path) -> bool {
     false
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let opt = Opt::from_args();
+async fn run() {
+    let now = Instant::now();
 
-    let filter = if std::env::var(EnvFilter::DEFAULT_ENV)
+    let opt = Opt::parse();
+
+    let env_filter = if std::env::var(EnvFilter::DEFAULT_ENV)
         .unwrap_or_default()
         .is_empty()
     {
@@ -834,36 +922,40 @@ async fn main() -> anyhow::Result<()> {
     } else {
         EnvFilter::from_default_env()
     };
-    let registry = tracing_subscriber::registry()
-        // the `TasksLayer` can be used in combination with other `tracing` layers...
-        .with(tracing_subscriber::fmt::layer().with_target(false));
-
-    if opt.tokio_console {
-        let (layer, server) = console_subscriber::TasksLayer::new();
-        registry
-            .with(filter.add_directive("tokio=trace".parse()?))
-            .with(layer)
-            .init();
-        tokio::spawn(async move { server.serve().await.expect("server failed") });
-    } else {
-        registry.with(filter).init();
-    }
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(env_filter)
+        .init();
 
     let root_dir = opt.tests;
-    let test_names = opt.test_names.into_iter().collect();
+    let test_names = Arc::new(opt.test_names.into_iter().collect());
 
+    let mut tasks = Vec::new();
     let mut res = RunResults::default();
-    for (f, config) in &*DIFFICULTY_CONFIG {
-        res += run_test_file(
-            &root_dir.join(&*DIFFICULTY_DIR).join(f),
-            &test_names,
-            difficulty_test,
-            Some(config.clone()),
-        )
-        .await;
-    }
 
     let mut skipped = 0;
+    for entry in walkdir::WalkDir::new(root_dir.join(&*DIFFICULTY_DIR))
+        .into_iter()
+        .filter_entry(|e| {
+            if exclude_test(e.path(), &root_dir) {
+                skipped += 1;
+                return false;
+            }
+
+            true
+        })
+    {
+        let e = entry.unwrap();
+
+        if e.file_type().is_file() {
+            let p = e.into_path();
+            let test_names = Arc::clone(&test_names);
+            tasks.push(tokio::spawn(async move {
+                run_test_file(p.as_path(), &test_names, difficulty_test).await
+            }));
+        }
+    }
+
     for entry in walkdir::WalkDir::new(root_dir.join(&*BLOCKCHAIN_DIR))
         .into_iter()
         .filter_entry(|e| {
@@ -878,7 +970,11 @@ async fn main() -> anyhow::Result<()> {
         let e = entry.unwrap();
 
         if e.file_type().is_file() {
-            res += run_test_file(e.path(), &test_names, blockchain_test, None).await;
+            let p = e.into_path();
+            let test_names = Arc::clone(&test_names);
+            tasks.push(tokio::spawn(async move {
+                run_test_file(p.as_path(), &test_names, blockchain_test).await
+            }));
         }
     }
 
@@ -896,16 +992,35 @@ async fn main() -> anyhow::Result<()> {
         let e = entry.unwrap();
 
         if e.file_type().is_file() {
-            res += run_test_file(e.path(), &test_names, transaction_test, None).await;
+            let p = e.into_path();
+            let test_names = Arc::clone(&test_names);
+            tasks.push(tokio::spawn(async move {
+                run_test_file(p.as_path(), &test_names, transaction_test).await
+            }));
         }
     }
 
+    for task in tasks {
+        res += task.await.unwrap();
+    }
+
     res.skipped += skipped;
-    println!("Ethereum Consensus Tests:\n{:?}", res);
+    println!(
+        "Ethereum Consensus Tests:\n{:?}\nElapsed {:?}",
+        res,
+        now.elapsed()
+    );
 
     if res.failed > 0 {
         std::process::exit(1);
     }
+}
 
-    Ok(())
+fn main() {
+    Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(64 * 1024 * 1024)
+        .build()
+        .unwrap()
+        .block_on(run());
 }
