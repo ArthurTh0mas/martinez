@@ -1,13 +1,21 @@
+pub mod block_id;
+pub mod chain_config;
+pub mod chain_id;
+mod downloader_impl;
+mod message_decoder;
+pub mod messages;
 pub mod opts;
-pub mod sentry_status_provider;
-pub mod ui;
+pub mod sentry_address;
+pub mod sentry_client;
+pub mod sentry_client_impl;
+mod sentry_client_mock;
 
-mod headers_downloader;
+#[cfg(test)]
+mod downloader_tests;
+mod headers;
+mod sentry_client_reactor;
 
-pub use headers_downloader::{
-    downloader::{
-        Downloader as HeadersDownloader, DownloaderReport as HeadersDownloaderReport,
-        DownloaderRunState as HeadersDownloaderRunState,
-    },
-    verification::header_slice_verifier,
-};
+mod ui_system;
+mod ui_view;
+
+pub use self::downloader_impl::Downloader;

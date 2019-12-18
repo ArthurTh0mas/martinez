@@ -1,30 +1,22 @@
-use crate::{
-    crypto::{is_valid_signature, TrieEncode},
-    models::*,
-    util::*,
-};
-use bytes::{BufMut, Bytes, BytesMut};
-use derive_more::Deref;
-use educe::Educe;
-use hex_literal::hex;
-use parity_scale_codec::{Compact, Decode, Encode, EncodeAsRef, EncodeLike, Input};
+use bytes::Bytes;
+use ethereum_types::*;
 use rlp::{Decodable, DecoderError, Encodable, Rlp, RlpStream};
 use secp256k1::{
-    ecdsa::{RecoverableSignature, RecoveryId},
-    Message as SecpMessage, SECP256K1,
+    recovery::{RecoverableSignature, RecoveryId},
+    Message, SECP256K1,
 };
-use serde::*;
 use sha3::*;
-use std::{borrow::Cow, cmp::min};
+use static_bytes::{BufMut, BytesMut};
+use std::{borrow::Cow, cmp::min, ops::Deref};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TxType {
     Legacy = 0,
     EIP2930 = 1,
     EIP1559 = 2,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransactionAction {
     Call(Address),
     Create,
@@ -58,7 +50,7 @@ impl Decodable for TransactionAction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct YParityAndChainId {
     pub odd_y_parity: bool,
-    pub chain_id: Option<ChainId>,
+    pub chain_id: Option<u64>,
 }
 
 impl YParityAndChainId {
@@ -74,7 +66,7 @@ impl YParityAndChainId {
             // Find chain_id and y_parity ∈ {0, 1} such that
             // v = chain_id * 2 + 35 + y_parity
             let w = v - 35;
-            let chain_id = Some(ChainId(w >> 1)); // w / 2
+            let chain_id = Some(w >> 1); // w / 2
             Some(Self {
                 odd_y_parity: (w % 2) != 0,
                 chain_id,
@@ -86,38 +78,41 @@ impl YParityAndChainId {
 
     pub fn v(&self) -> u64 {
         if let Some(chain_id) = self.chain_id {
-            chain_id.0 * 2 + 35 + self.odd_y_parity as u64
+            chain_id * 2 + 35 + self.odd_y_parity as u64
         } else {
             27 + self.odd_y_parity as u64
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
-pub struct MessageSignature {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransactionSignature {
     odd_y_parity: bool,
     r: H256,
     s: H256,
 }
 
-impl MessageSignature {
+impl TransactionSignature {
     #[must_use]
-    pub fn new(odd_y_parity: bool, r: impl Into<H256>, s: impl Into<H256>) -> Option<Self> {
-        let r = r.into();
-        let s = s.into();
-        if is_valid_signature(r, s) {
+    pub fn new(odd_y_parity: bool, r: H256, s: H256) -> Option<Self> {
+        const LOWER: H256 = H256([
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01,
+        ]);
+        const UPPER: H256 = H256([
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c,
+            0xd0, 0x36, 0x41, 0x41,
+        ]);
+
+        let is_valid = r < UPPER && r >= LOWER && s < UPPER && s >= LOWER;
+
+        if is_valid {
             Some(Self { odd_y_parity, r, s })
         } else {
             None
         }
-    }
-
-    #[must_use]
-    pub fn malleable(&self) -> bool {
-        const HALF_N: H256 = H256(hex!(
-            "7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0"
-        ));
-        self.s > HALF_N
     }
 
     #[must_use]
@@ -147,7 +142,7 @@ impl MessageSignature {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccessListItem {
     pub address: Address,
     pub slots: Vec<H256>,
@@ -172,109 +167,50 @@ impl Decodable for AccessListItem {
 
 pub type AccessList = Vec<AccessListItem>;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct OptionalChainId(pub Option<ChainId>);
-
-impl Encode for OptionalChainId {
-    fn using_encoded<R, F: FnOnce(&[u8]) -> R>(&self, f: F) -> R {
-        Compact(if let Some(chainid) = self.0 {
-            chainid.0
-        } else {
-            0
-        })
-        .using_encoded(f)
-    }
-}
-
-impl Decode for OptionalChainId {
-    fn decode<I: Input>(input: &mut I) -> Result<Self, parity_scale_codec::Error> {
-        Compact::<u64>::decode(input).map(|input| {
-            OptionalChainId(if input.0 == 0 {
-                None
-            } else {
-                Some(ChainId(input.0))
-            })
-        })
-    }
-}
-
-impl EncodeLike for OptionalChainId {}
-
-impl From<OptionalChainId> for Option<ChainId> {
-    fn from(v: OptionalChainId) -> Self {
-        v.0
-    }
-}
-
-impl EncodeAsRef<'_, Option<ChainId>> for OptionalChainId {
-    type RefType = OptionalChainId;
-}
-
-impl<'a> From<&'a Option<ChainId>> for OptionalChainId {
-    fn from(c: &'a Option<ChainId>) -> Self {
-        Self(*c)
-    }
-}
-
-#[derive(Clone, Educe, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
-#[educe(Debug)]
-pub enum Message {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransactionMessage {
     Legacy {
-        #[codec(encoded_as = "OptionalChainId")]
-        chain_id: Option<ChainId>,
-        #[codec(compact)]
+        chain_id: Option<u64>,
         nonce: u64,
-        #[codec(compact)]
         gas_price: U256,
-        #[codec(compact)]
         gas_limit: u64,
         action: TransactionAction,
-        #[codec(compact)]
         value: U256,
-        #[educe(Debug(method = "write_hex_string"))]
-        input: Bytes,
+        input: Bytes<'static>,
     },
     EIP2930 {
-        #[codec(compact)]
-        chain_id: ChainId,
-        #[codec(compact)]
+        chain_id: u64,
         nonce: u64,
-        #[codec(compact)]
         gas_price: U256,
-        #[codec(compact)]
         gas_limit: u64,
         action: TransactionAction,
-        #[codec(compact)]
         value: U256,
-        #[educe(Debug(method = "write_hex_string"))]
-        input: Bytes,
+        input: Bytes<'static>,
         access_list: Vec<AccessListItem>,
     },
     EIP1559 {
-        #[codec(compact)]
-        chain_id: ChainId,
-        #[codec(compact)]
+        chain_id: u64,
         nonce: u64,
-        #[codec(compact)]
         max_priority_fee_per_gas: U256,
-        #[codec(compact)]
         max_fee_per_gas: U256,
-        #[codec(compact)]
         gas_limit: u64,
         action: TransactionAction,
-        #[codec(compact)]
         value: U256,
-        #[educe(Debug(method = "write_hex_string"))]
-        input: Bytes,
+        input: Bytes<'static>,
         access_list: Vec<AccessListItem>,
     },
 }
 
-impl Message {
+impl TransactionMessage {
     pub fn hash(&self) -> H256 {
-        let msg = match self {
-            Message::Legacy {
+        H256::from_slice(Keccak256::digest(&rlp::encode(self)).as_slice())
+    }
+}
+
+impl Encodable for TransactionMessage {
+    fn rlp_append(&self, s: &mut RlpStream) {
+        match self {
+            TransactionMessage::Legacy {
                 chain_id,
                 nonce,
                 gas_price,
@@ -283,7 +219,6 @@ impl Message {
                 value,
                 input,
             } => {
-                let mut s = RlpStream::new();
                 if let Some(chain_id) = chain_id {
                     s.begin_list(9);
                     s.append(nonce);
@@ -304,9 +239,8 @@ impl Message {
                     s.append(value);
                     s.append(&input.as_ref());
                 }
-                s.out()
             }
-            Message::EIP2930 {
+            TransactionMessage::EIP2930 {
                 chain_id,
                 nonce,
                 gas_price,
@@ -316,9 +250,6 @@ impl Message {
                 input,
                 access_list,
             } => {
-                let mut b = BytesMut::with_capacity(1);
-                b.put_u8(1);
-                let mut s = RlpStream::new_with_buffer(b);
                 s.begin_list(8);
                 s.append(chain_id);
                 s.append(nonce);
@@ -328,9 +259,8 @@ impl Message {
                 s.append(value);
                 s.append(&input.as_ref());
                 s.append_list(access_list);
-                s.out()
             }
-            Message::EIP1559 {
+            TransactionMessage::EIP1559 {
                 chain_id,
                 nonce,
                 max_priority_fee_per_gas,
@@ -341,10 +271,7 @@ impl Message {
                 input,
                 access_list,
             } => {
-                let mut b = BytesMut::with_capacity(1);
-                b.put_u8(2);
-                let mut s = RlpStream::new_with_buffer(b);
-                s.begin_list(9);
+                s.begin_list(8);
                 s.append(chain_id);
                 s.append(nonce);
                 s.append(max_priority_fee_per_gas);
@@ -354,32 +281,55 @@ impl Message {
                 s.append(value);
                 s.append(&input.as_ref());
                 s.append_list(access_list);
-                s.out()
             }
-        };
-
-        H256::from_slice(Keccak256::digest(&msg.freeze()).as_slice())
+        }
     }
 }
 
-#[derive(Clone, Debug, Deref, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
-pub struct MessageWithSignature {
-    #[deref]
-    pub message: Message,
-    pub signature: MessageSignature,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EIP2930TransactionMessage {
+    pub chain_id: u64,
+    pub nonce: u64,
+    pub gas_price: U256,
+    pub gas_limit: u64,
+    pub action: TransactionAction,
+    pub value: U256,
+    pub input: Bytes<'static>,
+    pub access_list: Vec<AccessListItem>,
 }
 
-#[derive(Clone, Debug, Deref, PartialEq, Eq)]
-pub struct MessageWithSender {
-    #[deref]
-    pub message: Message,
-    pub sender: Address,
+impl Encodable for EIP2930TransactionMessage {
+    fn rlp_append(&self, s: &mut RlpStream) {
+        s.begin_list(8);
+        s.append(&self.chain_id);
+        s.append(&self.nonce);
+        s.append(&self.gas_price);
+        s.append(&self.gas_limit);
+        s.append(&self.action);
+        s.append(&self.value);
+        s.append(&self.input.as_ref());
+        s.append_list(&self.access_list);
+    }
 }
 
-impl MessageWithSignature {
-    fn encode_inner(&self, s: &mut RlpStream, standalone: bool) {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Transaction {
+    pub message: TransactionMessage,
+    pub signature: TransactionSignature,
+}
+
+impl Deref for Transaction {
+    type Target = TransactionMessage;
+
+    fn deref(&self) -> &Self::Target {
+        &self.message
+    }
+}
+
+impl Encodable for Transaction {
+    fn rlp_append(&self, s: &mut RlpStream) {
         match &self.message {
-            Message::Legacy {
+            TransactionMessage::Legacy {
                 chain_id,
                 nonce,
                 gas_price,
@@ -402,10 +352,10 @@ impl MessageWithSignature {
                     }
                     .v(),
                 );
-                s.append(&U256::from_be_bytes(self.signature.r.0));
-                s.append(&U256::from_be_bytes(self.signature.s.0));
+                s.append(&U256::from_big_endian(&self.signature.r[..]));
+                s.append(&U256::from_big_endian(&self.signature.s[..]));
             }
-            Message::EIP2930 {
+            TransactionMessage::EIP2930 {
                 chain_id,
                 nonce,
                 gas_price,
@@ -427,15 +377,11 @@ impl MessageWithSignature {
                 s1.append(&input.as_ref());
                 s1.append_list(access_list);
                 s1.append(&self.signature.odd_y_parity);
-                s1.append(&U256::from_be_bytes(self.signature.r.0));
-                s1.append(&U256::from_be_bytes(self.signature.s.0));
-                if standalone {
-                    s.append_raw(&*s1.out().freeze(), 1);
-                } else {
-                    s.append(&s1.out());
-                }
+                s1.append(&U256::from_big_endian(&self.signature.r[..]));
+                s1.append(&U256::from_big_endian(&self.signature.s[..]));
+                s1.out().rlp_append(s)
             }
-            Message::EIP1559 {
+            TransactionMessage::EIP1559 {
                 chain_id,
                 nonce,
                 max_priority_fee_per_gas,
@@ -459,126 +405,15 @@ impl MessageWithSignature {
                 s1.append(&input.as_ref());
                 s1.append_list(access_list);
                 s1.append(&self.signature.odd_y_parity);
-                s1.append(&U256::from_be_bytes(self.signature.r.0));
-                s1.append(&U256::from_be_bytes(self.signature.s.0));
-                if standalone {
-                    s.append_raw(&*s1.out().freeze(), 1);
-                } else {
-                    s.append(&s1.out());
-                }
+                s1.append(&U256::from_big_endian(&self.signature.r[..]));
+                s1.append(&U256::from_big_endian(&self.signature.s[..]));
+                s1.out().rlp_append(s)
             }
         }
     }
 }
 
-impl TrieEncode for MessageWithSignature {
-    fn trie_encode(&self) -> Bytes {
-        let mut s = RlpStream::new();
-        self.encode_inner(&mut s, true);
-        s.out().freeze()
-    }
-}
-
-impl MessageWithSignature {
-    pub fn trie_decode(slice: &[u8]) -> Result<MessageWithSignature, DecoderError> {
-        let first = *slice.get(0).ok_or(DecoderError::Custom("empty slice"))?;
-
-        if first == 0x01 {
-            let s = slice.get(1..).ok_or(DecoderError::Custom("no tx body"))?;
-            let rlp = Rlp::new(s);
-            if rlp.item_count()? != 11 {
-                return Err(DecoderError::RlpIncorrectListLen);
-            }
-
-            return Ok(Self {
-                message: Message::EIP2930 {
-                    chain_id: rlp.val_at(0)?,
-                    nonce: rlp.val_at(1)?,
-                    gas_price: rlp.val_at(2)?,
-                    gas_limit: rlp.val_at(3)?,
-                    action: rlp.val_at(4)?,
-                    value: rlp.val_at(5)?,
-                    input: rlp.val_at::<Vec<u8>>(6)?.into(),
-                    access_list: rlp.list_at(7)?,
-                },
-                signature: MessageSignature::new(
-                    rlp.val_at(8)?,
-                    H256(rlp.val_at::<U256>(9)?.to_be_bytes()),
-                    H256(rlp.val_at::<U256>(10)?.to_be_bytes()),
-                )
-                .ok_or(DecoderError::Custom("Invalid transaction signature format"))?,
-            });
-        }
-
-        if first == 0x02 {
-            let s = slice.get(1..).ok_or(DecoderError::Custom("no tx body"))?;
-            let rlp = Rlp::new(s);
-            if rlp.item_count()? != 12 {
-                return Err(DecoderError::RlpIncorrectListLen);
-            }
-
-            return Ok(Self {
-                message: Message::EIP1559 {
-                    chain_id: rlp.val_at(0)?,
-                    nonce: rlp.val_at(1)?,
-                    max_priority_fee_per_gas: rlp.val_at(2)?,
-                    max_fee_per_gas: rlp.val_at(3)?,
-                    gas_limit: rlp.val_at(4)?,
-                    action: rlp.val_at(5)?,
-                    value: rlp.val_at(6)?,
-                    input: rlp.val_at::<Vec<u8>>(7)?.into(),
-                    access_list: rlp.list_at(8)?,
-                },
-                signature: MessageSignature::new(
-                    rlp.val_at(9)?,
-                    H256(rlp.val_at::<U256>(10)?.to_be_bytes()),
-                    H256(rlp.val_at::<U256>(11)?.to_be_bytes()),
-                )
-                .ok_or(DecoderError::Custom("Invalid transaction signature format"))?,
-            });
-        }
-
-        let rlp = Rlp::new(slice);
-        if rlp.is_list() {
-            if rlp.item_count()? != 9 {
-                return Err(DecoderError::RlpIncorrectListLen);
-            }
-
-            let YParityAndChainId {
-                odd_y_parity: odd,
-                chain_id,
-            } = YParityAndChainId::from_v(rlp.val_at(6)?)
-                .ok_or(DecoderError::Custom("Invalid recovery ID"))?;
-            let r = H256(rlp.val_at::<U256>(7)?.to_be_bytes());
-            let s = H256(rlp.val_at::<U256>(8)?.to_be_bytes());
-            let signature = MessageSignature::new(odd, r, s)
-                .ok_or(DecoderError::Custom("Invalid transaction signature format"))?;
-
-            return Ok(Self {
-                message: Message::Legacy {
-                    chain_id,
-                    nonce: rlp.val_at(0)?,
-                    gas_price: rlp.val_at(1)?,
-                    gas_limit: rlp.val_at(2)?,
-                    action: rlp.val_at(3)?,
-                    value: rlp.val_at(4)?,
-                    input: rlp.val_at::<Vec<u8>>(5)?.into(),
-                },
-                signature,
-            });
-        }
-
-        Err(DecoderError::Custom("invalid tx type"))
-    }
-}
-
-impl Encodable for MessageWithSignature {
-    fn rlp_append(&self, s: &mut RlpStream) {
-        self.encode_inner(s, false);
-    }
-}
-
-impl Decodable for MessageWithSignature {
+impl Decodable for Transaction {
     fn decode(rlp: &Rlp) -> Result<Self, DecoderError> {
         let slice = rlp.data()?;
 
@@ -594,13 +429,21 @@ impl Decodable for MessageWithSignature {
                 chain_id,
             } = YParityAndChainId::from_v(rlp.val_at(6)?)
                 .ok_or(DecoderError::Custom("Invalid recovery ID"))?;
-            let r = H256(rlp.val_at::<U256>(7)?.to_be_bytes());
-            let s = H256(rlp.val_at::<U256>(8)?.to_be_bytes());
-            let signature = MessageSignature::new(odd, r, s)
+            let r = {
+                let mut rarr = [0_u8; 32];
+                rlp.val_at::<U256>(7)?.to_big_endian(&mut rarr);
+                H256::from(rarr)
+            };
+            let s = {
+                let mut sarr = [0_u8; 32];
+                rlp.val_at::<U256>(8)?.to_big_endian(&mut sarr);
+                H256::from(sarr)
+            };
+            let signature = TransactionSignature::new(odd, r, s)
                 .ok_or(DecoderError::Custom("Invalid transaction signature format"))?;
 
             return Ok(Self {
-                message: Message::Legacy {
+                message: TransactionMessage::Legacy {
                     chain_id,
                     nonce: rlp.val_at(0)?,
                     gas_price: rlp.val_at(1)?,
@@ -622,7 +465,7 @@ impl Decodable for MessageWithSignature {
             }
 
             return Ok(Self {
-                message: Message::EIP2930 {
+                message: TransactionMessage::EIP2930 {
                     chain_id: rlp.val_at(0)?,
                     nonce: rlp.val_at(1)?,
                     gas_price: rlp.val_at(2)?,
@@ -632,10 +475,18 @@ impl Decodable for MessageWithSignature {
                     input: rlp.val_at::<Vec<u8>>(6)?.into(),
                     access_list: rlp.list_at(7)?,
                 },
-                signature: MessageSignature::new(
+                signature: TransactionSignature::new(
                     rlp.val_at(8)?,
-                    H256(rlp.val_at::<U256>(9)?.to_be_bytes()),
-                    H256(rlp.val_at::<U256>(10)?.to_be_bytes()),
+                    {
+                        let mut rarr = [0_u8; 32];
+                        rlp.val_at::<U256>(9)?.to_big_endian(&mut rarr);
+                        H256::from(rarr)
+                    },
+                    {
+                        let mut sarr = [0_u8; 32];
+                        rlp.val_at::<U256>(10)?.to_big_endian(&mut sarr);
+                        H256::from(sarr)
+                    },
                 )
                 .ok_or(DecoderError::Custom("Invalid transaction signature format"))?,
             });
@@ -648,7 +499,7 @@ impl Decodable for MessageWithSignature {
             }
 
             return Ok(Self {
-                message: Message::EIP1559 {
+                message: TransactionMessage::EIP1559 {
                     chain_id: rlp.val_at(0)?,
                     nonce: rlp.val_at(1)?,
                     max_priority_fee_per_gas: rlp.val_at(2)?,
@@ -659,10 +510,18 @@ impl Decodable for MessageWithSignature {
                     input: rlp.val_at::<Vec<u8>>(7)?.into(),
                     access_list: rlp.list_at(8)?,
                 },
-                signature: MessageSignature::new(
+                signature: TransactionSignature::new(
                     rlp.val_at(9)?,
-                    H256(rlp.val_at::<U256>(10)?.to_be_bytes()),
-                    H256(rlp.val_at::<U256>(11)?.to_be_bytes()),
+                    {
+                        let mut rarr = [0_u8; 32];
+                        rlp.val_at::<U256>(10)?.to_big_endian(&mut rarr);
+                        H256::from(rarr)
+                    },
+                    {
+                        let mut sarr = [0_u8; 32];
+                        rlp.val_at::<U256>(11)?.to_big_endian(&mut sarr);
+                        H256::from(sarr)
+                    },
                 )
                 .ok_or(DecoderError::Custom("Invalid transaction signature format"))?,
             });
@@ -672,7 +531,7 @@ impl Decodable for MessageWithSignature {
     }
 }
 
-impl Message {
+impl TransactionMessage {
     pub const fn tx_type(&self) -> TxType {
         match self {
             Self::Legacy { .. } => TxType::Legacy,
@@ -681,7 +540,7 @@ impl Message {
         }
     }
 
-    pub fn chain_id(&self) -> Option<ChainId> {
+    pub fn chain_id(&self) -> Option<u64> {
         match *self {
             Self::Legacy { chain_id, .. } => chain_id,
             Self::EIP2930 { chain_id, .. } => Some(chain_id),
@@ -740,7 +599,7 @@ impl Message {
         }
     }
 
-    pub const fn input(&self) -> &Bytes {
+    pub const fn input(&self) -> &Bytes<'static> {
         match self {
             Self::Legacy { input, .. }
             | Self::EIP2930 { input, .. }
@@ -756,25 +615,9 @@ impl Message {
             }
         }
     }
-
-    pub(crate) fn priority_fee_per_gas(&self, base_fee_per_gas: U256) -> U256 {
-        assert!(self.max_fee_per_gas() >= base_fee_per_gas);
-        min(
-            self.max_priority_fee_per_gas(),
-            self.max_fee_per_gas() - base_fee_per_gas,
-        )
-    }
-
-    pub(crate) fn effective_gas_price(&self, base_fee_per_gas: U256) -> U256 {
-        self.priority_fee_per_gas(base_fee_per_gas) + base_fee_per_gas
-    }
 }
 
-impl MessageWithSignature {
-    pub fn hash(&self) -> H256 {
-        H256::from_slice(Keccak256::digest(&self.trie_encode()).as_slice())
-    }
-
+impl Transaction {
     pub fn v(&self) -> u8 {
         self.signature.odd_y_parity as u8
     }
@@ -795,13 +638,75 @@ impl MessageWithSignature {
 
         let rec = RecoveryId::from_i32(self.v() as i32)?;
 
-        let public = &SECP256K1.recover_ecdsa(
-            &SecpMessage::from_slice(self.message.hash().as_bytes())?,
+        let public = &SECP256K1.recover(
+            &Message::from_slice(self.message.hash().as_bytes())?,
             &RecoverableSignature::from_compact(&sig, rec)?,
         )?;
 
         let address_slice = &Keccak256::digest(&public.serialize_uncompressed()[1..])[12..];
         Ok(Address::from_slice(address_slice))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TransactionWithSender {
+    pub tx_type: TxType,
+    pub chain_id: Option<u64>,
+    pub nonce: u64,
+    pub max_priority_fee_per_gas: U256,
+    pub max_fee_per_gas: U256,
+    pub gas_limit: u64,
+    pub action: TransactionAction,
+    pub value: U256,
+    pub input: Bytes<'static>,
+    pub access_list: AccessList,
+    pub sender: Address,
+}
+
+impl TransactionWithSender {
+    pub fn new(msg: &TransactionMessage, sender: Address) -> Self {
+        Self {
+            tx_type: msg.tx_type(),
+            chain_id: msg.chain_id(),
+            nonce: msg.nonce(),
+            max_priority_fee_per_gas: msg.max_priority_fee_per_gas(),
+            max_fee_per_gas: msg.max_fee_per_gas(),
+            gas_limit: msg.gas_limit(),
+            action: msg.action(),
+            value: msg.value(),
+            input: msg.input().clone(),
+            access_list: msg.access_list().into_owned(),
+            sender,
+        }
+    }
+
+    pub(crate) fn priority_fee_per_gas(&self, base_fee_per_gas: U256) -> U256 {
+        assert!(self.max_fee_per_gas >= base_fee_per_gas);
+        min(
+            self.max_priority_fee_per_gas,
+            self.max_fee_per_gas - base_fee_per_gas,
+        )
+    }
+
+    pub(crate) fn effective_gas_price(&self, base_fee_per_gas: U256) -> U256 {
+        self.priority_fee_per_gas(base_fee_per_gas) + base_fee_per_gas
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        Self {
+            tx_type: TxType::Legacy,
+            sender: Address::zero(),
+            action: TransactionAction::Create,
+            value: U256::zero(),
+            chain_id: None,
+            nonce: 0,
+            max_priority_fee_per_gas: U256::zero(),
+            max_fee_per_gas: U256::zero(),
+            gas_limit: 0,
+            access_list: Default::default(),
+            input: Bytes::new(),
+        }
     }
 }
 
@@ -814,49 +719,46 @@ mod tests {
     fn can_decode_raw_transaction() {
         let bytes = hex!("f901e48080831000008080b90196608060405234801561001057600080fd5b50336000806101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055507fc68045c3c562488255b55aa2c4c7849de001859ff0d8a36a75c2d5ed80100fb660405180806020018281038252600d8152602001807f48656c6c6f2c20776f726c64210000000000000000000000000000000000000081525060200191505060405180910390a160cf806100c76000396000f3fe6080604052348015600f57600080fd5b506004361060285760003560e01c80638da5cb5b14602d575b600080fd5b60336075565b604051808273ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16815260200191505060405180910390f35b6000809054906101000a900473ffffffffffffffffffffffffffffffffffffffff168156fea265627a7a72315820fae816ad954005c42bea7bc7cb5b19f7fd5d3a250715ca2023275c9ca7ce644064736f6c634300050f003278a04cab43609092a99cf095d458b61b47189d1bbab64baed10a0fd7b7d2de2eb960a011ab1bcda76dfed5e733219beb83789f9887b2a7b2e61759c7c90f7d40403201");
 
-        rlp::decode::<MessageWithSignature>(&bytes).unwrap();
+        rlp::decode::<Transaction>(&bytes).unwrap();
     }
 
     #[test]
     fn transaction_legacy() {
-        let tx = MessageWithSignature {
-            message: Message::Legacy {
-                chain_id: Some(ChainId(2)),
+        let tx = Transaction {
+            message: TransactionMessage::Legacy {
+                chain_id: Some(2),
                 nonce: 12,
                 gas_price: 20_000_000_000_u64.into(),
                 gas_limit: 21000,
                 action: TransactionAction::Call(
                     hex!("727fc6a68321b754475c668a6abfb6e9e71c169a").into(),
                 ),
-                value: 10.as_u256() * 1_000_000_000 * 1_000_000_000,
+                value: U256::from(10) * 1_000_000_000 * 1_000_000_000,
                 input: hex!("a9059cbb000000000213ed0f886efd100b67c7e4ec0a85a7d20dc971600000000000000000000015af1d78b58c4000").to_vec().into(),
             },
-			signature: MessageSignature::new(
+			signature: TransactionSignature::new(
                 true,
-                hex!("be67e0a07db67da8d446f76add590e54b6e92cb6b8f9835aeb67540579a27717"),
-                hex!("2d690516512020171c1ec870f6ff45398cc8609250326be89915fb538e7bd718"),
+                hex!("be67e0a07db67da8d446f76add590e54b6e92cb6b8f9835aeb67540579a27717").into(),
+                hex!("2d690516512020171c1ec870f6ff45398cc8609250326be89915fb538e7bd718").into(),
             ).unwrap(),
 		};
 
-        assert_eq!(
-            tx,
-            rlp::decode::<MessageWithSignature>(&rlp::encode(&tx)).unwrap()
-        );
+        assert_eq!(tx, rlp::decode::<Transaction>(&rlp::encode(&tx)).unwrap());
     }
 
     #[test]
     fn transaction_eip2930() {
         let tx =
-            MessageWithSignature {
-                message: Message::EIP2930 {
-                    chain_id: ChainId(5),
+            Transaction {
+                message: TransactionMessage::EIP2930 {
+                    chain_id: 5,
                     nonce: 7,
                     gas_price: 30_000_000_000_u64.into(),
                     gas_limit: 5_748_100_u64,
                     action: TransactionAction::Call(
                         hex!("811a752c8cd697e3cb27279c330ed1ada745a8d7").into(),
                     ),
-                    value: 2.as_u256() * 1_000_000_000 * 1_000_000_000,
+                    value: U256::from(2) * 1_000_000_000 * 1_000_000_000,
                     input: hex!("6ebaf477f83e051589c1188bcc6ddccd").to_vec().into(),
                     access_list: vec![
                         AccessListItem {
@@ -874,30 +776,23 @@ mod tests {
                         },
                     ],
                 },
-                signature: MessageSignature::new(
+                signature: TransactionSignature::new(
                     false,
-                    hex!("36b241b061a36a32ab7fe86c7aa9eb592dd59018cd0443adc0903590c16b02b0"),
-                    hex!("5edcc541b4741c5cc6dd347c5ed9577ef293a62787b4510465fadbfe39ee4094"),
+                    hex!("36b241b061a36a32ab7fe86c7aa9eb592dd59018cd0443adc0903590c16b02b0").into(),
+                    hex!("5edcc541b4741c5cc6dd347c5ed9577ef293a62787b4510465fadbfe39ee4094").into(),
                 )
                 .unwrap(),
             };
 
-        assert_eq!(
-            tx,
-            rlp::decode::<MessageWithSignature>(&rlp::encode(&tx)).unwrap()
-        );
-        assert_eq!(
-            tx,
-            MessageWithSignature::trie_decode(&tx.trie_encode()).unwrap()
-        );
+        assert_eq!(tx, rlp::decode::<Transaction>(&rlp::encode(&tx)).unwrap());
     }
 
     #[test]
     fn transaction_eip1559() {
         let tx =
-            MessageWithSignature {
-                message: Message::EIP1559 {
-                    chain_id: ChainId(5),
+            Transaction {
+                message: TransactionMessage::EIP1559 {
+                    chain_id: 5,
                     nonce: 7,
                     max_priority_fee_per_gas: 10_000_000_000_u64.into(),
                     max_fee_per_gas: 30_000_000_000_u64.into(),
@@ -905,7 +800,7 @@ mod tests {
                     action: TransactionAction::Call(
                         hex!("811a752c8cd697e3cb27279c330ed1ada745a8d7").into(),
                     ),
-                    value: 2.as_u256() * 1_000_000_000 * 1_000_000_000,
+                    value: U256::from(2) * 1_000_000_000 * 1_000_000_000,
                     input: hex!("6ebaf477f83e051589c1188bcc6ddccd").to_vec().into(),
                     access_list: vec![
                         AccessListItem {
@@ -923,22 +818,15 @@ mod tests {
                         },
                     ],
                 },
-                signature: MessageSignature::new(
+                signature: TransactionSignature::new(
                     false,
-                    hex!("36b241b061a36a32ab7fe86c7aa9eb592dd59018cd0443adc0903590c16b02b0"),
-                    hex!("5edcc541b4741c5cc6dd347c5ed9577ef293a62787b4510465fadbfe39ee4094"),
+                    hex!("36b241b061a36a32ab7fe86c7aa9eb592dd59018cd0443adc0903590c16b02b0").into(),
+                    hex!("5edcc541b4741c5cc6dd347c5ed9577ef293a62787b4510465fadbfe39ee4094").into(),
                 )
                 .unwrap(),
             };
 
-        assert_eq!(
-            tx,
-            rlp::decode::<MessageWithSignature>(&rlp::encode(&tx)).unwrap()
-        );
-        assert_eq!(
-            tx,
-            MessageWithSignature::trie_decode(&tx.trie_encode()).unwrap()
-        );
+        assert_eq!(tx, rlp::decode::<Transaction>(&rlp::encode(&tx)).unwrap());
     }
 
     #[test]
@@ -967,28 +855,28 @@ mod tests {
             YParityAndChainId::from_v(35).unwrap(),
             YParityAndChainId {
                 odd_y_parity: false,
-                chain_id: Some(ChainId(0))
+                chain_id: Some(0)
             }
         );
         assert_eq!(
             YParityAndChainId::from_v(36).unwrap(),
             YParityAndChainId {
                 odd_y_parity: true,
-                chain_id: Some(ChainId(0))
+                chain_id: Some(0)
             }
         );
         assert_eq!(
             YParityAndChainId::from_v(37).unwrap(),
             YParityAndChainId {
                 odd_y_parity: false,
-                chain_id: Some(ChainId(1))
+                chain_id: Some(1)
             }
         );
         assert_eq!(
             YParityAndChainId::from_v(38).unwrap(),
             YParityAndChainId {
                 odd_y_parity: true,
-                chain_id: Some(ChainId(1))
+                chain_id: Some(1)
             }
         );
 
@@ -1011,7 +899,7 @@ mod tests {
         assert_eq!(
             YParityAndChainId {
                 odd_y_parity: false,
-                chain_id: Some(ChainId(1))
+                chain_id: Some(1)
             }
             .v(),
             37
@@ -1019,7 +907,7 @@ mod tests {
         assert_eq!(
             YParityAndChainId {
                 odd_y_parity: true,
-                chain_id: Some(ChainId(1))
+                chain_id: Some(1)
             }
             .v(),
             38

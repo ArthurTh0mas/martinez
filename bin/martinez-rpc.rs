@@ -1,65 +1,20 @@
-use martinez::{binutil::MartinezDataDir, kv::traits::*, models::*, stagedsync::stages::*};
-use async_trait::async_trait;
-use clap::Parser;
-use ethnum::U256;
-use jsonrpsee::{core::RpcResult, http_server::HttpServerBuilder, proc_macros::rpc};
-use std::{future::pending, net::SocketAddr, sync::Arc};
+use structopt::StructOpt;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
-#[derive(Parser)]
-#[clap(name = "Martinez RPC", about = "RPC server for Martinez")]
+#[derive(StructOpt)]
+#[structopt(name = "Martinez RPC", about = "RPC server for Martinez")]
 pub struct Opt {
-    #[clap(long)]
-    pub datadir: MartinezDataDir,
-
-    #[clap(long)]
-    pub listen_address: SocketAddr,
-}
-
-#[rpc(server, namespace = "eth")]
-pub trait EthApi {
-    #[method(name = "blockNumber")]
-    async fn block_number(&self) -> RpcResult<BlockNumber>;
-    #[method(name = "getBalance")]
-    async fn get_balance(&self, address: Address, block_number: BlockNumber) -> RpcResult<U256>;
-}
-
-pub struct EthApiServerImpl<DB>
-where
-    DB: KV,
-{
-    db: Arc<DB>,
-}
-
-#[async_trait]
-impl<DB> EthApiServer for EthApiServerImpl<DB>
-where
-    DB: KV,
-{
-    async fn block_number(&self) -> RpcResult<BlockNumber> {
-        Ok(FINISH
-            .get_progress(&self.db.begin().await?)
-            .await?
-            .unwrap_or(BlockNumber(0)))
-    }
-
-    async fn get_balance(&self, address: Address, block_number: BlockNumber) -> RpcResult<U256> {
-        Ok(martinez::accessors::state::account::read(
-            &self.db.begin().await?,
-            address,
-            Some(block_number),
-        )
-        .await?
-        .map(|acc| acc.balance)
-        .unwrap_or(U256::ZERO))
-    }
+    #[structopt(long, env)]
+    pub tokio_console: bool,
+    #[structopt(long, env)]
+    pub kv_address: String,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let opt = Opt::parse();
+    let opt = Opt::from_args();
 
-    let env_filter = if std::env::var(EnvFilter::DEFAULT_ENV)
+    let filter = if std::env::var(EnvFilter::DEFAULT_ENV)
         .unwrap_or_default()
         .is_empty()
     {
@@ -67,19 +22,20 @@ async fn main() -> anyhow::Result<()> {
     } else {
         EnvFilter::from_default_env()
     };
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_target(false))
-        .with(env_filter)
-        .init();
+    let registry = tracing_subscriber::registry()
+        // the `TasksLayer` can be used in combination with other `tracing` layers...
+        .with(tracing_subscriber::fmt::layer().with_target(false));
 
-    let db = Arc::new(martinez::kv::mdbx::Environment::<mdbx::NoWriteMap>::open_ro(
-        mdbx::Environment::new(),
-        &opt.datadir,
-        martinez::kv::tables::CHAINDATA_TABLES.clone(),
-    )?);
+    if opt.tokio_console {
+        let (layer, server) = console_subscriber::TasksLayer::new();
+        registry
+            .with(filter.add_directive("tokio=trace".parse()?))
+            .with(layer)
+            .init();
+        tokio::spawn(async move { server.serve().await.expect("server failed") });
+    } else {
+        registry.with(filter).init();
+    }
 
-    let server = HttpServerBuilder::default().build(opt.listen_address)?;
-    let _server_handle = server.start(EthApiServerImpl { db }.into_rpc())?;
-
-    pending().await
+    Ok(())
 }

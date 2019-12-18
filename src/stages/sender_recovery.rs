@@ -1,24 +1,46 @@
 use crate::{
-    kv::{
-        tables::{self, ErasedTable},
-        traits::*,
-    },
-    models::*,
-    stagedsync::{format_duration, stage::*},
-    StageId,
+    accessors::chain,
+    stagedsync::stage::{ExecOutput, Stage, StageInput, UnwindInput},
+    MutableTransaction, StageId,
 };
+use anyhow::Context;
 use async_trait::async_trait;
-use rayon::prelude::*;
-use std::time::{Duration, Instant};
-use tokio::pin;
-use tokio_stream::StreamExt as _;
-use tracing::*;
+use std::cmp;
+use thiserror::Error;
+use tracing::error;
 
-/// Recovery of senders of transactions from signatures
-#[derive(Debug)]
-pub struct SenderRecovery {
-    pub batch_size: usize,
+#[derive(Error, Debug)]
+pub enum SenderRecoveryError {
+    #[error("Canonical hash for block {0} not found")]
+    HashNotFound(u64),
+    #[error("Block body for block {0} not found")]
+    BlockBodyNotFound(u64),
 }
+
+const BUFFER_SIZE: u64 = 5000;
+
+async fn process_block<'db: 'tx, 'tx, RwTx>(tx: &'tx mut RwTx, height: u64) -> anyhow::Result<()>
+where
+    RwTx: MutableTransaction<'db>,
+{
+    let hash = chain::canonical_hash::read(tx, height)
+        .await?
+        .ok_or(SenderRecoveryError::HashNotFound(height))?;
+    let body = chain::storage_body::read(tx, hash, height)
+        .await?
+        .ok_or(SenderRecoveryError::BlockBodyNotFound(height))?;
+    let txs = chain::tx::read(tx, body.base_tx_id, body.tx_amount).await?;
+
+    let mut senders = vec![];
+    for tx in &txs {
+        senders.push(tx.recover_sender()?);
+    }
+
+    chain::tx_sender::write(tx, body.base_tx_id, &senders).await
+}
+
+#[derive(Debug)]
+pub struct SenderRecovery;
 
 #[async_trait]
 impl<'db, RwTx> Stage<'db, RwTx> for SenderRecovery
@@ -29,204 +51,82 @@ where
         StageId("SenderRecovery")
     }
 
-    async fn execute<'tx>(
-        &mut self,
-        tx: &'tx mut RwTx,
-        input: StageInput,
-    ) -> anyhow::Result<ExecOutput>
+    fn description(&self) -> &'static str {
+        "Recovering senders of transactions from signatures"
+    }
+
+    async fn execute<'tx>(&self, tx: &'tx mut RwTx, input: StageInput) -> anyhow::Result<ExecOutput>
     where
         'db: 'tx,
     {
-        let original_highest_block = input.stage_progress.unwrap_or(BlockNumber(0));
-        let mut highest_block = original_highest_block;
-
-        let mut body_cur = tx.cursor(tables::BlockBody).await?;
-        let mut tx_cur = tx.cursor(tables::BlockTransaction.erased()).await?;
-        let mut senders_cur = tx.mutable_cursor(tables::TxSender.erased()).await?;
-        senders_cur.last().await?;
-
-        let walker = walk(&mut body_cur, Some(BlockNumber(highest_block.0 + 1)));
-        pin!(walker);
-        let mut batch = Vec::with_capacity(self.batch_size);
-        let started_at = Instant::now();
-        let started_at_txnum = tx
-            .get(
-                tables::TotalTx,
-                input.first_started_at.1.unwrap_or(BlockNumber(0)),
-            )
-            .await?;
-        let done = loop {
-            let mut read_again = false;
-            debug!("Reading bodies");
-            while let Some(((block_number, hash), body)) = walker.try_next().await? {
-                let txs = walk(&mut tx_cur, Some(body.base_tx_id.encode().to_vec()))
-                    .take(body.tx_amount.try_into()?)
-                    .map(|res| res.map(|(_, tx)| tx))
-                    .collect::<anyhow::Result<Vec<_>>>()
-                    .await?;
-                batch.push((block_number, hash, txs));
-
-                highest_block = block_number;
-
-                if batch.len() >= self.batch_size {
-                    read_again = true;
-                    break;
-                }
-            }
-
-            debug!("Recovering senders from batch of {} bodies", batch.len());
-            let mut recovered_senders = batch
-                .par_drain(..)
-                .filter_map(move |(block_number, hash, txs)| {
-                    if !txs.is_empty() {
-                        let senders = txs
-                            .into_iter()
-                            .map(|encoded_tx| {
-                                let tx = ErasedTable::<tables::BlockTransaction>::decode_value(
-                                    &encoded_tx,
-                                )?;
-                                let sender = tx.recover_sender()?;
-                                Ok::<_, anyhow::Error>(sender)
-                            })
-                            .collect::<anyhow::Result<Vec<Address>>>();
-
-                        Some(senders.map(|senders| {
-                            (
-                                ErasedTable::<tables::TxSender>::encode_key((block_number, hash))
-                                    .to_vec(),
-                                senders.encode(),
-                            )
-                        }))
-                    } else {
-                        None
-                    }
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-
-            debug!("Inserting recovered senders");
-            for (db_key, db_value) in recovered_senders.drain(..) {
-                senders_cur.append(db_key, db_value).await?;
-            }
-
-            if !read_again {
-                break true;
-            }
-
-            let now = Instant::now();
-            let elapsed = now - started_at;
-            if elapsed > Duration::from_secs(30) {
-                let mut format_string = format!("Extracted senders from block {}", highest_block);
-
-                if let Some(started_at_txnum) = started_at_txnum {
-                    let current_txnum = tx.get(tables::TotalTx, highest_block).await?;
-                    let total_txnum = tx
-                        .cursor(tables::TotalTx)
-                        .await?
-                        .last()
-                        .await?
-                        .map(|(_, v)| v);
-
-                    if let Some(current_txnum) = current_txnum {
-                        if let Some(total_txnum) = total_txnum {
-                            let elapsed_since_start = now - input.first_started_at.0;
-
-                            let ratio_complete = (current_txnum - started_at_txnum) as f64
-                                / (total_txnum - started_at_txnum) as f64;
-
-                            let estimated_total_time = Duration::from_secs(
-                                (elapsed_since_start.as_secs() as f64 / ratio_complete) as u64,
-                            );
-
-                            debug!(
-                                "Elapsed since start {:?}, ratio complete {:?}, estimated total time {:?}",
-                                elapsed_since_start, ratio_complete, estimated_total_time
-                            );
-
-                            format_string = format!(
-                                "{}, progress: {:0>2.2}%, {} remaining",
-                                format_string,
-                                ratio_complete * 100_f64,
-                                format_duration(
-                                    estimated_total_time.saturating_sub(elapsed_since_start),
-                                    false
-                                )
-                            );
-                        }
-                    }
-                }
-
-                info!("{}", format_string);
-                break false;
-            }
+        let from_height = input.stage_progress.unwrap_or(0);
+        let max_height = if let Some((_, height)) = input.previous_stage {
+            height
+        } else {
+            0
         };
+        let to_height = cmp::min(max_height, from_height + BUFFER_SIZE);
 
+        let mut height = from_height;
+        while height < to_height {
+            process_block(tx, height + 1)
+                .await
+                .with_context(|| format!("Failed to recover senders for block {}", height + 1))?;
+            height += 1;
+        }
+
+        let made_progress = height > from_height;
         Ok(ExecOutput::Progress {
-            stage_progress: highest_block,
-            done,
+            stage_progress: height,
+            done: !made_progress,
+            must_commit: made_progress,
         })
     }
 
-    async fn unwind<'tx>(
-        &mut self,
-        tx: &'tx mut RwTx,
-        input: UnwindInput,
-    ) -> anyhow::Result<UnwindOutput>
+    async fn unwind<'tx>(&self, _tx: &'tx mut RwTx, _input: UnwindInput) -> anyhow::Result<()>
     where
         'db: 'tx,
     {
-        let mut senders_cur = tx.mutable_cursor(tables::TxSender).await?;
-
-        while let Some(((block_number, _), _)) = senders_cur.last().await? {
-            if block_number > input.unwind_to {
-                senders_cur.delete_current().await?;
-            } else {
-                break;
-            }
-        }
-
-        Ok(UnwindOutput {
-            stage_progress: input.unwind_to,
-        })
+        todo!()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{accessors::*, kv::new_mem_database};
+    use crate::{kv::traits::MutableKV, models::*, new_mem_database};
     use bytes::Bytes;
+    use ethereum_types::*;
     use hex_literal::hex;
-
-    const CHAIN_ID: Option<ChainId> = Some(ChainId(1));
 
     #[tokio::test]
     async fn recover_senders() {
         let db = new_mem_database().unwrap();
         let mut tx = db.begin_mutable().await.unwrap();
 
-        let sender1 = Address::from(hex!("de1ef574fd619979b16fd043ea97c4f4536af2e6"));
-        let sender2 = Address::from(hex!("c93c9f9cac833846a66bce3bd9dc7c85e36463af"));
+        let sender1 = H160::from(hex!("de1ef574fd619979b16fd043ea97c4f4536af2e6"));
+        let sender2 = H160::from(hex!("c93c9f9cac833846a66bce3bd9dc7c85e36463af"));
 
-        let recipient1 = Address::from(hex!("f4148309cc30f2dd4ba117122cad6be1e3ba0e2b"));
-        let recipient2 = Address::from(hex!("d7fa8303df7073290f66ced1add5fe89dac0c462"));
+        let recipient1 = H160::from(hex!("f4148309cc30f2dd4ba117122cad6be1e3ba0e2b"));
+        let recipient2 = H160::from(hex!("d7fa8303df7073290f66ced1add5fe89dac0c462"));
 
         let block1 = BodyForStorage {
-            base_tx_id: 1.into(),
+            base_tx_id: 1,
             tx_amount: 2,
             uncles: vec![],
         };
 
-        let tx1_1 = MessageWithSignature {
-            message: Message::Legacy {
-                chain_id: CHAIN_ID,
+        let tx1_1 = Transaction {
+            message: TransactionMessage::Legacy {
+                chain_id: Some(1),
                 nonce: 1,
-                gas_price: 1_000_000.as_u256(),
+                gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
                 action: TransactionAction::Call(recipient1),
-                value: 1.as_u256(),
+                value: 1.into(),
                 input: Bytes::new(),
             },
-            signature: MessageSignature::new(
+            signature: TransactionSignature::new(
                 false,
                 H256::from(hex!(
                     "11d244ae19e3bb96d1bb864aa761d48e957984a154329f0de757cd105f9c7ac4"
@@ -238,17 +138,17 @@ mod tests {
             .unwrap(),
         };
 
-        let tx1_2 = MessageWithSignature {
-            message: Message::Legacy {
-                chain_id: CHAIN_ID,
+        let tx1_2 = Transaction {
+            message: TransactionMessage::Legacy {
+                chain_id: Some(1),
                 nonce: 2,
-                gas_price: 1_000_000.as_u256(),
+                gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
                 action: TransactionAction::Call(recipient1),
-                value: 0x100.as_u256(),
+                value: 0x100.into(),
                 input: Bytes::new(),
             },
-            signature: MessageSignature::new(
+            signature: TransactionSignature::new(
                 true,
                 H256::from(hex!(
                     "9e8c555909921d359bfb0c2734841c87691eb257cb5f0597ac47501abd8ba0de"
@@ -261,22 +161,22 @@ mod tests {
         };
 
         let block2 = BodyForStorage {
-            base_tx_id: 3.into(),
+            base_tx_id: 3,
             tx_amount: 3,
             uncles: vec![],
         };
 
-        let tx2_1 = MessageWithSignature {
-            message: Message::Legacy {
-                chain_id: CHAIN_ID,
+        let tx2_1 = Transaction {
+            message: TransactionMessage::Legacy {
+                chain_id: Some(1),
                 nonce: 3,
-                gas_price: 1_000_000.as_u256(),
+                gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
                 action: TransactionAction::Call(recipient1),
-                value: 0x10000.as_u256(),
+                value: 0x10000.into(),
                 input: Bytes::new(),
             },
-            signature: MessageSignature::new(
+            signature: TransactionSignature::new(
                 true,
                 H256::from(hex!(
                     "2450fdbf8fbc1dee15022bfa7392eb15f04277782343258e185972b5b2b8bf79"
@@ -288,17 +188,17 @@ mod tests {
             .unwrap(),
         };
 
-        let tx2_2 = MessageWithSignature {
-            message: Message::Legacy {
-                chain_id: CHAIN_ID,
+        let tx2_2 = Transaction {
+            message: TransactionMessage::Legacy {
+                chain_id: Some(1),
                 nonce: 6,
-                gas_price: 1_000_000.as_u256(),
+                gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
                 action: TransactionAction::Call(recipient1),
-                value: 0x10.as_u256(),
+                value: 0x10.into(),
                 input: Bytes::new(),
             },
-            signature: MessageSignature::new(
+            signature: TransactionSignature::new(
                 false,
                 H256::from(hex!(
                     "ac0222c1258eada1f828729186b723eaf3dd7f535c5de7271ea02470cbb1029f"
@@ -310,17 +210,17 @@ mod tests {
             .unwrap(),
         };
 
-        let tx2_3 = MessageWithSignature {
-            message: Message::Legacy {
-                chain_id: CHAIN_ID,
+        let tx2_3 = Transaction {
+            message: TransactionMessage::Legacy {
+                chain_id: Some(1),
                 nonce: 2,
-                gas_price: 1_000_000.as_u256(),
+                gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
                 action: TransactionAction::Call(recipient2),
-                value: 2.as_u256(),
+                value: 2.into(),
                 input: Bytes::new(),
             },
-            signature: MessageSignature::new(
+            signature: TransactionSignature::new(
                 true,
                 H256::from(hex!(
                     "e41df92d64612590f72cae9e8895cd34ce0a545109f060879add106336bb5055"
@@ -333,7 +233,7 @@ mod tests {
         };
 
         let block3 = BodyForStorage {
-            base_tx_id: 6.into(),
+            base_tx_id: 6,
             tx_amount: 0,
             uncles: vec![],
         };
@@ -363,13 +263,12 @@ mod tests {
             .await
             .unwrap();
 
-        let mut stage = SenderRecovery { batch_size: 50_000 };
+        let stage = SenderRecovery {};
 
         let stage_input = StageInput {
             restarted: false,
-            first_started_at: (Instant::now(), Some(BlockNumber(0))),
-            previous_stage: Some((StageId("BodyDownload"), 3.into())),
-            stage_progress: Some(0.into()),
+            previous_stage: Some((StageId("BodyDownload"), 3)),
+            stage_progress: Some(0),
         };
 
         let output: ExecOutput = stage.execute(&mut tx, stage_input).await.unwrap();
@@ -377,18 +276,19 @@ mod tests {
         assert_eq!(
             output,
             ExecOutput::Progress {
-                stage_progress: 3.into(),
-                done: true,
+                stage_progress: 3,
+                done: false,
+                must_commit: true,
             }
         );
 
-        let senders1 = chain::tx_sender::read(&tx, hash1, 1);
+        let senders1 = chain::tx_sender::read(&tx, block1.base_tx_id, block1.tx_amount);
         assert_eq!(senders1.await.unwrap(), [sender1, sender1]);
 
-        let senders2 = chain::tx_sender::read(&tx, hash2, 2);
+        let senders2 = chain::tx_sender::read(&tx, block2.base_tx_id, block2.tx_amount);
         assert_eq!(senders2.await.unwrap(), [sender1, sender2, sender2]);
 
-        let senders3 = chain::tx_sender::read(&tx, hash3, 3);
+        let senders3 = chain::tx_sender::read(&tx, block3.base_tx_id, block3.tx_amount);
         assert!(senders3.await.unwrap().is_empty());
     }
 }

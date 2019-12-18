@@ -2,8 +2,7 @@ pub mod stage;
 pub mod stages;
 
 use self::stage::{Stage, StageInput, UnwindInput};
-use crate::{kv::traits::*, stagedsync::stage::ExecOutput};
-use std::time::{Duration, Instant};
+use crate::{kv::traits::MutableKV, stagedsync::stage::ExecOutput, MutableTransaction};
 use tracing::*;
 
 /// Staged synchronization framework
@@ -20,7 +19,6 @@ use tracing::*;
 /// If the app is restarted in between stages, it restarts from the first stage. Absent new blocks, already completed stages are skipped.
 pub struct StagedSync<'db, DB: MutableKV> {
     stages: Vec<Box<dyn Stage<'db, DB::MutableTx<'db>>>>,
-    min_progress_to_commit_after_stage: u64,
 }
 
 impl<'db, DB: MutableKV> Default for StagedSync<'db, DB> {
@@ -31,10 +29,7 @@ impl<'db, DB: MutableKV> Default for StagedSync<'db, DB> {
 
 impl<'db, DB: MutableKV> StagedSync<'db, DB> {
     pub fn new() -> Self {
-        Self {
-            stages: Vec::new(),
-            min_progress_to_commit_after_stage: 0,
-        }
+        Self { stages: Vec::new() }
     }
 
     pub fn push<S>(&mut self, stage: S)
@@ -44,16 +39,11 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
         self.stages.push(Box::new(stage))
     }
 
-    pub fn set_min_progress_to_commit_after_stage(&mut self, v: u64) -> &mut Self {
-        self.min_progress_to_commit_after_stage = v;
-        self
-    }
-
     /// Run staged sync loop.
     /// Invokes each loaded stage, and does unwinds if necessary.
     ///
     /// NOTE: it should never return, except if the loop or any stage fails with error.
-    pub async fn run(&mut self, db: &'db DB) -> anyhow::Result<!> {
+    pub async fn run(&self, db: &'db DB) -> anyhow::Result<!> {
         let num_stages = self.stages.len();
 
         let mut unwind_to = None;
@@ -63,39 +53,34 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
             // Start with unwinding if it's been requested.
             if let Some(to) = unwind_to.take() {
                 // Unwind stages in reverse order.
-                for (stage_index, stage) in self.stages.iter_mut().enumerate().rev() {
+                for (stage_index, stage) in self.stages.iter().rev().enumerate() {
                     let stage_id = stage.id();
 
                     // Unwind magic happens here.
                     // Encapsulated into a future for tracing instrumentation.
                     let res: anyhow::Result<()> = async {
-                        let mut stage_progress =
-                            stage_id.get_progress(&tx).await?.unwrap_or_default();
+                        let stage_progress = stage_id.get_progress(&tx).await?.unwrap_or(0);
 
                         if stage_progress > to {
-                            info!("UNWINDING from {}", stage_progress);
+                            info!("RUNNING");
 
-                            while stage_progress > to {
-                                let unwind_output = stage
-                                    .unwind(
-                                        &mut tx,
-                                        UnwindInput {
-                                            stage_progress,
-                                            unwind_to: to,
-                                        },
-                                    )
-                                    .await?;
+                            stage
+                                .unwind(
+                                    &mut tx,
+                                    UnwindInput {
+                                        stage_progress,
+                                        unwind_to: to,
+                                    },
+                                )
+                                .await?;
 
-                                stage_progress = unwind_output.stage_progress;
+                            stage_id.save_progress(&tx, to).await?;
 
-                                stage_id.save_progress(&tx, stage_progress).await?;
-                            }
-
-                            info!("DONE @ {}", stage_progress);
+                            info!("DONE");
                         } else {
                             debug!(
-                                unwind_point = *to,
-                                progress = *stage_progress,
+                                unwind_point = to,
+                                progress = stage_progress,
                                 "Unwind point too far for stage"
                             );
                         }
@@ -123,84 +108,42 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                 let mut timings = vec![];
 
                 // Execute each stage in direct order.
-                for (stage_index, stage) in self.stages.iter_mut().enumerate() {
+                for (stage_index, stage) in self.stages.iter().enumerate() {
                     let mut restarted = false;
 
                     let stage_id = stage.id();
 
-                    let start_time = Instant::now();
-                    let start_progress = stage_id.get_progress(&tx).await?;
+                    let start_time = std::time::Instant::now();
 
                     // Re-invoke the stage until it reports `StageOutput::done`.
                     let done_progress = loop {
-                        let prev_progress = stage_id.get_progress(&tx).await?;
-
-                        let stage_id = stage.id();
+                        let stage_progress = stage_id.get_progress(&tx).await?;
 
                         let exec_output: anyhow::Result<_> = async {
-                            if restarted {
-                                debug!(
-                                    "Invoking stage @ {}",
-                                    prev_progress
-                                        .map(|s| s.to_string())
-                                        .unwrap_or_else(|| "genesis".to_string())
-                                );
-                            } else {
-                                info!(
-                                    "RUNNING from {}",
-                                    prev_progress
-                                        .map(|s| s.to_string())
-                                        .unwrap_or_else(|| "genesis".to_string())
-                                );
+                            if !restarted {
+                                info!("RUNNING");
                             }
 
-                            let invocation_start_time = Instant::now();
                             let output = stage
                                 .execute(
                                     &mut tx,
                                     StageInput {
                                         restarted,
-                                        first_started_at: (start_time, start_progress),
                                         previous_stage,
-                                        stage_progress: prev_progress,
+                                        stage_progress,
                                     },
                                 )
                                 .await?;
 
                             // Nothing here, pass along.
                             match &output {
-                                ExecOutput::Progress {
-                                    done,
-                                    stage_progress,
-                                    ..
-                                } => {
+                                ExecOutput::Progress { done, .. } => {
                                     if *done {
-                                        info!(
-                                            "DONE @ {} in {}",
-                                            stage_progress,
-                                            format_duration(Instant::now() - start_time, true)
-                                        );
-                                    } else {
-                                        debug!(
-                                            "Stage invocation complete @ {}{} in {}",
-                                            stage_progress,
-                                            if let Some(prev_progress) = prev_progress {
-                                                format!(
-                                                    " (+{} blocks)",
-                                                    stage_progress.saturating_sub(*prev_progress)
-                                                )
-                                            } else {
-                                                String::new()
-                                            },
-                                            format_duration(
-                                                Instant::now() - invocation_start_time,
-                                                true
-                                            )
-                                        );
+                                        info!("DONE");
                                     }
                                 }
                                 ExecOutput::Unwind { unwind_to } => {
-                                    info!(to = unwind_to.0, "Unwind requested");
+                                    info!(to = unwind_to, "Unwind requested");
                                 }
                             }
 
@@ -212,7 +155,7 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                             " {}/{} {} ",
                             stage_index + 1,
                             num_stages,
-                            AsRef::<str>::as_ref(&stage_id)
+                            AsRef::<str>::as_ref(&stage.id())
                         ))
                         .await;
 
@@ -221,18 +164,14 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                             stage::ExecOutput::Progress {
                                 stage_progress,
                                 done,
+                                must_commit,
                             } => {
                                 stage_id.save_progress(&tx, stage_progress).await?;
 
-                                // Check if we should commit now.
-                                if stage_progress
-                                    .saturating_sub(start_progress.map(|v| v.0).unwrap_or(0))
-                                    >= self.min_progress_to_commit_after_stage
-                                {
+                                // Stage requested that we commit into database now.
+                                if must_commit {
                                     // Commit and restart transaction.
-                                    debug!("Commit requested");
                                     tx.commit().await?;
-                                    debug!("Commit complete");
                                     tx = db.begin_mutable().await?;
                                 }
 
@@ -253,7 +192,7 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                             }
                         }
                     };
-                    timings.push((stage_id, Instant::now() - start_time));
+                    timings.push((stage_id, std::time::Instant::now() - start_time));
 
                     previous_stage = Some((stage_id, done_progress))
                 }
@@ -262,30 +201,10 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                 let t = timings
                     .into_iter()
                     .fold(String::new(), |acc, (stage_id, time)| {
-                        format!("{} {}={}", acc, stage_id, format_duration(time, true))
+                        format!("{} {}={}ms", acc, stage_id, time.as_millis())
                     });
                 info!("Staged sync complete.{}", t);
             }
         }
     }
-}
-
-pub fn format_duration(dur: Duration, subsec_millis: bool) -> String {
-    let mut secs = dur.as_secs();
-    let mut minutes = secs / 60;
-    let hours = minutes / 60;
-
-    secs %= 60;
-    minutes %= 60;
-    format!(
-        "{:0>2}:{:0>2}:{:0>2}{}",
-        hours,
-        minutes,
-        secs,
-        if subsec_millis {
-            format!(".{:0>3}", dur.subsec_millis())
-        } else {
-            String::new()
-        }
-    )
 }

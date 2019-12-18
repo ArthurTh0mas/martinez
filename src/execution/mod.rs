@@ -1,44 +1,39 @@
-use self::{analysis_cache::AnalysisCache, processor::ExecutionProcessor};
-use crate::{consensus, crypto::*, models::*, State};
+use self::processor::ExecutionProcessor;
+use crate::{crypto::ordered_trie_root, models::*, State};
+use ethereum_types::H256;
+use rlp::Encodable;
 
-pub mod address;
-pub mod analysis_cache;
+mod address;
 pub mod evm;
 pub mod precompiled;
 pub mod processor;
-pub mod tracer;
 
-pub async fn execute_block<S: State>(
+pub async fn execute_block<'storage, S: State<'storage>>(
     state: &mut S,
-    config: &ChainSpec,
-    header: &PartialHeader,
+    config: &ChainConfig,
+    header: &BlockHeader,
     block: &BlockBodyWithSenders,
 ) -> anyhow::Result<Vec<Receipt>> {
-    let mut analysis_cache = AnalysisCache::default();
-    let mut engine = consensus::engine_factory(config.clone())?;
-    let config = config.collect_block_spec(header.number);
-    ExecutionProcessor::new(
-        state,
-        None,
-        &mut analysis_cache,
-        &mut *engine,
-        header,
-        block,
-        &config,
-    )
-    .execute_and_write_block()
-    .await
+    Ok(ExecutionProcessor::new(state, header, block, config)
+        .execute_and_write_block()
+        .await?)
+}
+
+pub fn root_hash<E: Encodable>(values: &[E]) -> H256 {
+    ordered_trie_root(values.iter().map(rlp::encode))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{address::create_address, *};
     use crate::{
-        chain::protocol_param::param, crypto::root_hash, res::chainspec::MAINNET,
-        util::test_util::run_test, InMemoryState,
+        chain::{config::MAINNET_CONFIG, protocol_param::param},
+        common::*,
+        util::test_util::run_test,
+        InMemoryState, DEFAULT_INCARNATION,
     };
+    use ethereum_types::*;
     use hex_literal::hex;
-    use sha3::{Digest, Keccak256};
 
     #[test]
     fn compute_receipt_root() {
@@ -73,7 +68,7 @@ mod tests {
             // Prepare
             // ---------------------------------------
 
-            let block_number = 13_500_001.into();
+            let block_number = 13_500_001;
             let miner = hex!("5a0b54d5dc17e0aadc383d2db43b0a0d3e029c4c").into();
 
             let gas_used = 98_824;
@@ -85,13 +80,24 @@ mod tests {
                 logs: vec![],
             }];
 
-            let header = PartialHeader {
+            let header = BlockHeader {
                 number: block_number,
                 beneficiary: miner,
                 gas_limit: 100_000,
                 gas_used,
+
+                parent_hash: Default::default(),
+                ommers_hash: Default::default(),
+                state_root: Default::default(),
+                transactions_root: Default::default(),
                 receipts_root: root_hash(&receipts),
-                ..PartialHeader::empty()
+                logs_bloom: Default::default(),
+                difficulty: Default::default(),
+                timestamp: Default::default(),
+                extra_data: Default::default(),
+                mix_hash: Default::default(),
+                nonce: Default::default(),
+                base_fee_per_gas: Default::default(),
             };
 
             // This contract initially sets its 0th storage to 0x2a
@@ -106,31 +112,30 @@ mod tests {
 
             let sender = hex!("b685342b8c54347aad148e1f22eff3eb3eb29391").into();
 
-            let t = |action, input, nonce, max_priority_fee_per_gas: u128| MessageWithSender {
-                message: Message::EIP1559 {
-                    input,
-                    max_priority_fee_per_gas: max_priority_fee_per_gas.as_u256(),
-                    action,
-                    nonce,
-
-                    gas_limit: header.gas_limit,
-                    max_fee_per_gas: U256::from(20 * GIGA),
-                    chain_id: ChainId(1),
-
-                    value: U256::ZERO,
-                    access_list: Default::default(),
-                },
+            let tx = TransactionWithSender {
+                tx_type: TxType::EIP1559,
+                input: deployment_code.into(),
+                gas_limit: header.gas_limit,
+                max_priority_fee_per_gas: U256::zero(), // EIP-1559
+                max_fee_per_gas: U256::from(20 * GIGA),
                 sender,
-            };
+                action: TransactionAction::Create,
 
-            let tx = (t)(TransactionAction::Create, deployment_code.into(), 0, 0);
+                chain_id: None,
+                nonce: 0,
+                value: U256::zero(),
+                access_list: Default::default(),
+            };
 
             let mut state = InMemoryState::default();
             let sender_account = Account {
                 balance: ETHER.into(),
                 ..Default::default()
             };
-            state.update_account(sender, None, Some(sender_account));
+            state
+                .update_account(sender, None, Some(sender_account))
+                .await
+                .unwrap();
 
             // ---------------------------------------
             // Execute first block
@@ -138,7 +143,7 @@ mod tests {
 
             execute_block(
                 &mut state,
-                &MAINNET,
+                &MAINNET_CONFIG,
                 &header,
                 &BlockBodyWithSenders {
                     transactions: vec![tx.clone()],
@@ -151,33 +156,43 @@ mod tests {
             let contract_address = create_address(sender, 0);
             let contract_account = state.read_account(contract_address).await.unwrap().unwrap();
 
-            let code_hash = H256::from_slice(&Keccak256::digest(&contract_code)[..]);
+            let code_hash = hash_data(contract_code);
             assert_eq!(contract_account.code_hash, code_hash);
 
-            let storage_key0 = U256::ZERO;
+            let storage_key0 = H256::zero();
             let storage0 = state
-                .read_storage(contract_address, storage_key0)
+                .read_storage(contract_address, DEFAULT_INCARNATION, storage_key0)
                 .await
                 .unwrap();
-            assert_eq!(storage0, 0x2a);
+            assert_eq!(
+                storage0,
+                hex!("000000000000000000000000000000000000000000000000000000000000002a").into()
+            );
 
-            let storage_key1 = 0x01.as_u256();
+            let storage_key1 =
+                hex!("0000000000000000000000000000000000000000000000000000000000000001").into();
             let storage1 = state
-                .read_storage(contract_address, storage_key1)
+                .read_storage(contract_address, DEFAULT_INCARNATION, storage_key1)
                 .await
                 .unwrap();
-            assert_eq!(storage1, 0x01c9);
+            assert_eq!(
+                storage1,
+                hex!("00000000000000000000000000000000000000000000000000000000000001c9").into()
+            );
 
             let miner_account = state.read_account(miner).await.unwrap().unwrap();
-            assert_eq!(miner_account.balance, param::BLOCK_REWARD_CONSTANTINOPLE);
+            assert_eq!(
+                miner_account.balance,
+                param::BLOCK_REWARD_CONSTANTINOPLE.into()
+            );
 
             // ---------------------------------------
             // Execute second block
             // ---------------------------------------
 
-            let new_val = 0x3e;
+            let new_val = hex!("000000000000000000000000000000000000000000000000000000000000003e");
 
-            let block_number = 13_500_002.into();
+            let block_number = 13_500_002;
             let mut header = header.clone();
 
             header.number = block_number;
@@ -187,16 +202,16 @@ mod tests {
             receipts[0].cumulative_gas_used = gas_used;
             header.receipts_root = root_hash(&receipts);
 
-            let tx = (t)(
-                TransactionAction::Call(contract_address),
-                new_val.as_u256().to_be_bytes().to_vec().into(),
-                1,
-                20_u128 * u128::from(GIGA),
-            );
+            let mut tx = tx.clone();
+
+            tx.nonce = 1;
+            tx.action = TransactionAction::Call(contract_address);
+            tx.input = new_val.to_vec().into();
+            tx.max_priority_fee_per_gas = U256::from(20 * GIGA);
 
             execute_block(
                 &mut state,
-                &MAINNET,
+                &MAINNET_CONFIG,
                 &header,
                 &BlockBodyWithSenders {
                     transactions: vec![tx],
@@ -207,14 +222,14 @@ mod tests {
             .unwrap();
 
             let storage0 = state
-                .read_storage(contract_address, storage_key0)
+                .read_storage(contract_address, DEFAULT_INCARNATION, storage_key0)
                 .await
                 .unwrap();
-            assert_eq!(storage0, new_val);
+            assert_eq!(storage0, new_val.into());
 
             let miner_account = state.read_account(miner).await.unwrap().unwrap();
-            assert!(miner_account.balance > 2 * param::BLOCK_REWARD_CONSTANTINOPLE);
-            assert!(miner_account.balance < 3 * param::BLOCK_REWARD_CONSTANTINOPLE);
+            assert!(miner_account.balance > U256::from(2 * param::BLOCK_REWARD_CONSTANTINOPLE));
+            assert!(miner_account.balance < U256::from(3 * param::BLOCK_REWARD_CONSTANTINOPLE));
         })
     }
 }
