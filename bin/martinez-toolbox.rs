@@ -23,7 +23,7 @@ pub enum Opt {
 }
 
 async fn blockhashes(chaindata: PathBuf) -> anyhow::Result<()> {
-    let env = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
+    let env = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_rw(
         mdbx::Environment::new(),
         &chaindata,
         &martinez::kv::tables::TABLE_MAP,
@@ -38,7 +38,7 @@ async fn table_sizes(chaindata: PathBuf, csv: bool) -> anyhow::Result<()> {
     let env = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
         mdbx::Environment::new(),
         &chaindata,
-        &martinez::kv::tables::TABLE_MAP,
+        2,
     )?;
     let mut sizes = mdbx_table_sizes(&env.begin_ro_txn()?)?
         .into_iter()
