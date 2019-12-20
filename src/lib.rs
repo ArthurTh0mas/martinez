@@ -3,6 +3,7 @@
     destructuring_assignment,
     entry_insert,
     generic_associated_types,
+    generic_const_exprs,
     linked_list_cursors,
     never_type,
     type_alias_impl_trait
@@ -20,18 +21,15 @@ pub mod adapter;
 mod bitmapdb;
 pub mod chain;
 mod changeset;
-mod common;
-mod crypto;
-mod dbutils;
+pub mod crypto;
 pub mod downloader;
 pub mod etl;
 pub mod execution;
 pub mod kv;
-mod models;
+pub mod models;
 pub mod stagedsync;
 pub mod stages;
 mod state;
-pub mod txdb;
 pub(crate) mod util;
 
 pub use changeset::*;
@@ -45,3 +43,4 @@ pub use kv::{
 };
 pub use stagedsync::stages::StageId;
 pub use state::*;
+pub use util::*;

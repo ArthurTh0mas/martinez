@@ -1,77 +1,27 @@
 use super::*;
-use crate::{models::*, zeroless_view, StageId};
-use anyhow::{bail, format_err};
+use crate::models::{BlockHeader, *};
 use arrayref::array_ref;
 use arrayvec::ArrayVec;
-use bytes::Bytes;
-use croaring::{treemap::NativeSerializer, Treemap as RoaringTreemap};
-use derive_more::*;
+use ethereum_types::{H256, *};
 use maplit::hashmap;
-use modular_bitfield::prelude::*;
 use once_cell::sync::Lazy;
-use serde::{Deserialize, *};
-use std::{collections::HashMap, fmt::Display, sync::Arc};
+use roaring::RoaringTreemap;
+use serde::Deserialize;
+use static_bytes::BytesMut;
+use std::{borrow::Cow, collections::HashMap, fmt::Display, sync::Arc};
 
-#[derive(Debug)]
-pub struct ErasedTable<T>(pub T)
-where
-    T: Table;
-
-impl<T> Table for ErasedTable<T>
-where
-    T: Table,
-{
-    type Key = Vec<u8>;
-    type Value = Vec<u8>;
-    type SeekKey = Vec<u8>;
-
-    fn db_name(&self) -> string::String<StaticBytes> {
-        self.0.db_name()
-    }
-}
-
-impl<T> ErasedTable<T>
-where
-    T: Table,
-{
-    pub fn encode_key(object: T::Key) -> <<T as Table>::Key as TableEncode>::Encoded {
-        object.encode()
-    }
-
-    pub fn decode_key(input: &[u8]) -> anyhow::Result<T::Key>
-    where
-        <T as Table>::Key: TableDecode,
-    {
-        T::Key::decode(input)
-    }
-
-    pub fn encode_value(object: T::Value) -> <<T as Table>::Value as TableEncode>::Encoded {
-        object.encode()
-    }
-
-    pub fn decode_value(input: &[u8]) -> anyhow::Result<T::Value> {
-        T::Value::decode(input)
-    }
-
-    pub fn encode_seek_key(object: T::SeekKey) -> <<T as Table>::SeekKey as TableEncode>::Encoded {
-        object.encode()
-    }
-}
-
-#[macro_export]
 macro_rules! decl_table {
-    ($name:ident => $key:ty => $value:ty => $seek_key:ty) => {
+    ($name:ident => $key:ty => $value:ty) => {
         #[derive(Clone, Copy, Debug, Default)]
         pub struct $name;
 
-        impl $crate::kv::traits::Table for $name {
+        impl crate::kv::traits::Table for $name {
             type Key = $key;
-            type SeekKey = $seek_key;
             type Value = $value;
 
-            fn db_name(&self) -> string::String<bytes::Bytes> {
+            fn db_name(&self) -> string::String<static_bytes::Bytes> {
                 unsafe {
-                    string::String::from_utf8_unchecked(bytes::Bytes::from_static(
+                    string::String::from_utf8_unchecked(static_bytes::Bytes::from_static(
                         Self::const_db_name().as_bytes(),
                     ))
                 }
@@ -79,12 +29,8 @@ macro_rules! decl_table {
         }
 
         impl $name {
-            pub const fn const_db_name() -> &'static str {
+            const fn const_db_name() -> &'static str {
                 stringify!($name)
-            }
-
-            pub const fn erased(self) -> $crate::kv::tables::ErasedTable<Self> {
-                $crate::kv::tables::ErasedTable(self)
             }
         }
 
@@ -94,82 +40,34 @@ macro_rules! decl_table {
             }
         }
     };
-    ($name:ident => $key:ty => $value:ty) => {
-        decl_table!($name => $key => $value => $key);
-    };
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct TableInfo {
-    pub dup_sort: bool,
+    pub dup_sort: Option<DupSortConfig>,
 }
 
-impl traits::TableEncode for Vec<u8> {
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct DupSortConfig {
+    pub auto: Option<AutoDupSortConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AutoDupSortConfig {
+    pub from: usize,
+    pub to: usize,
+}
+
+impl TableObject for Vec<u8> {
     type Encoded = Self;
+    type DecodeError = !;
+
+    fn decode<'tx>(b: Cow<'tx, [u8]>) -> Result<Self, Self::DecodeError> {
+        Ok(b.into_owned())
+    }
 
     fn encode(self) -> Self::Encoded {
         self
-    }
-}
-
-impl traits::TableDecode for Vec<u8> {
-    fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        Ok(b.to_vec())
-    }
-}
-
-impl traits::TableEncode for Bytes {
-    type Encoded = Self;
-
-    fn encode(self) -> Self::Encoded {
-        self
-    }
-}
-
-impl traits::TableDecode for Bytes {
-    fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        Ok(b.to_vec().into())
-    }
-}
-
-#[derive(Clone, Debug, Default, Deref, DerefMut, PartialEq, Eq, PartialOrd, Ord)]
-pub struct VariableVec<const LEN: usize> {
-    pub inner: ArrayVec<u8, LEN>,
-}
-
-impl<const LEN: usize> FromIterator<u8> for VariableVec<LEN> {
-    fn from_iter<T: IntoIterator<Item = u8>>(iter: T) -> Self {
-        Self {
-            inner: ArrayVec::from_iter(iter),
-        }
-    }
-}
-
-impl<const LEN: usize> AsRef<[u8]> for VariableVec<LEN> {
-    fn as_ref(&self) -> &[u8] {
-        self.inner.as_ref()
-    }
-}
-
-impl<const LEN: usize> traits::TableEncode for VariableVec<LEN> {
-    type Encoded = Self;
-
-    fn encode(self) -> Self::Encoded {
-        self
-    }
-}
-
-impl<const LEN: usize> traits::TableDecode for VariableVec<LEN> {
-    fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        let mut out = Self::default();
-        out.try_extend_from_slice(b)?;
-        Ok(out)
-    }
-}
-
-impl<const LEN: usize> From<VariableVec<LEN>> for Vec<u8> {
-    fn from(v: VariableVec<LEN>) -> Self {
-        v.to_vec()
     }
 }
 
@@ -187,384 +85,351 @@ impl<const EXPECTED: usize> Display for InvalidLength<EXPECTED> {
 impl<const EXPECTED: usize> std::error::Error for InvalidLength<EXPECTED> {}
 
 #[derive(Clone, Debug)]
-pub struct TooShort<const MINIMUM: usize> {
+pub struct InvalidLengthOneOf<const NUM: usize> {
+    pub expected_one_of: [usize; NUM],
     pub got: usize,
 }
 
-impl<const MINIMUM: usize> Display for TooShort<MINIMUM> {
+impl<const NUM: usize> Display for InvalidLengthOneOf<NUM> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Too short: {} < {}", self.got, MINIMUM)
+        write!(
+            f,
+            "Invalid length: {} is not one of {:?}",
+            self.got, self.expected_one_of
+        )
     }
 }
 
-impl<const MINIMUM: usize> std::error::Error for TooShort<MINIMUM> {}
-
-#[derive(Clone, Debug)]
-pub struct TooLong<const MAXIMUM: usize> {
-    pub got: usize,
-}
-impl<const MAXIMUM: usize> Display for TooLong<MAXIMUM> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Too long: {} > {}", self.got, MAXIMUM)
-    }
-}
-
-impl<const MAXIMUM: usize> std::error::Error for TooLong<MAXIMUM> {}
+impl<const NUM: usize> std::error::Error for InvalidLengthOneOf<NUM> {}
 
 macro_rules! u64_table_object {
     ($ty:ident) => {
-        impl TableEncode for $ty {
+        impl TableObject for $ty
+        where
+            InvalidLength<8>: 'static,
+        {
             type Encoded = [u8; 8];
+            type DecodeError = InvalidLength<8>;
 
-            fn encode(self) -> Self::Encoded {
-                self.to_be_bytes()
-            }
-        }
-
-        impl TableDecode for $ty {
-            fn decode(b: &[u8]) -> anyhow::Result<Self> {
+            fn decode<'tx>(b: Cow<'tx, [u8]>) -> Result<Self, Self::DecodeError> {
                 match b.len() {
-                    8 => Ok(u64::from_be_bytes(*array_ref!(&*b, 0, 8)).into()),
-                    other => Err(InvalidLength::<8> { got: other }.into()),
+                    8 => Ok(Self(u64::from_be_bytes(*array_ref!(&*b, 0, 8)))),
+                    other => Err(InvalidLength { got: other }),
                 }
             }
+            fn encode(self) -> Self::Encoded {
+                self.0.to_be_bytes()
+            }
         }
     };
 }
 
-u64_table_object!(u64);
 u64_table_object!(BlockNumber);
-u64_table_object!(TxIndex);
+u64_table_object!(Incarnation);
 
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Deref,
-    DerefMut,
-    Default,
-    Display,
-    PartialEq,
-    Eq,
-    From,
-    PartialOrd,
-    Ord,
-    Hash,
-    Serialize,
-    Deserialize,
-)]
-#[serde(transparent)]
-pub struct TruncateStart<T>(pub T);
-
-impl<T, const LEN: usize> TableEncode for TruncateStart<T>
+impl TableObject for Address
 where
-    T: TableEncode<Encoded = [u8; LEN]>,
+    InvalidLength<BLOCK_NUMBER_LENGTH>: 'static,
 {
-    type Encoded = VariableVec<LEN>;
-
-    fn encode(self) -> Self::Encoded {
-        let arr = self.0.encode();
-
-        let mut out = Self::Encoded::default();
-        out.try_extend_from_slice(zeroless_view(&arr)).unwrap();
-        out
-    }
-}
-
-impl<T, const LEN: usize> TableDecode for TruncateStart<T>
-where
-    T: TableEncode<Encoded = [u8; LEN]> + TableDecode,
-{
-    fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        if b.len() > LEN {
-            return Err(TooLong::<LEN> { got: b.len() }.into());
-        }
-
-        let mut arr = [0; LEN];
-        arr[LEN - b.len()..].copy_from_slice(b);
-        T::decode(&arr).map(Self)
-    }
-}
-
-macro_rules! scale_table_object {
-    ($ty:ty) => {
-        impl TableEncode for $ty {
-            type Encoded = Vec<u8>;
-
-            fn encode(self) -> Self::Encoded {
-                ::parity_scale_codec::Encode::encode(&self)
-            }
-        }
-
-        impl TableDecode for $ty {
-            fn decode(mut b: &[u8]) -> anyhow::Result<Self> {
-                Ok(<Self as ::parity_scale_codec::Decode>::decode(&mut b)?)
-            }
-        }
-    };
-}
-
-scale_table_object!(BodyForStorage);
-scale_table_object!(BlockHeader);
-scale_table_object!(MessageWithSignature);
-scale_table_object!(Vec<crate::models::Log>);
-
-macro_rules! ron_table_object {
-    ($ty:ident) => {
-        impl TableEncode for $ty {
-            type Encoded = String;
-
-            fn encode(self) -> Self::Encoded {
-                ron::to_string(&self).unwrap()
-            }
-        }
-
-        impl TableDecode for $ty {
-            fn decode(b: &[u8]) -> anyhow::Result<Self> {
-                Ok(ron::from_str(std::str::from_utf8(b)?)?)
-            }
-        }
-    };
-}
-
-ron_table_object!(ChainSpec);
-
-impl TableEncode for Address {
     type Encoded = [u8; ADDRESS_LENGTH];
+    type DecodeError = InvalidLength<ADDRESS_LENGTH>;
 
-    fn encode(self) -> Self::Encoded {
-        self.0
-    }
-}
-
-impl TableDecode for Address {
-    fn decode(b: &[u8]) -> anyhow::Result<Self> {
+    fn decode<'tx>(b: Cow<'tx, [u8]>) -> Result<Self, Self::DecodeError> {
         match b.len() {
             ADDRESS_LENGTH => Ok(Address::from_slice(&*b)),
-            other => Err(InvalidLength::<ADDRESS_LENGTH> { got: other }.into()),
+            other => Err(InvalidLength { got: other }),
         }
     }
-}
-
-impl TableEncode for Vec<Address> {
-    type Encoded = Vec<u8>;
-
-    fn encode(self) -> Self::Encoded {
-        let mut v = Vec::with_capacity(self.len() * ADDRESS_LENGTH);
-        for addr in self {
-            v.extend_from_slice(&addr.encode());
-        }
-
-        v
-    }
-}
-
-impl TableDecode for Vec<Address> {
-    fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        if b.len() % ADDRESS_LENGTH != 0 {
-            bail!("Slice len should be divisible by {}", ADDRESS_LENGTH);
-        }
-
-        let mut v = Vec::with_capacity(b.len() / ADDRESS_LENGTH);
-        for i in 0..b.len() / ADDRESS_LENGTH {
-            let offset = i * ADDRESS_LENGTH;
-            v.push(Address::decode(&b[offset..offset + ADDRESS_LENGTH])?);
-        }
-
-        Ok(v)
-    }
-}
-
-impl TableEncode for H256 {
-    type Encoded = [u8; KECCAK_LENGTH];
 
     fn encode(self) -> Self::Encoded {
         self.0
     }
 }
 
-impl TableDecode for H256
+impl TableObject for H256
 where
-    InvalidLength<KECCAK_LENGTH>: 'static,
+    InvalidLength<BLOCK_NUMBER_LENGTH>: 'static,
 {
-    fn decode(b: &[u8]) -> anyhow::Result<Self> {
+    type Encoded = [u8; KECCAK_LENGTH];
+    type DecodeError = InvalidLength<KECCAK_LENGTH>;
+
+    fn decode<'tx>(b: Cow<'tx, [u8]>) -> Result<Self, Self::DecodeError> {
         match b.len() {
             KECCAK_LENGTH => Ok(H256::from_slice(&*b)),
-            other => Err(InvalidLength::<KECCAK_LENGTH> { got: other }.into()),
+            other => Err(InvalidLength { got: other }),
         }
     }
-}
-
-impl TableEncode for U256 {
-    type Encoded = VariableVec<KECCAK_LENGTH>;
-
-    fn encode(self) -> Self::Encoded {
-        self.to_be_bytes()
-            .into_iter()
-            .skip_while(|&v| v == 0)
-            .collect()
-    }
-}
-
-impl TableDecode for U256 {
-    fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        if b.len() > KECCAK_LENGTH {
-            return Err(TooLong::<KECCAK_LENGTH> { got: b.len() }.into());
-        }
-        let mut v = [0; 32];
-        v[KECCAK_LENGTH - b.len()..].copy_from_slice(b);
-        Ok(Self::from_be_bytes(v))
-    }
-}
-
-impl TableEncode for (H256, U256) {
-    type Encoded = VariableVec<{ KECCAK_LENGTH + KECCAK_LENGTH }>;
-
-    fn encode(self) -> Self::Encoded {
-        let mut out = Self::Encoded::default();
-        out.try_extend_from_slice(&self.0.encode()).unwrap();
-        out.try_extend_from_slice(&self.1.encode()).unwrap();
-        out
-    }
-}
-
-impl TableDecode for (H256, U256) {
-    fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        if b.len() > KECCAK_LENGTH + KECCAK_LENGTH {
-            return Err(TooLong::<{ KECCAK_LENGTH + KECCAK_LENGTH }> { got: b.len() }.into());
-        }
-
-        if b.len() < KECCAK_LENGTH {
-            return Err(TooShort::<{ KECCAK_LENGTH }> { got: b.len() }.into());
-        }
-
-        let (location, value) = b.split_at(KECCAK_LENGTH);
-
-        Ok((H256::decode(location)?, U256::decode(value)?))
-    }
-}
-
-impl TableEncode for RoaringTreemap {
-    type Encoded = Vec<u8>;
-
-    fn encode(mut self) -> Self::Encoded {
-        self.run_optimize();
-        self.serialize().unwrap()
-    }
-}
-
-impl TableDecode for RoaringTreemap {
-    fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        Ok(RoaringTreemap::deserialize(b)?)
-    }
-}
-
-#[derive(Debug)]
-pub struct BitmapKey<K> {
-    pub inner: K,
-    pub block_number: BlockNumber,
-}
-
-impl TableEncode for BitmapKey<Address> {
-    type Encoded = [u8; ADDRESS_LENGTH + BLOCK_NUMBER_LENGTH];
-
-    fn encode(self) -> Self::Encoded {
-        let mut out = [0; ADDRESS_LENGTH + BLOCK_NUMBER_LENGTH];
-        out[..ADDRESS_LENGTH].copy_from_slice(&self.inner.encode());
-        out[ADDRESS_LENGTH..].copy_from_slice(&self.block_number.encode());
-        out
-    }
-}
-
-impl TableDecode for BitmapKey<Address> {
-    fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        if b.len() != ADDRESS_LENGTH + BLOCK_NUMBER_LENGTH {
-            return Err(
-                InvalidLength::<{ ADDRESS_LENGTH + BLOCK_NUMBER_LENGTH }> { got: b.len() }.into(),
-            );
-        }
-
-        Ok(Self {
-            inner: Address::decode(&b[..ADDRESS_LENGTH])?,
-            block_number: BlockNumber::decode(&b[ADDRESS_LENGTH..])?,
-        })
-    }
-}
-
-impl TableEncode for BitmapKey<(Address, H256)> {
-    type Encoded = [u8; ADDRESS_LENGTH + KECCAK_LENGTH + BLOCK_NUMBER_LENGTH];
-
-    fn encode(self) -> Self::Encoded {
-        let mut out = [0; ADDRESS_LENGTH + KECCAK_LENGTH + BLOCK_NUMBER_LENGTH];
-        out[..ADDRESS_LENGTH].copy_from_slice(&self.inner.0.encode());
-        out[ADDRESS_LENGTH..ADDRESS_LENGTH + KECCAK_LENGTH].copy_from_slice(&self.inner.1.encode());
-        out[ADDRESS_LENGTH + KECCAK_LENGTH..].copy_from_slice(&self.block_number.encode());
-        out
-    }
-}
-
-impl TableDecode for BitmapKey<(Address, H256)> {
-    fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        if b.len() != ADDRESS_LENGTH + KECCAK_LENGTH + BLOCK_NUMBER_LENGTH {
-            return Err(
-                InvalidLength::<{ ADDRESS_LENGTH + KECCAK_LENGTH + BLOCK_NUMBER_LENGTH }> {
-                    got: b.len(),
-                }
-                .into(),
-            );
-        }
-
-        Ok(Self {
-            inner: (
-                Address::decode(&b[..ADDRESS_LENGTH])?,
-                H256::decode(&b[ADDRESS_LENGTH..ADDRESS_LENGTH + KECCAK_LENGTH])?,
-            ),
-            block_number: BlockNumber::decode(&b[ADDRESS_LENGTH + KECCAK_LENGTH..])?,
-        })
-    }
-}
-
-impl TableEncode for StageId {
-    type Encoded = &'static str;
 
     fn encode(self) -> Self::Encoded {
         self.0
     }
 }
 
-impl<A, B, const A_LEN: usize, const B_LEN: usize> TableEncode for (A, B)
+impl<A, B, const A_LEN: usize, const B_LEN: usize> TableObject for (A, B)
 where
-    A: TableObject<Encoded = [u8; A_LEN]>,
-    B: TableObject<Encoded = [u8; B_LEN]>,
+    A: TableObject<Encoded = [u8; A_LEN], DecodeError = InvalidLength<A_LEN>>,
+    B: TableObject<Encoded = [u8; B_LEN], DecodeError = InvalidLength<B_LEN>>,
+    InvalidLength<{ A_LEN + B_LEN }>: 'static,
+    [u8; A_LEN + B_LEN]: AsRef<[u8]>,
 {
-    type Encoded = VariableVec<256>;
+    type Encoded = [u8; A_LEN + B_LEN];
+    type DecodeError = InvalidLength<{ A_LEN + B_LEN }>;
+
+    fn decode<'tx>(v: Cow<'tx, [u8]>) -> Result<Self, Self::DecodeError> {
+        if v.len() != A_LEN + B_LEN {
+            return Err(InvalidLength { got: v.len() });
+        }
+        let b_bytes = v.split_off(A_LEN);
+        Ok((A::decode(v).unwrap(), B::decode(b_bytes).unwrap()))
+    }
 
     fn encode(self) -> Self::Encoded {
-        let mut v = Self::Encoded::default();
-        v.try_extend_from_slice(&self.0.encode()).unwrap();
-        v.try_extend_from_slice(&self.1.encode()).unwrap();
+        let mut v = [0; A_LEN + B_LEN];
+        v[..A_LEN].copy_from_slice(&self.0.encode());
+        v[A_LEN..].copy_from_slice(&self.1.encode());
         v
     }
 }
 
-impl<A, B, const A_LEN: usize, const B_LEN: usize> TableDecode for (A, B)
+impl<A, B, C, const A_LEN: usize, const B_LEN: usize, const C_LEN: usize> TableObject for (A, B, C)
 where
-    A: TableObject<Encoded = [u8; A_LEN]>,
-    B: TableObject<Encoded = [u8; B_LEN]>,
+    A: TableObject<Encoded = [u8; A_LEN], DecodeError = InvalidLength<A_LEN>>,
+    B: TableObject<Encoded = [u8; B_LEN], DecodeError = InvalidLength<B_LEN>>,
+    C: TableObject<Encoded = [u8; C_LEN], DecodeError = InvalidLength<C_LEN>>,
+    InvalidLength<{ A_LEN + B_LEN + C_LEN }>: 'static,
+    [u8; A_LEN + B_LEN + C_LEN]: AsRef<[u8]>,
 {
-    fn decode(v: &[u8]) -> anyhow::Result<Self> {
-        if v.len() != A_LEN + B_LEN {
-            bail!("Invalid len: {} != {} + {}", v.len(), A_LEN, B_LEN);
+    type Encoded = [u8; A_LEN + B_LEN + C_LEN];
+    type DecodeError = InvalidLength<{ A_LEN + B_LEN + C_LEN }>;
+
+    fn decode<'tx>(v: Cow<'tx, [u8]>) -> Result<Self, Self::DecodeError> {
+        if v.len() != A_LEN + B_LEN + C_LEN {
+            return Err(InvalidLength { got: v.len() });
         }
+        let b_bytes = v.split_off(A_LEN);
+        let c_bytes = b_bytes.split_off(B_LEN);
         Ok((
-            A::decode(&v[..A_LEN]).unwrap(),
-            B::decode(&v[A_LEN..]).unwrap(),
+            A::decode(v).unwrap(),
+            B::decode(b_bytes).unwrap(),
+            C::decode(c_bytes).unwrap(),
         ))
+    }
+
+    fn encode(self) -> Self::Encoded {
+        let mut v = [0; A_LEN + B_LEN + C_LEN];
+        v[..A_LEN].copy_from_slice(&self.0.encode());
+        v[A_LEN..A_LEN + B_LEN].copy_from_slice(&self.1.encode());
+        v[A_LEN + B_LEN..].copy_from_slice(&self.2.encode());
+        v
     }
 }
 
-impl DupSort for Storage {
-    type SeekBothKey = H256;
+pub type HeaderKey = (BlockNumber, H256);
+
+// #[derive(Debug)]
+// pub struct HeaderKey {
+//     pub number: BlockNumber,
+//     pub hash: H256,
+// }
+
+// impl TableObject for HeaderKey {
+//     type Encoded = [u8; HEADER_KEY_LEN];
+//     type DecodeError = InvalidLength<HEADER_KEY_LEN>;
+
+//     fn decode(mut b: Bytes<'tx>) -> Result<Self, Self::DecodeError> {
+//         let hash_bytes = b.split_off(BLOCK_NUMBER_LENGTH);
+//         Ok(Self {
+//             number: BlockNumber::decode(b)?,
+//             hash: H256::decode(hash_bytes)?,
+//         })
+//     }
+
+//     fn encode(self) -> Self::Encoded {
+//         let mut v = [0; HEADER_KEY_LEN];
+
+//         v[..BLOCK_NUMBER_LENGTH].copy_from_slice(&self.number.encode());
+//         v[BLOCK_NUMBER_LENGTH..].copy_from_slice(&self.hash.encode());
+
+//         v
+//     }
+// }
+
+impl TableObject for BlockHeader {
+    type Encoded = BytesMut;
+    type DecodeError = rlp::DecoderError;
+
+    fn decode<'tx>(b: Cow<'tx, [u8]>) -> Result<Self, Self::DecodeError> {
+        rlp::decode(&*b)
+    }
+
+    fn encode(self) -> Self::Encoded {
+        rlp::encode(&self)
+    }
+}
+
+pub type BitmapKey<K> = (K, BlockNumber);
+
+// #[derive(Debug)]
+// pub struct BitmapKey<K> {
+//     pub inner: K,
+//     pub chunk: BlockNumber,
+// }
+
+// impl<K, const K_LEN: usize> TableObject for BitmapKey<K>
+// where
+//     K: TableObject<Encoded = [u8; K_LEN]>,
+//     [u8; K_LEN + BLOCK_NUMBER_LENGTH]: AsRef<[u8]>,
+// {
+//     type Encoded = [u8; K_LEN + BLOCK_NUMBER_LENGTH];
+//     type DecodeError = !;
+
+//     fn decode<'tx>(b: Cow<'tx, [u8]>) -> Result<Self, Self::DecodeError> {
+//         Ok(Self {
+//             inner: K::decode(&b[..K_LEN]).unwrap(),
+//             chunk: BlockNumber::decode(&b[K_LEN..]).unwrap(),
+//         })
+//     }
+
+//     fn encode(self) -> Self::Encoded {
+//         let mut out = [0; K_LEN + BLOCK_NUMBER_LENGTH];
+//         out[..K_LEN].copy_from_slice(&self.inner.encode());
+//         out[K_LEN..].copy_from_slice(&self.chunk.encode());
+//         out
+//     }
+// }
+
+impl TableObject for ChainConfig {
+    type Encoded = Vec<u8>;
+    type DecodeError = serde_json::Error;
+
+    fn decode<'tx>(b: Cow<'tx, [u8]>) -> Result<Self, Self::DecodeError> {
+        serde_json::from_slice(&b)
+    }
+
+    fn encode(self) -> Self::Encoded {
+        serde_json::to_vec(&self).unwrap()
+    }
+}
+
+impl TableObject for RoaringTreemap {
+    type Encoded = Vec<u8>;
+    type DecodeError = std::io::Error;
+
+    fn decode<'tx>(b: Cow<'tx, [u8]>) -> Result<Self, Self::DecodeError> {
+        RoaringTreemap::deserialize_from(b)
+    }
+
+    fn encode(self) -> Self::Encoded {
+        let mut out = vec![];
+        self.serialize_into(&mut out).unwrap();
+        out
+    }
+}
+
+impl TableObject for Account {
+    type Encoded = Vec<u8>;
+    type DecodeError = !;
+
+    fn decode<'tx>(enc: Cow<'tx, [u8]>) -> Result<Self, Self::DecodeError> {
+        Self::decode_from_storage(&enc[..]).unwrap()
+    }
+
+    fn encode(self) -> Self::Encoded {
+        self.encode_for_storage(false)
+    }
+}
+
+pub struct AccountChange {
+    pub address: Address,
+    pub account: ArrayVec<u8, { Account::MAX_ENCODED_LEN }>,
+}
+
+impl TableObject for AccountChange {
+    type Encoded = Vec<u8>;
+    type DecodeError = !;
+
+    fn decode<'tx>(b: Cow<'tx, [u8]>) -> Result<Self, Self::DecodeError> {
+        if (ADDRESS_LENGTH..ADDRESS_LENGTH + Account::MAX_ENCODED_LEN).contains(&b.len()) {
+            todo!()
+        }
+        Ok(Self {
+            address: Address::decode(Cow::Borrowed(&b[..ADDRESS_LENGTH])).unwrap(),
+            account: ArrayVec::from_slice(&b[ADDRESS_LENGTH..]),
+        })
+    }
+
+    fn encode(self) -> Self::Encoded {
+        let mut v = Vec::with_capacity(ADDRESS_LENGTH + self.account.encoding_length_for_storage());
+        v.extend_from_slice(&self.address.encode());
+        v.extend_from_slice(&self.account.encode());
+        v
+    }
+}
+
+pub type StorageChange = (H256, H256);
+
+pub enum MultiLenKeyEncoded<const LEFT: usize, const RIGHT: usize> {
+    Left([u8; LEFT]),
+    Right([u8; RIGHT]),
+}
+
+impl<const LEFT: usize, const RIGHT: usize> AsRef<[u8]> for MultiLenKeyEncoded<LEFT, RIGHT> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Left(arr) => arr.as_ref(),
+            Self::Right(arr) => arr.as_ref(),
+        }
+    }
+}
+
+pub enum PlainStateKey {
+    Account(Address),
+    Storage((Address, Incarnation, H256)),
+}
+
+const PLAIN_STORAGE_KEY_LENGTH: usize = ADDRESS_LENGTH + INCARNATION_LENGTH + KECCAK_LENGTH;
+
+impl TableObject for PlainStateKey {
+    type Encoded = MultiLenKeyEncoded<ADDRESS_LENGTH, PLAIN_STORAGE_KEY_LENGTH>;
+    type DecodeError = InvalidLengthOneOf<2>;
+
+    fn decode<'tx>(b: Cow<'tx, [u8]>) -> Result<Self, Self::DecodeError> {
+        match b.len() {
+            ADDRESS_LENGTH => Ok(Self::Account(TableObject::<'tx>::decode(b).unwrap())),
+            PLAIN_STORAGE_KEY_LENGTH => Ok(Self::Storage(TableObject::<'tx>::decode(b).unwrap())),
+            other => Err(InvalidLengthOneOf {
+                expected_one_of: [ADDRESS_LENGTH, PLAIN_STORAGE_KEY_LENGTH],
+                got: other,
+            }),
+        }
+    }
+
+    fn encode(self) -> Self::Encoded {
+        match self {
+            PlainStateKey::Account(obj) => MultiLenKeyEncoded::Left(obj.encode()),
+            PlainStateKey::Storage(obj) => MultiLenKeyEncoded::Right(obj.encode()),
+        }
+    }
+}
+
+impl<const MAX_LEN: usize> TableObject for ArrayVec<u8, MAX_LEN> {
+    type Encoded = Self;
+    type DecodeError = !;
+
+    fn decode<'tx>(b: Cow<'tx, [u8]>) -> Result<Self, Self::DecodeError> {
+        Self::from_slice(&b[..])
+    }
+
+    fn encode(self) -> Self::Encoded {
+        self
+    }
+}
+
+pub type PlainStateValue =
+    ArrayVec<u8, { const_utils::max(KECCAK_LENGTH, Account::MAX_ENCODED_LEN) }>;
+
+impl DupSort for PlainState {
+    type SeekBothKey = PlainStateValue;
 }
 impl DupSort for AccountChangeSet {
     type SeekBothKey = Address;
@@ -579,180 +444,18 @@ impl DupSort for CallTraceSet {
     type SeekBothKey = Vec<u8>;
 }
 
-pub type AccountChangeKey = BlockNumber;
-
-impl TableEncode for crate::models::Account {
-    type Encoded = EncodedAccount;
-
-    fn encode(self) -> Self::Encoded {
-        self.encode_for_storage()
-    }
-}
-
-impl TableDecode for crate::models::Account {
-    fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        crate::models::Account::decode_for_storage(b)?.ok_or_else(|| format_err!("cannot be empty"))
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct AccountChange {
-    pub address: Address,
-    pub account: Option<crate::models::Account>,
-}
-
-impl TableEncode for AccountChange {
-    type Encoded = VariableVec<{ ADDRESS_LENGTH + MAX_ACCOUNT_LEN }>;
-
-    fn encode(self) -> Self::Encoded {
-        let mut out = Self::Encoded::default();
-        out.try_extend_from_slice(&self.address.encode()).unwrap();
-        if let Some(account) = self.account {
-            out.try_extend_from_slice(&account.encode()).unwrap();
-        }
-        out
-    }
-}
-
-impl TableDecode for AccountChange {
-    fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        if b.len() < ADDRESS_LENGTH {
-            return Err(TooShort::<{ ADDRESS_LENGTH }> { got: b.len() }.into());
-        }
-
-        Ok(Self {
-            address: TableDecode::decode(&b[..ADDRESS_LENGTH])?,
-            account: if b.len() > ADDRESS_LENGTH {
-                Some(TableDecode::decode(&b[ADDRESS_LENGTH..])?)
-            } else {
-                None
-            },
-        })
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct StorageChangeKey {
-    pub block_number: BlockNumber,
-    pub address: Address,
-}
-
-impl TableEncode for StorageChangeKey {
-    type Encoded = [u8; BLOCK_NUMBER_LENGTH + ADDRESS_LENGTH];
-
-    fn encode(self) -> Self::Encoded {
-        let mut out = [0; BLOCK_NUMBER_LENGTH + ADDRESS_LENGTH];
-        out[..BLOCK_NUMBER_LENGTH].copy_from_slice(&self.block_number.encode());
-        out[BLOCK_NUMBER_LENGTH..].copy_from_slice(&self.address.encode());
-        out
-    }
-}
-
-impl TableDecode for StorageChangeKey {
-    fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        if b.len() != BLOCK_NUMBER_LENGTH + ADDRESS_LENGTH {
-            return Err(
-                InvalidLength::<{ BLOCK_NUMBER_LENGTH + ADDRESS_LENGTH }> { got: b.len() }.into(),
-            );
-        }
-
-        Ok(Self {
-            block_number: BlockNumber::decode(&b[..BLOCK_NUMBER_LENGTH])?,
-            address: Address::decode(
-                &b[BLOCK_NUMBER_LENGTH..BLOCK_NUMBER_LENGTH + ADDRESS_LENGTH],
-            )?,
-        })
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct StorageChange {
-    pub location: H256,
-    pub value: U256,
-}
-
-impl TableEncode for StorageChange {
-    type Encoded = VariableVec<{ KECCAK_LENGTH + KECCAK_LENGTH }>;
-
-    fn encode(self) -> Self::Encoded {
-        let mut out = Self::Encoded::default();
-        out.try_extend_from_slice(&self.location.encode()).unwrap();
-        out.try_extend_from_slice(&self.value.encode()).unwrap();
-        out
-    }
-}
-
-impl TableDecode for StorageChange {
-    fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        if b.len() < KECCAK_LENGTH {
-            return Err(TooShort::<KECCAK_LENGTH> { got: b.len() }.into());
-        }
-
-        Ok(Self {
-            location: H256::decode(&b[..KECCAK_LENGTH])?,
-            value: U256::decode(&b[KECCAK_LENGTH..])?,
-        })
-    }
-}
-
-pub type HeaderKey = (BlockNumber, H256);
-
-#[bitfield]
-#[derive(Clone, Copy, Debug, Default)]
-struct CallTraceSetFlags {
-    flag_from: bool,
-    flag_to: bool,
-    #[skip]
-    unused: B6,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct CallTraceSetEntry {
-    pub address: Address,
-    pub from: bool,
-    pub to: bool,
-}
-
-impl TableEncode for CallTraceSetEntry {
-    type Encoded = [u8; ADDRESS_LENGTH + 1];
-
-    fn encode(self) -> Self::Encoded {
-        let mut v = [0; ADDRESS_LENGTH + 1];
-        v[..ADDRESS_LENGTH].copy_from_slice(&self.address.encode());
-
-        let mut field_set = CallTraceSetFlags::default();
-        field_set.set_flag_from(self.from);
-        field_set.set_flag_to(self.to);
-        v[ADDRESS_LENGTH] = field_set.into_bytes()[0];
-
-        v
-    }
-}
-
-impl TableDecode for CallTraceSetEntry {
-    fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        if b.len() != ADDRESS_LENGTH + 1 {
-            return Err(InvalidLength::<{ ADDRESS_LENGTH + 1 }> { got: b.len() }.into());
-        }
-
-        let field_set = CallTraceSetFlags::from_bytes([b[ADDRESS_LENGTH]]);
-        Ok(Self {
-            address: Address::decode(&b[..ADDRESS_LENGTH])?,
-            from: field_set.flag_from(),
-            to: field_set.flag_to(),
-        })
-    }
-}
-
-decl_table!(Account => Address => crate::models::Account);
-decl_table!(Storage => Address => (H256, U256));
-decl_table!(AccountChangeSet => AccountChangeKey => AccountChange);
-decl_table!(StorageChangeSet => StorageChangeKey => StorageChange => BlockNumber);
-decl_table!(HashedAccount => H256 => crate::models::Account);
-decl_table!(HashedStorage => H256 => (H256, U256));
+decl_table!(PlainState => PlainStateKey => PlainStateValue);
+decl_table!(PlainCodeHash => (Address, Incarnation) => H256);
+decl_table!(AccountChangeSet => BlockNumber => AccountChange);
+decl_table!(StorageChangeSet => (BlockNumber, Address, Incarnation) => (H256, H256));
+decl_table!(HashedAccount => H256 => Vec<u8>);
+decl_table!(HashedStorage => (H256, Incarnation, H256) => H256);
 decl_table!(AccountHistory => BitmapKey<Address> => RoaringTreemap);
 decl_table!(StorageHistory => BitmapKey<(Address, H256)> => RoaringTreemap);
-decl_table!(Code => H256 => Bytes);
+decl_table!(Code => H256 => Vec<u8>);
+decl_table!(HashedCodeHash => (H256, Incarnation) => H256);
+decl_table!(IncarnationMap => Vec<u8> => Vec<u8>);
+decl_table!(TEVMCode => H256 => Vec<u8>);
 decl_table!(TrieAccount => Vec<u8> => Vec<u8>);
 decl_table!(TrieStorage => Vec<u8> => Vec<u8>);
 decl_table!(DbInfo => Vec<u8> => Vec<u8>);
@@ -760,49 +463,68 @@ decl_table!(SnapshotInfo => Vec<u8> => Vec<u8>);
 decl_table!(BittorrentInfo => Vec<u8> => Vec<u8>);
 decl_table!(HeaderNumber => H256 => BlockNumber);
 decl_table!(CanonicalHeader => BlockNumber => H256);
-decl_table!(Header => HeaderKey => BlockHeader => BlockNumber);
-decl_table!(HeadersTotalDifficulty => HeaderKey => U256);
-decl_table!(BlockBody => HeaderKey => BodyForStorage => BlockNumber);
-decl_table!(BlockTransaction => TxIndex => MessageWithSignature);
-decl_table!(TotalGas => BlockNumber => u64);
-decl_table!(TotalTx => BlockNumber => u64);
-decl_table!(Log => (BlockNumber, TxIndex) => Vec<crate::models::Log>);
-decl_table!(LogTopicIndex => Vec<u8> => RoaringTreemap);
-decl_table!(LogAddressIndex => Vec<u8> => RoaringTreemap);
-decl_table!(CallTraceSet => BlockNumber => CallTraceSetEntry);
-decl_table!(CallFromIndex => BitmapKey<Address> => RoaringTreemap);
-decl_table!(CallToIndex => BitmapKey<Address> => RoaringTreemap);
-decl_table!(BlockTransactionLookup => H256 => TruncateStart<BlockNumber>);
-decl_table!(Config => H256 => ChainSpec);
-decl_table!(SyncStage => StageId => BlockNumber);
-decl_table!(TxSender => HeaderKey => Vec<Address>);
+decl_table!(Header => HeaderKey => BlockHeader);
+decl_table!(HeadersTotalDifficulty => HeaderKey => Vec<u8>);
+decl_table!(BlockBody => HeaderKey => BodyForStorage);
+decl_table!(BlockTransaction => u64 => Transaction);
+decl_table!(Receipt => Vec<u8> => Vec<u8>);
+decl_table!(TransactionLog => Vec<u8> => Vec<u8>);
+decl_table!(LogTopicIndex => Vec<u8> => Vec<u8>);
+decl_table!(LogAddressIndex => Vec<u8> => Vec<u8>);
+decl_table!(CallTraceSet => Vec<u8> => Vec<u8>);
+decl_table!(CallFromIndex => Vec<u8> => Vec<u8>);
+decl_table!(CallToIndex => Vec<u8> => Vec<u8>);
+decl_table!(BlockTransactionLookup => H256 => Vec<u8>);
+decl_table!(Config => H256 => ChainConfig);
+decl_table!(SyncStage => Vec<u8> => Vec<u8>);
+decl_table!(CliqueSeparate => Vec<u8> => Vec<u8>);
+decl_table!(CliqueSnapshot => Vec<u8> => Vec<u8>);
+decl_table!(CliqueLastSnapshot => Vec<u8> => Vec<u8>);
+decl_table!(TxSender => u64 => Address);
 decl_table!(LastBlock => Vec<u8> => Vec<u8>);
 decl_table!(Migration => Vec<u8> => Vec<u8>);
 decl_table!(Sequence => Vec<u8> => Vec<u8>);
-decl_table!(LastHeader => VariableVec<0> => H256);
+decl_table!(LastHeader => Vec<u8> => Vec<u8>);
 decl_table!(Issuance => Vec<u8> => Vec<u8>);
 
 pub type DatabaseChart = Arc<HashMap<&'static str, TableInfo>>;
 
 pub static CHAINDATA_TABLES: Lazy<Arc<HashMap<&'static str, TableInfo>>> = Lazy::new(|| {
     Arc::new(hashmap! {
-        Account::const_db_name() => TableInfo::default(),
-        Storage::const_db_name() => TableInfo {
-            dup_sort: true,
+        PlainState::const_db_name() => TableInfo {
+            dup_sort: Some(DupSortConfig {
+                auto: Some(AutoDupSortConfig {
+                    from: 60,
+                    to: 28,
+                }),
+            }),
         },
+        PlainCodeHash::const_db_name() => TableInfo::default(),
         AccountChangeSet::const_db_name() => TableInfo {
-            dup_sort: true,
+            dup_sort: Some(DupSortConfig {
+                auto: None,
+            }),
         },
         StorageChangeSet::const_db_name() => TableInfo {
-            dup_sort: true,
+            dup_sort: Some(DupSortConfig {
+                auto: None,
+            }),
         },
         HashedAccount::const_db_name() => TableInfo::default(),
         HashedStorage::const_db_name() => TableInfo {
-            dup_sort: true,
+            dup_sort: Some(DupSortConfig {
+                auto: Some(AutoDupSortConfig {
+                    from: 72,
+                    to: 40,
+                }),
+            }),
         },
         AccountHistory::const_db_name() => TableInfo::default(),
         StorageHistory::const_db_name() => TableInfo::default(),
         Code::const_db_name() => TableInfo::default(),
+        HashedCodeHash::const_db_name() => TableInfo::default(),
+        IncarnationMap::const_db_name() => TableInfo::default(),
+        TEVMCode::const_db_name() => TableInfo::default(),
         TrieAccount::const_db_name() => TableInfo::default(),
         TrieStorage::const_db_name() => TableInfo::default(),
         DbInfo::const_db_name() => TableInfo::default(),
@@ -814,19 +536,23 @@ pub static CHAINDATA_TABLES: Lazy<Arc<HashMap<&'static str, TableInfo>>> = Lazy:
         HeadersTotalDifficulty::const_db_name() => TableInfo::default(),
         BlockBody::const_db_name() => TableInfo::default(),
         BlockTransaction::const_db_name() => TableInfo::default(),
-        TotalGas::const_db_name() => TableInfo::default(),
-        TotalTx::const_db_name() => TableInfo::default(),
-        Log::const_db_name() => TableInfo::default(),
+        Receipt::const_db_name() => TableInfo::default(),
+        TransactionLog::const_db_name() => TableInfo::default(),
         LogTopicIndex::const_db_name() => TableInfo::default(),
         LogAddressIndex::const_db_name() => TableInfo::default(),
         CallTraceSet::const_db_name() => TableInfo {
-            dup_sort: true,
+            dup_sort: Some(DupSortConfig {
+                auto: None,
+            }),
         },
         CallFromIndex::const_db_name() => TableInfo::default(),
         CallToIndex::const_db_name() => TableInfo::default(),
         BlockTransactionLookup::const_db_name() => TableInfo::default(),
         Config::const_db_name() => TableInfo::default(),
         SyncStage::const_db_name() => TableInfo::default(),
+        CliqueSeparate::const_db_name() => TableInfo::default(),
+        CliqueSnapshot::const_db_name() => TableInfo::default(),
+        CliqueLastSnapshot::const_db_name() => TableInfo::default(),
         TxSender::const_db_name() => TableInfo::default(),
         LastBlock::const_db_name() => TableInfo::default(),
         Migration::const_db_name() => TableInfo::default(),
@@ -842,39 +568,23 @@ mod tests {
     use hex_literal::hex;
 
     #[test]
-    fn u256() {
-        for (fixture, expected) in [
-            (U256::ZERO, vec![]),
-            (
-                U256::from(0xDEADBEEFBAADCAFE_u128),
-                hex!("DEADBEEFBAADCAFE").to_vec(),
-            ),
-            (U256::MAX, hex!("FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF").to_vec()),
-        ] {
-            assert_eq!(fixture.encode().to_vec(), expected);
-            assert_eq!(U256::decode(&expected).unwrap(), fixture);
-        }
-    }
+    fn plain_storage_key_encode() {
+        let expected_addr = hex!("5A0b54D5dc17e0AadC383d2db43B0a0D3E029c4c").into();
+        let expected_incarnation = 999_000_999_u64;
+        let expected_key =
+            hex!("58833f949125129fb8c6c93d2c6003c5bab7c0b116d695f4ca137b1debf4e472").into();
 
-    #[test]
-    fn log() {
-        let input = vec![
-            crate::models::Log {
-                address: Address::from([0; 20]),
-                topics: vec![H256([1; 32]), H256([2; 32])],
-                data: hex!("BAADCAFE").to_vec().into(),
-            },
-            crate::models::Log {
-                address: Address::from([1; 20]),
-                topics: vec![H256([3; 32]), H256([4; 32])],
-                data: hex!("DEADBEEF").to_vec().into(),
-            },
-        ];
+        let composite_key =
+            PlainStateKey::Storage((expected_addr, expected_incarnation, expected_key)).encode();
 
-        let encoded = input.clone().encode();
+        let (addr, incarnation, key) =
+            PlainStateKey::decode(composite_key.as_ref().to_vec().into()).unwrap();
 
-        println!("{}", hex::encode(&encoded));
-
-        assert_eq!(Vec::<crate::models::Log>::decode(&encoded).unwrap(), input);
+        assert_eq!(expected_addr, addr, "address should be extracted");
+        assert_eq!(
+            expected_incarnation, incarnation,
+            "incarnation should be extracted"
+        );
+        assert_eq!(expected_key, key, "key should be extracted");
     }
 }

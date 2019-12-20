@@ -1,5 +1,5 @@
 use crate::{
-    common::hash_data,
+    crypto::*,
     etl::{
         collector::{Collector, OPTIMAL_BUFFER_CAPACITY},
         data_provider::Entry,
@@ -7,7 +7,7 @@ use crate::{
     kv::tables,
     models::BodyForStorage,
     stagedsync::stage::{ExecOutput, Stage, StageInput},
-    txdb, Cursor, MutableTransaction, StageId,
+    Cursor, MutableTransaction, StageId,
 };
 use async_trait::async_trait;
 use ethereum_types::U64;
@@ -36,7 +36,7 @@ where
         'db: 'tx,
     {
         let mut bodies_cursor = tx.mutable_cursor(&tables::BlockBody).await?;
-        let mut tx_hash_cursor = tx.mutable_cursor(&tables::TxLookup).await?;
+        let mut tx_hash_cursor = tx.mutable_cursor(&tables::BlockTransactionLookup).await?;
 
         let mut block_txs_cursor = tx.cursor(&tables::BlockTransaction).await?;
 
@@ -44,7 +44,7 @@ where
 
         let mut start_block_number = [0; 8];
         let (_, last_processed_block_number) = tx
-            .mutable_cursor(&tables::TxLookup)
+            .mutable_cursor(&tables::BlockTransactionLookup)
             .await?
             .last()
             .await?
@@ -53,7 +53,7 @@ where
         (U64::from_big_endian(last_processed_block_number.as_ref()) + 1)
             .to_big_endian(&mut start_block_number);
 
-        let walker_block_body = txdb::walk(&mut bodies_cursor, &start_block_number, 0);
+        let walker_block_body = bodies_cursor.walk(&start_block_number, |_, _| true);
         pin!(walker_block_body);
 
         while let Some((block_body_key, ref block_body_value)) =
@@ -69,7 +69,7 @@ where
             let (tx_count, tx_base_id) = (body_rpl.tx_amount, body_rpl.base_tx_id);
             let tx_base_id_as_bytes = tx_base_id.to_be_bytes();
 
-            let walker_block_txs = txdb::walk(&mut block_txs_cursor, &tx_base_id_as_bytes, 0);
+            let walker_block_txs = block_txs_cursor.walk(&tx_base_id_as_bytes, |_, _| true);
             pin!(walker_block_txs);
 
             let mut num_txs = 1;
@@ -79,7 +79,7 @@ where
                     break;
                 }
 
-                let hashed_tx_data = hash_data(tx_value);
+                let hashed_tx_data = keccak256(tx_value);
                 collector.collect(Entry {
                     key: hashed_tx_data.as_bytes().to_vec(),
                     value: block_number.clone(),
@@ -155,7 +155,7 @@ mod tests {
             )
             .unwrap(),
         };
-        let hash1_1 = hash_data(rlp::encode(&tx1_1));
+        let hash1_1 = keccak256(rlp::encode(&tx1_1));
 
         let tx1_2 = Transaction {
             message: TransactionMessage::Legacy {
@@ -178,7 +178,7 @@ mod tests {
             )
             .unwrap(),
         };
-        let hash1_2 = hash_data(rlp::encode(&tx1_2));
+        let hash1_2 = keccak256(rlp::encode(&tx1_2));
 
         let block2 = BodyForStorage {
             base_tx_id: 3,
@@ -208,7 +208,7 @@ mod tests {
             .unwrap(),
         };
 
-        let hash2_1 = hash_data(rlp::encode(&tx2_1));
+        let hash2_1 = keccak256(rlp::encode(&tx2_1));
 
         let tx2_2 = Transaction {
             message: TransactionMessage::Legacy {
@@ -232,7 +232,7 @@ mod tests {
             .unwrap(),
         };
 
-        let hash2_2 = hash_data(rlp::encode(&tx2_2));
+        let hash2_2 = keccak256(rlp::encode(&tx2_2));
 
         let tx2_3 = Transaction {
             message: TransactionMessage::Legacy {
@@ -256,7 +256,7 @@ mod tests {
             .unwrap(),
         };
 
-        let hash2_3 = hash_data(rlp::encode(&tx2_3));
+        let hash2_3 = keccak256(rlp::encode(&tx2_3));
 
         let block3 = BodyForStorage {
             base_tx_id: 6,
@@ -268,13 +268,13 @@ mod tests {
         let hash2 = H256::random();
         let hash3 = H256::random();
 
-        chain::storage_body::write(&tx, hash1, 1, &block1)
+        chain::storage_body::write(&tx, hash1, 1, block1)
             .await
             .unwrap();
-        chain::storage_body::write(&tx, hash2, 2, &block2)
+        chain::storage_body::write(&tx, hash2, 2, block2)
             .await
             .unwrap();
-        chain::storage_body::write(&tx, hash3, 3, &block3)
+        chain::storage_body::write(&tx, hash3, 3, block3)
             .await
             .unwrap();
 

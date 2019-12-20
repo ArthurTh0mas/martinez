@@ -1,5 +1,8 @@
 use super::data_provider::*;
-use crate::{kv::Table, MutableCursor};
+use crate::{
+    kv::{Table, TableObject},
+    MutableCursor,
+};
 use std::{cmp::Reverse, collections::BinaryHeap};
 
 pub struct Collector {
@@ -49,10 +52,13 @@ impl Collector {
             self.buffer.sort_unstable();
             for entry in &self.buffer {
                 if let Some(f) = &load_function {
-                    (f)(cursor, entry.key.to_vec(), entry.value.to_vec());
+                    (f)(cursor, entry.key.clone(), entry.value.clone());
                 } else {
                     cursor
-                        .put(entry.key.as_slice(), entry.value.as_slice())
+                        .put(
+                            TableObject::decode(entry.key.clone().into())?,
+                            TableObject::decode(entry.value.clone().into())?,
+                        )
                         .await?;
                 }
             }
@@ -83,10 +89,13 @@ impl Collector {
         while let Some(e) = heap.pop() {
             let entry = e.0;
             if let Some(f) = &load_function {
-                (f)(cursor, entry.key.to_vec(), entry.value.to_vec());
+                (f)(cursor, entry.key, entry.value);
             } else {
                 cursor
-                    .put(entry.key.as_slice(), entry.value.as_slice())
+                    .put(
+                        TableObject::decode(entry.key.into())?,
+                        TableObject::decode(entry.value.into())?,
+                    )
                     .await?;
             }
             let (next_key, next_value) = self.data_providers[entry.id].to_next()?;

@@ -1,12 +1,14 @@
 use self::kv_client::*;
-use super::*;
+use super::{
+    traits::{DupSort, Table},
+    *,
+};
 use crate::kv::traits;
 use anyhow::Context;
 use async_stream::stream;
 use async_trait::async_trait;
-use bytes::Bytes;
 pub use ethereum_interfaces::remotekv::*;
-use std::{marker::PhantomData, sync::Arc};
+use std::{borrow::Cow, marker::PhantomData, sync::Arc};
 use tokio::sync::{
     mpsc::{channel, Sender},
     oneshot::{channel as oneshot, Sender as OneshotSender},
@@ -106,19 +108,19 @@ impl<'env> crate::Transaction<'env> for RemoteTransaction {
 }
 
 impl<'tx, T: Table> RemoteCursor<'tx, T> {
-    async fn op(
+    async fn op_raw(
         &mut self,
         op: Op,
-        key: Option<&[u8]>,
-        value: Option<&[u8]>,
-    ) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>> {
+        key: Option<Vec<u8>>,
+        value: Option<Vec<u8>>,
+    ) -> anyhow::Result<Option<(<T as Table>::Key, <T as Table>::Value)>> {
         let mut io = self.transaction.io.lock().await;
 
         io.0.send(Cursor {
             op: op as i32,
             cursor: self.id,
-            k: key.map(|v| v.to_vec().into()).unwrap_or_default(),
-            v: value.map(|v| v.to_vec().into()).unwrap_or_default(),
+            k: key.map(From::from).unwrap_or_default(),
+            v: value.map(From::from).unwrap_or_default(),
 
             bucket_name: Default::default(),
         })
@@ -126,37 +128,55 @@ impl<'tx, T: Table> RemoteCursor<'tx, T> {
 
         let rsp = io.1.message().await?.context("no response")?;
 
-        Ok((!rsp.k.is_empty() || !rsp.v.is_empty()).then_some((rsp.k.into(), rsp.v.into())))
+        if !rsp.k.is_empty() || !rsp.v.is_empty() {
+            return Ok(Some((
+                TableObject::decode(Cow::Borrowed(&rsp.k[..]))?,
+                TableObject::decode(Cow::Borrowed(&rsp.v[..]))?,
+            )));
+        }
+
+        Ok(None)
+    }
+
+    async fn op(
+        &mut self,
+        op: Op,
+        key: Option<T::Key>,
+        value: Option<T::Value>,
+    ) -> anyhow::Result<Option<(<T as Table>::Key, <T as Table>::Value)>> {
+        let k = key.map(|v| v.encode().as_ref().to_vec());
+        let v = value.map(|v| v.encode().as_ref().to_vec());
+        self.op_raw(op, k, v).await
     }
 }
 
 #[async_trait]
 impl<'tx, T: Table> traits::Cursor<'tx, T> for RemoteCursor<'tx, T> {
-    async fn first(&mut self) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>> {
+    async fn first(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>> {
         self.op(Op::First, None, None).await
     }
 
-    async fn seek(&mut self, key: &[u8]) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>> {
+    async fn seek(&mut self, key: T::Key) -> anyhow::Result<Option<(T::Key, T::Value)>> {
         self.op(Op::Seek, Some(key), None).await
     }
 
-    async fn seek_exact(&mut self, key: &[u8]) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>> {
+    async fn seek_exact(&mut self, key: T::Key) -> anyhow::Result<Option<(T::Key, T::Value)>> {
         self.op(Op::SeekExact, Some(key), None).await
     }
 
-    async fn next(&mut self) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>> {
+    async fn next(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>> {
         self.op(Op::Next, None, None).await
     }
 
-    async fn prev(&mut self) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>> {
+    async fn prev(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>> {
         self.op(Op::Prev, None, None).await
     }
 
-    async fn last(&mut self) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>> {
+    async fn last(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>> {
         self.op(Op::Last, None, None).await
     }
 
-    async fn current(&mut self) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>> {
+    async fn current(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>> {
         self.op(Op::Current, None, None).await
     }
 }
@@ -165,19 +185,23 @@ impl<'tx, T: Table> traits::Cursor<'tx, T> for RemoteCursor<'tx, T> {
 impl<'tx, T: DupSort> traits::CursorDupSort<'tx, T> for RemoteCursor<'tx, T> {
     async fn seek_both_range(
         &mut self,
-        key: &[u8],
-        value: &[u8],
-    ) -> anyhow::Result<Option<Bytes<'tx>>> {
+        key: T::Key,
+        value: T::SeekBothKey,
+    ) -> anyhow::Result<Option<T::Value>> {
         Ok(self
-            .op(Op::SeekBoth, Some(key), Some(value))
+            .op_inner(
+                Op::SeekBoth,
+                Some(key.encode().to_vec()),
+                Some(value.encode().to_vec()),
+            )
             .await?
             .map(|(_, v)| v))
     }
 
-    async fn next_dup(&mut self) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>> {
+    async fn next_dup(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>> {
         self.op(Op::NextDup, None, None).await
     }
-    async fn next_no_dup(&mut self) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>> {
+    async fn next_no_dup(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>> {
         self.op(Op::NextNoDup, None, None).await
     }
 }
