@@ -1,36 +1,55 @@
 use crate::{
-    kv::{
-        tables,
-        traits::{Cursor, MutableCursor},
-    },
+    dbutils::*,
+    kv::{tables, traits::MutableCursor},
     models::*,
-    MutableTransaction, Transaction as ReadTransaction,
+    txdb, MutableTransaction, Transaction as ReadTransaction,
 };
+use anyhow::{bail, Context};
+use arrayref::array_ref;
 use ethereum_types::{Address, H256, U256};
+use tokio::pin;
 use tokio_stream::StreamExt;
 use tracing::*;
+use BlockHeader as HeaderType;
 
 pub mod canonical_hash {
     use super::*;
 
     pub async fn read<'db: 'tx, 'tx, Tx: ReadTransaction<'db>>(
         tx: &'tx Tx,
-        block_num: BlockNumber,
+        block_num: u64,
     ) -> anyhow::Result<Option<H256>> {
-        tx.get(&tables::CanonicalHeader, block_num).await
+        let key = encode_block_number(block_num);
+
+        trace!(
+            "Reading canonical hash of {} from at {}",
+            block_num,
+            hex::encode(&key)
+        );
+
+        if let Some(b) = tx.get(&tables::CanonicalHeader, &key).await? {
+            match b.len() {
+                KECCAK_LENGTH => return Ok(Some(H256::from_slice(&*b))),
+                other => bail!("invalid length: {}", other),
+            }
+        }
+
+        Ok(None)
     }
 
     pub async fn write<'db: 'tx, 'tx, RwTx: MutableTransaction<'db>>(
         tx: &'tx RwTx,
-        block_num: BlockNumber,
+        block_num: u64,
         hash: H256,
     ) -> anyhow::Result<()> {
+        let key = encode_block_number(block_num);
+
         trace!("Writing canonical hash of {}", block_num);
 
-        tx.mutable_cursor(&tables::CanonicalHeader)
-            .await?
-            .put(block_num, hash)
-            .await
+        let mut cursor = tx.mutable_cursor(&tables::CanonicalHeader).await?;
+        cursor.put(&key, hash.as_bytes()).await.unwrap();
+
+        Ok(())
     }
 }
 
@@ -40,10 +59,20 @@ pub mod header_number {
     pub async fn read<'db: 'tx, 'tx, Tx: ReadTransaction<'db>>(
         tx: &'tx Tx,
         hash: H256,
-    ) -> anyhow::Result<Option<BlockNumber>> {
+    ) -> anyhow::Result<Option<u64>> {
         trace!("Reading block number for hash {:?}", hash);
 
-        tx.get(&tables::HeaderNumber, hash).await
+        if let Some(b) = tx
+            .get(&tables::HeaderNumber, &hash.to_fixed_bytes())
+            .await?
+        {
+            match b.len() {
+                BLOCK_NUMBER_LENGTH => return Ok(Some(u64::from_be_bytes(*array_ref![b, 0, 8]))),
+                other => bail!("invalid length: {}", other),
+            }
+        }
+
+        Ok(None)
     }
 }
 
@@ -53,11 +82,15 @@ pub mod header {
     pub async fn read<'db: 'tx, 'tx, Tx: ReadTransaction<'db>>(
         tx: &'tx Tx,
         hash: H256,
-        number: BlockNumber,
-    ) -> anyhow::Result<Option<BlockHeader>> {
+        number: u64,
+    ) -> anyhow::Result<Option<HeaderType>> {
         trace!("Reading header for block {}/{:?}", number, hash);
 
-        tx.get(&tables::Header, (number, hash)).await
+        if let Some(b) = tx.get(&tables::Header, &header_key(number, hash)).await? {
+            return Ok(Some(rlp::decode(&b)?));
+        }
+
+        Ok(None)
     }
 }
 
@@ -76,13 +109,24 @@ pub mod tx {
         );
 
         Ok(if amount > 0 {
-            tx.cursor(&tables::BlockTransaction)
-                .await?
-                .walk(Some(base_tx_id), |_, _| true)
-                .take(amount as usize)
-                .map(|res| res.map(|(_, tx)| tx))
-                .collect::<anyhow::Result<Vec<_>>>()
-                .await?
+            let mut out = Vec::with_capacity(amount as usize);
+
+            let mut cursor = tx.cursor(&tables::BlockTransaction).await?;
+
+            let start_key = base_tx_id.to_be_bytes();
+            let walker = txdb::walk(&mut cursor, &start_key, 0);
+
+            pin!(walker);
+
+            while let Some((_, tx_rlp)) = walker.try_next().await? {
+                out.push(rlp::decode(&tx_rlp).context("broken tx rlp")?);
+
+                if out.len() >= amount as usize {
+                    break;
+                }
+            }
+
+            out
         } else {
             vec![]
         })
@@ -102,10 +146,9 @@ pub mod tx {
         let mut cursor = tx.mutable_cursor(&tables::BlockTransaction).await.unwrap();
 
         for (i, eth_tx) in txs.iter().enumerate() {
-            cursor
-                .put(base_tx_id + i as u64, eth_tx.clone())
-                .await
-                .unwrap();
+            let key = (base_tx_id + i as u64).to_be_bytes();
+            let data = rlp::encode(eth_tx).freeze();
+            cursor.put(&key, &data).await.unwrap();
         }
 
         Ok(())
@@ -127,13 +170,14 @@ pub mod tx_sender {
         );
 
         Ok(if amount > 0 {
-            tx.cursor(&tables::TxSender)
+            let mut cursor = tx.cursor(&tables::TxSender).await?;
+
+            let start_key = base_tx_id.to_be_bytes();
+            txdb::get_n(&mut cursor, &start_key, 0, amount as usize)
                 .await?
-                .walk(Some(base_tx_id), |_, _| true)
-                .take(amount as usize)
-                .map(|res| res.map(|(_, sender)| sender))
-                .collect::<anyhow::Result<Vec<_>>>()
-                .await?
+                .into_iter()
+                .map(|(_, address_bytes)| Address::from_slice(&*address_bytes))
+                .collect()
         } else {
             vec![]
         })
@@ -152,8 +196,10 @@ pub mod tx_sender {
 
         let mut cursor = tx.mutable_cursor(&tables::TxSender).await.unwrap();
 
-        for (i, sender) in senders.iter().cloned().enumerate() {
-            cursor.put(base_tx_id + i as u64, sender).await.unwrap();
+        for (i, sender) in senders.iter().enumerate() {
+            let key = (base_tx_id + i as u64).to_be_bytes();
+            let data = sender.to_fixed_bytes();
+            cursor.put(&key, &data).await.unwrap();
         }
 
         Ok(())
@@ -161,38 +207,58 @@ pub mod tx_sender {
 }
 
 pub mod storage_body {
+    use bytes::Bytes;
+
     use super::*;
+
+    async fn read_raw<'db: 'tx, 'tx, Tx: ReadTransaction<'db>>(
+        tx: &'tx Tx,
+        hash: H256,
+        number: u64,
+    ) -> anyhow::Result<Option<Bytes<'tx>>> {
+        trace!("Reading storage body for block {}/{:?}", number, hash);
+
+        if let Some(b) = tx
+            .get(&tables::BlockBody, &header_key(number, hash))
+            .await?
+        {
+            return Ok(Some(b));
+        }
+
+        Ok(None)
+    }
 
     pub async fn read<'db: 'tx, 'tx, Tx: ReadTransaction<'db>>(
         tx: &'tx Tx,
         hash: H256,
-        number: BlockNumber,
+        number: u64,
     ) -> anyhow::Result<Option<BodyForStorage>> {
-        trace!("Reading storage body for block {}/{:?}", number, hash);
+        if let Some(b) = read_raw(tx, hash, number).await? {
+            return Ok(Some(rlp::decode(&b)?));
+        }
 
-        tx.get(&tables::BlockBody, (number, hash)).await
+        Ok(None)
     }
 
     pub async fn has<'db: 'tx, 'tx, Tx: ReadTransaction<'db>>(
         tx: &'tx Tx,
         hash: H256,
-        number: BlockNumber,
+        number: u64,
     ) -> anyhow::Result<bool> {
-        Ok(read(tx, hash, number).await?.is_some())
+        Ok(read_raw(tx, hash, number).await?.is_some())
     }
 
     pub async fn write<'db: 'tx, 'tx, RwTx: MutableTransaction<'db>>(
         tx: &'tx RwTx,
         hash: H256,
-        number: BlockNumber,
-        body: BodyForStorage,
+        number: u64,
+        body: &BodyForStorage,
     ) -> anyhow::Result<()> {
         trace!("Writing storage body for block {}/{:?}", number, hash);
 
-        tx.mutable_cursor(&tables::BlockBody)
-            .await?
-            .put((number, hash), body)
-            .await?;
+        let data = rlp::encode(body);
+        let mut cursor = tx.mutable_cursor(&tables::BlockBody).await.unwrap();
+        cursor.put(&header_key(number, hash), &data).await.unwrap();
 
         Ok(())
     }
@@ -204,12 +270,12 @@ pub mod td {
     pub async fn read<'db: 'tx, 'tx, Tx: ReadTransaction<'db>>(
         tx: &'tx Tx,
         hash: H256,
-        number: BlockNumber,
+        number: u64,
     ) -> anyhow::Result<Option<U256>> {
         trace!("Reading total difficulty at block {}/{:?}", number, hash);
 
         if let Some(b) = tx
-            .get(&tables::HeadersTotalDifficulty, (number, hash))
+            .get(&tables::HeadersTotalDifficulty, &header_key(number, hash))
             .await?
         {
             trace!("Reading TD RLP: {}", hex::encode(&b));
@@ -230,7 +296,7 @@ pub mod tl {
     ) -> anyhow::Result<Option<Vec<u8>>> {
         trace!("Reading Block number for a tx_hash {:?}", tx_hash);
 
-        if let Some(b) = tx.get(&tables::BlockTransactionLookup, tx_hash).await? {
+        if let Some(b) = tx.get(&tables::TxLookup, tx_hash.as_bytes()).await? {
             trace!("Reading TL RLP: {}", hex::encode(&b));
 
             return Ok(Some(rlp::decode(&b)?));
@@ -291,20 +357,18 @@ mod tests {
         let rwtx = db.begin_mutable().await.unwrap();
         let rwtx = &rwtx;
 
-        storage_body::write(rwtx, block1_hash, BlockNumber(1), body)
+        storage_body::write(rwtx, block1_hash, 1, &body)
             .await
             .unwrap();
-        canonical_hash::write(rwtx, BlockNumber(1), block1_hash)
-            .await
-            .unwrap();
+        canonical_hash::write(rwtx, 1, block1_hash).await.unwrap();
         tx::write(rwtx, 1, &txs).await.unwrap();
         tx_sender::write(rwtx, 1, &senders).await.unwrap();
 
-        let recovered_body = storage_body::read(rwtx, block1_hash, BlockNumber(1))
+        let recovered_body = storage_body::read(rwtx, block1_hash, 1)
             .await
             .unwrap()
             .expect("Could not recover storage body.");
-        let recovered_hash = canonical_hash::read(rwtx, BlockNumber(1))
+        let recovered_hash = canonical_hash::read(rwtx, 1)
             .await
             .unwrap()
             .expect("Could not recover block hash");

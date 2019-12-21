@@ -73,11 +73,7 @@ where
         let block_number = b.header.number;
 
         let mut chain = self
-            .intermediate_chain(
-                BlockNumber(block_number.0 - 1),
-                b.header.parent_hash,
-                ancestor,
-            )
+            .intermediate_chain(block_number - 1, b.header.parent_hash, ancestor)
             .await?;
         chain.push(WithHash { inner: b, hash });
 
@@ -90,11 +86,8 @@ where
             {
                 if let Some(e) = e.downcast_ref::<ValidationError>() {
                     self.bad_blocks.insert(hash, e.clone());
-                    self.unwind_last_changes(
-                        ancestor,
-                        BlockNumber(ancestor.0 + num_of_executed_chain_blocks),
-                    )
-                    .await?;
+                    self.unwind_last_changes(ancestor, ancestor + num_of_executed_chain_blocks)
+                        .await?;
                     self.re_execute_canonical_chain(ancestor, current_canonical_block)
                         .await?;
                 }
@@ -127,19 +120,16 @@ where
             > current_total_difficulty
         {
             // canonize the new chain
-            for i in (ancestor.0 + 1..=current_canonical_block.0).rev() {
-                self.state.decanonize_block(BlockNumber(i)).await?;
+            for i in (ancestor + 1..=current_canonical_block).rev() {
+                self.state.decanonize_block(i).await?;
             }
 
             for x in chain {
                 self.state.canonize_block(x.header.number, x.hash).await?;
             }
         } else {
-            self.unwind_last_changes(
-                ancestor,
-                BlockNumber(ancestor.0 + num_of_executed_chain_blocks),
-            )
-            .await?;
+            self.unwind_last_changes(ancestor, ancestor + num_of_executed_chain_blocks)
+                .await?;
             self.re_execute_canonical_chain(ancestor, current_canonical_block)
                 .await?;
         }
@@ -176,14 +166,9 @@ where
         Ok(())
     }
 
-    async fn re_execute_canonical_chain(
-        &mut self,
-        ancestor: BlockNumber,
-        tip: BlockNumber,
-    ) -> anyhow::Result<()> {
+    async fn re_execute_canonical_chain(&mut self, ancestor: u64, tip: u64) -> anyhow::Result<()> {
         assert!(ancestor <= tip);
-        for block_number in ancestor.0 + 1..=tip.0 {
-            let block_number = BlockNumber(block_number);
+        for block_number in ancestor + 1..=tip {
             let hash = self.state.canonical_hash(block_number).await?.unwrap();
             let body = self
                 .state
@@ -204,14 +189,9 @@ where
         Ok(())
     }
 
-    async fn unwind_last_changes(
-        &mut self,
-        ancestor: BlockNumber,
-        tip: BlockNumber,
-    ) -> anyhow::Result<()> {
+    async fn unwind_last_changes(&mut self, ancestor: u64, tip: u64) -> anyhow::Result<()> {
         assert!(ancestor <= tip);
-        for block_number in (ancestor.0 + 1..=tip.0).rev() {
-            let block_number = BlockNumber(block_number);
+        for block_number in (ancestor + 1..=tip).rev() {
             self.state.unwind_state_changes(block_number).await?;
         }
 
@@ -220,14 +200,13 @@ where
 
     async fn intermediate_chain(
         &self,
-        block_number: BlockNumber,
+        block_number: u64,
         mut hash: H256,
-        canonical_ancestor: BlockNumber,
+        canonical_ancestor: u64,
     ) -> anyhow::Result<Vec<WithHash<BlockWithSenders>>> {
         let mut chain =
-            Vec::with_capacity(usize::try_from(block_number.0 - canonical_ancestor.0).unwrap());
-        for block_number in (canonical_ancestor.0 + 1..=block_number.0).rev() {
-            let block_number = BlockNumber(block_number);
+            Vec::with_capacity(usize::try_from(block_number - canonical_ancestor).unwrap());
+        for block_number in (canonical_ancestor + 1..=block_number).rev() {
             let body = self
                 .state
                 .read_body_with_senders(block_number, hash)
@@ -260,11 +239,7 @@ where
     }
 
     #[async_recursion]
-    async fn canonical_ancestor(
-        &self,
-        header: &PartialHeader,
-        hash: H256,
-    ) -> anyhow::Result<BlockNumber> {
+    async fn canonical_ancestor(&self, header: &PartialHeader, hash: H256) -> anyhow::Result<u64> {
         if let Some(canonical_hash) = self.state.canonical_hash(header.number).await? {
             if canonical_hash == hash {
                 return Ok(header.number);

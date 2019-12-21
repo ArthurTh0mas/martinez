@@ -1,11 +1,10 @@
+use super::*;
 use arrayref::array_ref;
-use async_stream::try_stream;
 use async_trait::async_trait;
 use bytes::Bytes;
 use ethereum_types::Address;
-use futures_core::stream::{BoxStream, LocalBoxStream};
-use static_bytes::Bytes as StaticBytes;
-use std::{borrow::Cow, error::Error, fmt::Debug};
+use futures_core::stream::LocalBoxStream;
+use std::fmt::Debug;
 
 #[async_trait]
 pub trait KV: Send + Sync + 'static {
@@ -19,24 +18,6 @@ pub trait MutableKV: KV + 'static {
     type MutableTx<'db>: MutableTransaction<'db>;
 
     async fn begin_mutable(&self) -> anyhow::Result<Self::MutableTx<'_>>;
-}
-
-pub trait TableObject: Send + Sync + Sized {
-    type Encoded: AsRef<[u8]>;
-    type DecodeError: Error + Send + Sync + 'static;
-
-    fn decode<'tx>(b: Cow<'tx, [u8]>) -> Result<Self, Self::DecodeError>;
-    fn encode(self) -> Self::Encoded;
-}
-
-pub trait Table: Send + Sync + Debug + 'static {
-    type Key: TableObject;
-    type Value: TableObject;
-
-    fn db_name(&self) -> string::String<StaticBytes>;
-}
-pub trait DupSort: Table {
-    type SeekBothKey: TableObject;
 }
 
 #[async_trait]
@@ -56,7 +37,7 @@ pub trait Transaction<'db>: Send + Sync + Debug + Sized {
         'db: 'tx,
         T: DupSort;
 
-    async fn get<'tx, T>(&'tx self, table: &T, key: T::Key) -> anyhow::Result<Option<T::Value>>
+    async fn get<'tx, T>(&'tx self, table: &T, key: &[u8]) -> anyhow::Result<Option<Bytes<'tx>>>
     where
         'db: 'tx,
         T: Table,
@@ -100,8 +81,7 @@ pub trait MutableTransaction<'db>: Transaction<'db> {
         'db: 'tx,
         T: DupSort;
 
-    async fn set<'tx, T: Table>(&'tx self, table: &T, k: T::Key, v: T::Value)
-        -> anyhow::Result<()>;
+    async fn set<T: Table>(&self, table: &T, k: &[u8], v: &[u8]) -> anyhow::Result<()>;
 
     async fn commit(self) -> anyhow::Result<()>;
 
@@ -109,9 +89,9 @@ pub trait MutableTransaction<'db>: Transaction<'db> {
     /// Can be called for a read transaction to retrieve the current sequence value, and the increment must be zero.
     /// Sequence changes become visible outside the current write transaction after it is committed, and discarded on abort.
     /// Starts from 0.
-    async fn increment_sequence<'tx, T>(&'tx self, table: &T, amount: u64) -> anyhow::Result<u64>
+    async fn increment_sequence<T>(&self, table: &T, amount: u64) -> anyhow::Result<u64>
     where
-        T: Table<Key = Bytes<'tx>, Value = u64>,
+        T: Table,
     {
         let mut c = self.mutable_cursor::<T>(table).await?;
 
@@ -136,46 +116,13 @@ pub trait Cursor<'tx, T>: Send + Debug
 where
     T: Table,
 {
-    async fn first(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>>;
-    async fn seek(&mut self, key: T::Key) -> anyhow::Result<Option<(T::Key, T::Value)>>;
-    async fn seek_exact(&mut self, key: T::Key) -> anyhow::Result<Option<(T::Key, T::Value)>>;
-    async fn next(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>>;
-    async fn prev(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>>;
-    async fn last(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>>;
-    async fn current(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>>;
-
-    fn walk<'cur, F>(
-        &'cur mut self,
-        start_key: Option<T::Key>,
-        take_while: F,
-    ) -> BoxStream<'cur, anyhow::Result<(T::Key, T::Value)>>
-    where
-        F: Fn(&T::Key, &T::Value) -> bool + Send + 'cur,
-        'tx: 'cur,
-    {
-        Box::pin(try_stream! {
-            let start_res = if let Some(start_key) = start_key {
-                self.seek(start_key).await
-            } else {
-                self.first().await
-            };
-            if let Some((mut k, mut v)) = start_res.await? {
-                loop {
-                    if !(take_while)(&k, &v) {
-                        break;
-                    }
-                    yield (k, v);
-
-                    match self.next().await? {
-                        Some((k1, v1)) => {
-                            (k, v) = (k1, v1);
-                        }
-                        None => break,
-                    }
-                }
-            }
-        })
-    }
+    async fn first(&mut self) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>>;
+    async fn seek(&mut self, key: &[u8]) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>>;
+    async fn seek_exact(&mut self, key: &[u8]) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>>;
+    async fn next(&mut self) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>>;
+    async fn prev(&mut self) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>>;
+    async fn last(&mut self) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>>;
+    async fn current(&mut self) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>>;
 }
 
 #[async_trait]
@@ -184,12 +131,12 @@ where
     T: Table,
 {
     /// Put based on order
-    async fn put(&mut self, key: T::Key, value: T::Value) -> anyhow::Result<()>;
+    async fn put(&mut self, key: &[u8], value: &[u8]) -> anyhow::Result<()>;
     /// Append the given key/data pair to the end of the database.
     /// This option allows fast bulk loading when keys are already known to be in the correct order.
-    async fn append(&mut self, key: T::Key, value: T::Value) -> anyhow::Result<()>;
+    async fn append(&mut self, key: &[u8], value: &[u8]) -> anyhow::Result<()>;
     /// Short version of SeekExact+DeleteCurrent or SeekBothExact+DeleteCurrent
-    async fn delete(&mut self, key: T::Key, value: T::Value) -> anyhow::Result<()>;
+    async fn delete(&mut self, key: &[u8], value: &[u8]) -> anyhow::Result<()>;
 
     /// Deletes the key/data pair to which the cursor refers.
     /// This does not invalidate the cursor, so operations such as MDB_NEXT
@@ -209,13 +156,13 @@ where
 {
     async fn seek_both_range(
         &mut self,
-        key: T::Key,
-        value: T::SeekBothKey,
-    ) -> anyhow::Result<Option<T::Value>>;
+        key: &[u8],
+        value: &[u8],
+    ) -> anyhow::Result<Option<Bytes<'tx>>>;
     /// Position at next data item of current key
-    async fn next_dup(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>>;
+    async fn next_dup(&mut self) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>>;
     /// Position at first data item of next key
-    async fn next_no_dup(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>>;
+    async fn next_no_dup(&mut self) -> anyhow::Result<Option<(Bytes<'tx>, Bytes<'tx>)>>;
 }
 
 #[async_trait]
@@ -226,7 +173,7 @@ where
     /// Deletes all of the data items for the current key
     async fn delete_current_duplicates(&mut self) -> anyhow::Result<()>;
     /// Same as `Cursor::append`, but for sorted dup data
-    async fn append_dup(&mut self, key: T::Key, value: T::Value) -> anyhow::Result<()>;
+    async fn append_dup(&mut self, key: &[u8], value: &[u8]) -> anyhow::Result<()>;
 }
 
 #[async_trait]
