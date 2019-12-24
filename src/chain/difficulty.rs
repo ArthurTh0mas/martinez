@@ -55,7 +55,7 @@ fn canonical_difficulty_homestead(
 }
 
 fn canonical_difficulty_byzantium(
-    mut block_number: u64,
+    mut block_number: BlockNumber,
     block_timestamp: u64,
     parent_difficulty: U256,
     parent_timestamp: u64,
@@ -84,7 +84,7 @@ fn canonical_difficulty_byzantium(
 }
 
 pub fn canonical_difficulty(
-    block_number: u64,
+    block_number: BlockNumber,
     block_timestamp: u64,
     parent_difficulty: U256,
     parent_timestamp: u64,
@@ -108,7 +108,8 @@ pub fn canonical_difficulty(
                 // https://eips.ethereum.org/EIPS/eip-649
                 3_000_000
             }
-        };
+        }
+        .into();
         canonical_difficulty_byzantium(
             block_number,
             block_timestamp,

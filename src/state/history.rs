@@ -1,19 +1,24 @@
-use crate::{changeset::*, dbutils, dbutils::*, kv::*, models::*, Cursor, Transaction};
-use arrayref::array_ref;
+use crate::{changeset::*, kv::*, models::*, Cursor, Transaction};
 use bytes::Bytes;
 use ethereum_types::*;
-use roaring::RoaringTreemap;
 
 pub async fn get_account_data_as_of<'db: 'tx, 'tx, Tx: Transaction<'db>>(
     tx: &'tx Tx,
     address: Address,
-    timestamp: u64,
-) -> anyhow::Result<Option<Bytes<'tx>>> {
+    timestamp: BlockNumber,
+) -> anyhow::Result<Option<Account>> {
     if let Some(v) = find_data_by_history(tx, address, timestamp).await? {
         return Ok(Some(v));
     }
 
-    tx.get(&tables::PlainState, address.as_fixed_bytes()).await
+    if let Some(accdata) = tx
+        .get(&tables::PlainState, tables::PlainStateKey::Account(address))
+        .await?
+    {
+        return Ok(Some(Account::decode_from_storage(&accdata)));
+    }
+
+    Ok(None)
 }
 
 pub async fn get_storage_as_of<'db: 'tx, 'tx, Tx: Transaction<'db>>(
@@ -21,40 +26,44 @@ pub async fn get_storage_as_of<'db: 'tx, 'tx, Tx: Transaction<'db>>(
     address: Address,
     incarnation: Incarnation,
     key: H256,
-    block_number: u64,
+    block_number: BlockNumber,
 ) -> anyhow::Result<Option<Bytes<'tx>>> {
-    let key = plain_generate_composite_storage_key(address, incarnation, key);
-    if let Some(v) = find_storage_by_history(tx, key, block_number).await? {
+    if let Some(v) = find_storage_by_history(tx, (address, incarnation, key), block_number).await? {
         return Ok(Some(v));
     }
 
-    tx.get(&tables::PlainState, &key).await
+    tx.get(
+        &tables::PlainState,
+        tables::PlainStateKey::Storage((address, incarnation, key)),
+    )
+    .await
 }
 
 pub async fn find_data_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
     tx: &'tx Tx,
     address: Address,
-    block_number: u64,
-) -> anyhow::Result<Option<Bytes<'tx>>> {
+    block_number: BlockNumber,
+) -> anyhow::Result<Option<Account>> {
     let mut ch = tx.cursor(&tables::AccountHistory).await?;
     if let Some((k, v)) = ch
-        .seek(&AccountHistory::index_chunk_key(address, block_number))
+        .seek(AccountHistory::index_chunk_key(address, block_number))
         .await?
     {
-        if k.starts_with(address.as_fixed_bytes()) {
-            let change_set_block = RoaringTreemap::deserialize_from(&*v)?
+        if k.0 == address {
+            let change_set_block = v
                 .into_iter()
-                .find(|n| *n >= block_number);
+                .find(|n| *n >= block_number.0)
+                .map(BlockNumber);
 
-            let data = {
+            let mut acc = {
                 if let Some(change_set_block) = change_set_block {
                     let data = {
                         let mut c = tx.cursor_dup_sort(&tables::AccountChangeSet).await?;
-                        AccountHistory::find(&mut c, change_set_block, &address).await?
+                        AccountHistory::find(&mut c, change_set_block, address).await?
                     };
 
                     if let Some(data) = data {
-                        data
+                        Account::decode_from_storage(&data)
                     } else {
                         return Ok(None);
                     }
@@ -64,25 +73,16 @@ pub async fn find_data_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
             };
 
             //restore codehash
-            if let Some(mut acc) = Account::decode_for_storage(&*data)? {
-                if acc.incarnation > 0 && acc.code_hash == EMPTY_HASH {
-                    if let Some(code_hash) = tx
-                        .get(
-                            &tables::PlainCodeHash,
-                            &dbutils::plain_generate_storage_prefix(address, acc.incarnation),
-                        )
-                        .await?
-                    {
-                        acc.code_hash = H256(*array_ref![&*code_hash, 0, 32]);
-                    }
-
-                    let data = acc.encode_for_storage(false);
-
-                    return Ok(Some(data.into()));
+            if acc.incarnation.0 > 0 && acc.code_hash == EMPTY_HASH {
+                if let Some(code_hash) = tx
+                    .get(&tables::PlainCodeHash, (address, acc.incarnation))
+                    .await?
+                {
+                    acc.code_hash = code_hash;
                 }
             }
 
-            return Ok(Some(data));
+            return Ok(Some(acc));
         }
     }
 
@@ -91,29 +91,24 @@ pub async fn find_data_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
 
 pub async fn find_storage_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
     tx: &'tx Tx,
-    key: PlainCompositeStorageKey,
-    timestamp: u64,
+    key: (Address, Incarnation, H256),
+    timestamp: BlockNumber,
 ) -> anyhow::Result<Option<Bytes<'tx>>> {
     let mut ch = tx.cursor(&tables::StorageHistory).await?;
     if let Some((k, v)) = ch
-        .seek(&StorageHistory::index_chunk_key(key, timestamp))
+        .seek(StorageHistory::index_chunk_key(key, timestamp))
         .await?
     {
-        if k[..ADDRESS_LENGTH] != key[..ADDRESS_LENGTH]
-            || k[ADDRESS_LENGTH..ADDRESS_LENGTH + KECCAK_LENGTH]
-                != key[ADDRESS_LENGTH + INCARNATION_LENGTH..]
-        {
+        if k.0 != key.0 || k.1 != key.2 {
             return Ok(None);
         }
-        let change_set_block = RoaringTreemap::deserialize_from(&*v)?
-            .into_iter()
-            .find(|n| *n >= timestamp);
+        let change_set_block = v.into_iter().find(|n| *n >= timestamp.0);
 
         let data = {
             if let Some(change_set_block) = change_set_block {
                 let data = {
                     let mut c = tx.cursor_dup_sort(&tables::StorageChangeSet).await?;
-                    find_storage_with_incarnation(&mut c, change_set_block, &key).await?
+                    find_storage_with_incarnation(&mut c, change_set_block, key).await?
                 };
 
                 if let Some(data) = data {
@@ -198,7 +193,7 @@ mod tests {
         assert_eq!(index.iter().next(), Some(1));
 
         let mut cursor = tx.cursor(&tables::StorageChangeSet).await.unwrap();
-        let bn = BlockNumber(1).db_key();
+        let bn = BlockNumber(1);
         let s = cursor.walk(&bn, |key, _| key.starts_with(&bn));
 
         pin_mut!(s);
@@ -256,9 +251,17 @@ mod tests {
             assert_eq!(index.iter().next().unwrap(), 2);
             assert_eq!(index.len(), 1);
 
-            let prefix = plain_generate_storage_prefix(address, acc.incarnation);
             let res_account_storage = plain_state
-                .walk(&prefix, |key, _| key.starts_with(&prefix))
+                .walk(
+                    tables::PlainStateKey::Storage((address, acc.incarnation, H256::zero())),
+                    |key, _| {
+                        if let tables::PlainStateKey::Storage((a, i, _)) = key {
+                            return a == address && i == acc.incarnation;
+                        }
+
+                        false
+                    },
+                )
                 .fold(HashMap::new(), |mut accum, res| {
                     let (k, v) = res.unwrap();
                     accum.insert(
@@ -284,12 +287,12 @@ mod tests {
             }
         }
 
-        let bn = encode_block_number(2);
+        let bn = BlockNumber(2);
         let changeset_in_db = tx
             .cursor(&tables::AccountChangeSet)
             .await
             .unwrap()
-            .walk(&bn, |key, _| key.starts_with(&bn))
+            .walk(Some(bn), |block, _| block == bn)
             .map(|res| {
                 let (k, v) = res.unwrap();
                 AccountHistory::decode(k, v).1
@@ -307,7 +310,7 @@ mod tests {
 
         assert_eq!(changeset_in_db, expected_changeset);
 
-        let bn = encode_block_number(2);
+        let bn = BlockNumber(2);
         let cs = tx
             .cursor(&tables::StorageChangeSet)
             .await
@@ -332,7 +335,7 @@ mod tests {
                 let value = value_to_bytes(U256::from(10 + j as u64)).to_vec().into();
 
                 expected_changeset.insert(Change::new(
-                    plain_generate_composite_storage_key(address, acc_history[i].incarnation, key),
+                    (address, acc_history[i].incarnation, key),
                     value,
                 ));
             }
@@ -373,7 +376,7 @@ mod tests {
             // acc_history[i].root = Some(Hash::from_slice(
             //     &hex::decode(format!("{:0>64}", 10 + i)).unwrap(),
             // ));
-            acc_history[i].incarnation = i as u64 + 1;
+            acc_history[i].incarnation = Incarnation(i as u64 + 1);
 
             acc_state.push(acc_history[i].clone());
             acc_state[i].nonce += 1;

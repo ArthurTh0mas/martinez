@@ -294,7 +294,8 @@ where
         let block_number = self.header.number;
         let mut miner_reward = block_reward;
         for ommer in &self.block.ommers {
-            let ommer_reward = (U256::from(8 + ommer.number - block_number) * block_reward) >> 3;
+            let ommer_reward =
+                (U256::from(8 + ommer.number.0 - block_number.0) * block_reward) >> 3;
             self.state
                 .add_to_balance(ommer.beneficiary, ommer_reward)
                 .await?;

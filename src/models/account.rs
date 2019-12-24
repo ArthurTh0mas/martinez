@@ -1,5 +1,5 @@
 use crate::{models::*, util::*};
-use anyhow::bail;
+use arrayvec::ArrayVec;
 use bytes::Bytes;
 use educe::Educe;
 use ethereum_types::*;
@@ -14,7 +14,7 @@ pub struct Account {
     pub nonce: u64,
     pub balance: U256,
     pub code_hash: H256, // hash of the bytecode
-    pub incarnation: u64,
+    pub incarnation: Incarnation,
 }
 
 #[derive(Debug, RlpEncodable, RlpDecodable)]
@@ -46,16 +46,6 @@ pub struct SerializedAccount {
     pub nonce: U64,
     pub storage: HashMap<U256, U256>,
 }
-
-fn bytes_to_u64(buf: &[u8]) -> u64 {
-    let mut decoded = [0u8; 8];
-    for (i, b) in buf.iter().rev().enumerate() {
-        decoded[i] = *b;
-    }
-
-    u64::from_le_bytes(decoded)
-}
-
 #[allow(dead_code)]
 #[bitfield]
 #[derive(Clone, Copy, Debug, Default)]
@@ -67,7 +57,11 @@ struct AccountStorageFlags {
     dummy: B4,
 }
 
+pub type EncodedAccount = ArrayVec<u8, { Account::MAX_ENCODED_LEN }>;
+
 impl Account {
+    pub const MAX_ENCODED_LEN: usize = 1 + (1 + 32) + (1 + 8) + (1 + 32) + (1 + 8);
+
     pub fn encoding_length_for_storage(&self) -> usize {
         let mut struct_length = 1; // 1 byte for fieldset
 
@@ -90,28 +84,26 @@ impl Account {
         struct_length
     }
 
-    fn u256_compact_len(num: U256) -> usize {
-        (num.bits() + 7) / 8
-    }
-
-    fn u64_compact_len(num: u64) -> usize {
-        ((u64::BITS - num.leading_zeros()) as usize + 7) / 8
-    }
-
-    fn write_compact(input: &[u8], buffer: &mut [u8]) -> usize {
-        let mut written = 0;
-        for &byte in input.iter().skip_while(|v| **v == 0) {
-            written += 1;
-            buffer[written] = byte;
+    pub fn encode_for_storage(self, omit_code_hash: bool) -> EncodedAccount {
+        fn u256_compact_len(num: U256) -> usize {
+            (num.bits() + 7) / 8
         }
-        if written > 0 {
-            buffer[0] = written as u8;
+        fn u64_compact_len(num: u64) -> usize {
+            ((u64::BITS - num.leading_zeros()) as usize + 7) / 8
+        }
+        fn write_compact(input: &[u8], buffer: &mut [u8]) -> usize {
+            let mut written = 0;
+            for &byte in input.iter().skip_while(|v| **v == 0) {
+                written += 1;
+                buffer[written] = byte;
+            }
+            if written > 0 {
+                buffer[0] = written as u8;
+            }
+
+            written
         }
 
-        written
-    }
-
-    pub fn encode_for_storage(&self, omit_code_hash: bool) -> Vec<u8> {
         let mut buffer = vec![0; self.encoding_length_for_storage()];
 
         let mut field_set = AccountStorageFlags::default(); // start with first bit set to 0
@@ -133,7 +125,7 @@ impl Account {
         }
 
         // Encoding code hash
-        if self.code_hash != EMPTY_HASH && !omit_code_hash {
+        if self.code_hash != EMPTY_HASH && !self.omit_code_hash.unwrap_or(false) {
             field_set.set_code_hash(true);
             buffer[pos] = 32;
             buffer[pos + 1..pos + 33].copy_from_slice(self.code_hash.as_bytes());
@@ -142,12 +134,17 @@ impl Account {
         let fs = field_set.into_bytes()[0];
         buffer[0] = fs;
 
-        buffer
+        buffer.into()
     }
 
-    pub fn decode_for_storage(mut enc: &[u8]) -> anyhow::Result<Option<Self>> {
-        if enc.is_empty() {
-            return Ok(None);
+    pub fn decode_from_storage(enc: &[u8]) -> Self {
+        fn bytes_to_u64(buf: &[u8]) -> u64 {
+            let mut decoded = [0u8; 8];
+            for (i, b) in buf.iter().rev().enumerate() {
+                decoded[i] = *b;
+            }
+
+            u64::from_le_bytes(decoded)
         }
 
         let mut a = Self::default();
@@ -179,12 +176,9 @@ impl Account {
         if field_set.code_hash() {
             let decode_length = enc.get_u8() as usize;
 
-            if decode_length != 32 {
-                bail!(
-                    "codehash should be 32 bytes long, got {} instead",
-                    decode_length
-                )
-            }
+            // if decode_length != 32 {
+            //     return Err(InvalidLength { got: decode_length });
+            // }
 
             a.code_hash = H256::from_slice(&enc[..decode_length]);
             enc.advance(decode_length);

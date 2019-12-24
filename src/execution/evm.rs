@@ -496,7 +496,7 @@ where
                     let tx_gas_price = self.txn.effective_gas_price(base_fee_per_gas);
                     let tx_origin = self.txn.sender;
                     let block_coinbase = self.header.beneficiary;
-                    let block_number = self.header.number;
+                    let block_number = self.header.number.0;
                     let block_timestamp = self.header.timestamp;
                     let block_gas_limit = self.header.gas_limit;
                     let block_difficulty = self.header.difficulty;
@@ -520,7 +520,7 @@ where
                 InterruptVariant::GetBlockHash(i) => {
                     let n = i.data().block_number;
 
-                    let base_number = self.header.number;
+                    let base_number = self.header.number.0;
                     let distance = base_number - n;
                     assert!(distance <= 256);
 
@@ -530,7 +530,7 @@ where
                         hash = self
                             .state
                             .db()
-                            .read_header(base_number - i, hash)
+                            .read_header(BlockNumber(base_number - i), hash)
                             .await?
                             .context("no header")?
                             .parent_hash;

@@ -1,18 +1,17 @@
 use crate::{
-    kv::{traits, *},
+    kv::{tables::*, traits, *},
     Cursor, CursorDupSort, MutableCursor, MutableCursorDupSort,
 };
 use ::mdbx::{
-    DatabaseFlags, EnvironmentKind, Error as MdbxError, Transaction as MdbxTransaction,
-    TransactionKind, WriteFlags, RO, RW,
+    DatabaseFlags, EnvironmentKind, Error as MdbxError, Transaction, TransactionKind, WriteFlags,
+    RO, RW,
 };
-use martinez_table_defs::AutoDupSortConfig;
 use anyhow::{bail, Context};
 use async_trait::async_trait;
-use bytes::{Buf, Bytes};
-use std::{collections::HashMap, ops::Deref, path::Path, str};
+use bytes::Buf;
+use std::{borrow::Cow, collections::HashMap, ops::Deref, path::Path};
 
-pub fn table_sizes<E>(tx: &MdbxTransaction<RO, E>) -> anyhow::Result<HashMap<String, u64>>
+pub fn table_sizes<E>(tx: &mdbx::Transaction<RO, E>) -> anyhow::Result<HashMap<String, u64>>
 where
     E: EnvironmentKind,
 {
@@ -44,16 +43,17 @@ where
 
 pub struct Environment<E: EnvironmentKind> {
     inner: ::mdbx::Environment<E>,
+    chart: DatabaseChart,
 }
 
 impl<E: EnvironmentKind> Environment<E> {
     fn open(
         mut b: ::mdbx::EnvironmentBuilder<E>,
         path: &Path,
-        max_dbs: usize,
+        chart: DatabaseChart,
         ro: bool,
     ) -> anyhow::Result<Self> {
-        b.set_max_dbs(max_dbs);
+        b.set_max_dbs(chart.len());
         if ro {
             b.set_flags(::mdbx::EnvironmentFlags {
                 mode: ::mdbx::Mode::ReadOnly,
@@ -63,29 +63,30 @@ impl<E: EnvironmentKind> Environment<E> {
 
         Ok(Self {
             inner: b.open(path).context("failed to open database")?,
+            chart,
         })
     }
 
     pub fn open_ro(
         b: ::mdbx::EnvironmentBuilder<E>,
         path: &Path,
-        max_dbs: usize,
+        chart: DatabaseChart,
     ) -> anyhow::Result<Self> {
-        Self::open(b, path, max_dbs, true)
+        Self::open(b, path, chart, true)
     }
 
     pub fn open_rw(
         b: ::mdbx::EnvironmentBuilder<E>,
         path: &Path,
-        chart: &HashMap<&'static str, bool>,
+        chart: DatabaseChart,
     ) -> anyhow::Result<Self> {
-        let s = Self::open(b, path, chart.len(), false)?;
+        let s = Self::open(b, path, chart.clone(), false)?;
 
         let tx = s.inner.begin_rw_txn()?;
-        for (&db, &is_dup_sort) in chart {
+        for (table, info) in &*chart {
             tx.create_db(
-                Some(db),
-                if is_dup_sort {
+                Some(table),
+                if info.dup_sort.is_some() {
                     DatabaseFlags::DUP_SORT
                 } else {
                     DatabaseFlags::default()
@@ -111,7 +112,10 @@ impl<E: EnvironmentKind> traits::KV for Environment<E> {
     type Tx<'tx> = MdbxTransaction<'tx, RO, E>;
 
     async fn begin(&self, _flags: u8) -> anyhow::Result<Self::Tx<'_>> {
-        Ok(self.inner.begin_ro_txn()?)
+        Ok(Self::Tx::<'_> {
+            inner: self.inner.begin_ro_txn()?,
+            chart: self.chart.clone(),
+        })
     }
 }
 
@@ -120,8 +124,21 @@ impl<E: EnvironmentKind> traits::MutableKV for Environment<E> {
     type MutableTx<'tx> = MdbxTransaction<'tx, RW, E>;
 
     async fn begin_mutable(&self) -> anyhow::Result<Self::MutableTx<'_>> {
-        Ok(self.inner.begin_rw_txn()?)
+        Ok(Self::MutableTx::<'_> {
+            inner: self.inner.begin_rw_txn()?,
+            chart: self.chart.clone(),
+        })
     }
+}
+
+#[derive(Debug)]
+pub struct MdbxTransaction<'env, K, E>
+where
+    K: TransactionKind,
+    E: EnvironmentKind,
+{
+    inner: ::mdbx::Transaction<'env, K, E>,
+    chart: DatabaseChart,
 }
 
 #[async_trait]
@@ -138,8 +155,18 @@ where
         'env: 'tx,
         T: Table,
     {
+        let table_name = table.db_name();
         Ok(MdbxCursor {
-            inner: Self::cursor(self, &self.open_db(Some(table.db_name().as_ref()))?)?,
+            inner: self
+                .inner
+                .cursor(&self.inner.open_db(Some(table_name.as_ref()))?)?,
+            table_info: self
+                .chart
+                .get(table_name.as_ref() as &str)
+                .cloned()
+                .unwrap_or(TableInfo {
+                    dup_sort: Some(DupSortConfig::default()),
+                }),
             t: table.db_name(),
         })
     }
@@ -152,11 +179,14 @@ where
         traits::Transaction::cursor(self, table).await
     }
 
-    async fn get<'s, T: Table>(&'s self, table: &T, k: &[u8]) -> anyhow::Result<Option<Bytes<'s>>> {
-        Ok(Self::get(
-            self,
-            &self.open_db(Some(table.db_name().as_ref()))?,
-            k,
+    async fn get<'tx, T>(&'tx self, table: &T, key: T::Key) -> anyhow::Result<Option<T::Value>>
+    where
+        'env: 'tx,
+        T: Table,
+    {
+        Ok(self.inner.get(
+            &self.inner.open_db(Some(table.db_name().as_ref()))?,
+            TableObject::<'tx>::encode(key),
         )?)
     }
 }
@@ -188,35 +218,40 @@ impl<'env, E: EnvironmentKind> traits::MutableTransaction<'env> for MdbxTransact
         self.mutable_cursor(table).await
     }
 
-    async fn set<T: Table>(&self, table: &T, k: &[u8], v: &[u8]) -> anyhow::Result<()> {
-        if tables::DUP_SORT_TABLES
+    async fn set<'tx, T: Table>(
+        &'tx self,
+        table: &T,
+        k: T::Key,
+        v: T::Value,
+    ) -> anyhow::Result<()> {
+        if self
+            .chart
             .get(&table.db_name().as_ref())
-            .and_then(|dup| dup.as_ref())
+            .and_then(|info| info.dup_sort.as_ref())
             .is_some()
         {
             return MutableCursor::<T>::put(&mut self.mutable_cursor(table).await?, k, v).await;
         }
-        Ok(Self::put(
-            self,
-            &self.open_db(Some(table.db_name().as_ref()))?,
-            k,
-            v,
+        Ok(self.inner.put(
+            &self.inner.open_db(Some(table.db_name().as_ref()))?,
+            TableObject::<'tx>::encode(k),
+            TableObject::<'tx>::encode(v),
             WriteFlags::UPSERT,
         )?)
     }
 
     async fn commit(self) -> anyhow::Result<()> {
-        MdbxTransaction::commit(self)?;
+        self.inner.commit()?;
 
         Ok(())
     }
 }
 
-fn seek_autodupsort<'txn, K: TransactionKind>(
-    c: &mut ::mdbx::Cursor<'txn, K>,
+fn seek_autodupsort<'tx, K: TransactionKind>(
+    c: &mut ::mdbx::Cursor<'tx, K>,
     dupsort_data: &AutoDupSortConfig,
     seek: &[u8],
-) -> anyhow::Result<Option<(Bytes<'txn>, Bytes<'txn>)>> {
+) -> anyhow::Result<Option<(Cow<'tx, [u8]>, Cow<'tx, [u8]>)>> {
     let &AutoDupSortConfig { from, to } = dupsort_data;
     if seek.is_empty() {
         if let Some((mut k, mut v)) = c.first()? {
@@ -271,14 +306,15 @@ fn seek_autodupsort<'txn, K: TransactionKind>(
     Ok(Some((k, v)))
 }
 
-fn auto_dup_sort_from_db<'txn>(
-    table: &str,
-    mut k: Bytes<'txn>,
-    mut v: Bytes<'txn>,
-) -> (Bytes<'txn>, Bytes<'txn>) {
-    if let Some(&AutoDupSortConfig { from, to }) = tables::DUP_SORT_TABLES
-        .get(table)
-        .and_then(|dup| dup.as_ref())
+fn auto_dup_sort_from_db<'tx>(
+    table_info: &TableInfo,
+    mut k: Cow<'tx, [u8]>,
+    mut v: Cow<'tx, [u8]>,
+) -> (Cow<'tx, [u8]>, Cow<'tx, [u8]>) {
+    if let Some(&AutoDupSortConfig { from, to }) = table_info
+        .dup_sort
+        .as_ref()
+        .and_then(|dup| dup.auto.as_ref())
     {
         if k.len() == to {
             let key_part = from - to;
@@ -291,28 +327,28 @@ fn auto_dup_sort_from_db<'txn>(
 }
 
 #[derive(Debug)]
-pub struct MdbxCursor<'txn, K>
+pub struct MdbxCursor<'tx, K>
 where
     K: TransactionKind,
 {
-    inner: ::mdbx::Cursor<'txn, K>,
+    inner: ::mdbx::Cursor<'tx, K>,
+    table_info: TableInfo,
     t: string::String<StaticBytes>,
 }
 
-#[async_trait]
-impl<'txn, K, T> Cursor<'txn, T> for MdbxCursor<'txn, K>
+impl<'tx, K> MdbxCursor<'tx, K>
 where
     K: TransactionKind,
-    T: Table,
 {
-    async fn first(&mut self) -> anyhow::Result<Option<(Bytes<'txn>, Bytes<'txn>)>> {
-        Cursor::<T>::seek(self, &[]).await
-    }
-
-    async fn seek(&mut self, key: &[u8]) -> anyhow::Result<Option<(Bytes<'txn>, Bytes<'txn>)>> {
-        if let Some(info) = tables::DUP_SORT_TABLES
-            .get(&self.t.as_ref())
-            .and_then(|dup| dup.as_ref())
+    fn seek_inner(
+        &mut self,
+        key: &[u8],
+    ) -> anyhow::Result<Option<(Cow<'tx, [u8]>, Cow<'tx, [u8]>)>> {
+        if let Some(info) = self
+            .table_info
+            .dup_sort
+            .as_ref()
+            .and_then(|dup| dup.auto.as_ref())
         {
             return seek_autodupsort(&mut self.inner, info, key);
         }
@@ -323,14 +359,56 @@ where
             self.inner.set_range(key)?
         })
     }
+}
 
-    async fn seek_exact(
-        &mut self,
-        key: &[u8],
-    ) -> anyhow::Result<Option<(Bytes<'txn>, Bytes<'txn>)>> {
-        if let Some(&AutoDupSortConfig { from, to }) = tables::DUP_SORT_TABLES
-            .get(&self.t.as_ref())
-            .and_then(|dup| dup.as_ref())
+fn map_res_opt_decode<'tx, T: Table>(
+    v: anyhow::Result<Option<(Cow<'tx, [u8]>, Cow<'tx, [u8]>)>>,
+) -> anyhow::Result<Option<(T::Key, T::Value)>> {
+    map_opt_decode::<'tx, T>(v?)
+}
+
+fn map_opt_decode<'tx, T: Table>(
+    v: Option<(Cow<'tx, [u8]>, Cow<'tx, [u8]>)>,
+) -> anyhow::Result<Option<(T::Key, T::Value)>> {
+    if let Some((k, v)) = v {
+        return decode(k, v).map(Some);
+    }
+
+    Ok(None)
+}
+
+fn decode<'tx, T: Table>(
+    k: Cow<'tx, [u8]>,
+    v: Cow<'tx, [u8]>,
+) -> anyhow::Result<(T::Key, T::Value)> {
+    let k = TableObject::decode::<'tx>(k)?;
+    let v = TableObject::decode::<'tx>(v)?;
+    Ok((k, v))
+}
+
+#[async_trait]
+impl<'tx, K, T> Cursor<'tx, T> for MdbxCursor<'tx, K>
+where
+    K: TransactionKind,
+    T: Table,
+{
+    async fn first(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>> {
+        map_res_opt_decode(self.seek_inner(&[]))
+    }
+
+    async fn seek(&mut self, key: T::Key) -> anyhow::Result<Option<(T::Key, T::Value)>> {
+        map_res_opt_decode(self.seek_inner(key.encode().as_ref()))
+    }
+
+    async fn seek_exact(&mut self, key: T::Key) -> anyhow::Result<Option<(T::Key, T::Value)>> {
+        let key = key.encode();
+        let key = key.as_ref();
+
+        if let Some(&AutoDupSortConfig { from, to }) = self
+            .table_info
+            .dup_sort
+            .as_ref()
+            .and_then(|dup| dup.auto.as_ref())
         {
             return Ok(self
                 .inner
@@ -338,66 +416,81 @@ where
                 .and_then(|v| {
                     (key[to..] == v[..from - to])
                         .then(move || (key[..to].to_vec().into(), v.slice(from - to..)))
-                }));
+                })
+                .map(|(k, v)| {
+                    Ok::<_, anyhow::Error>(
+                        TableObject::<'tx>::decode(k)?,
+                        TableObject::<'tx>::decode(v)?,
+                    )
+                })
+                .transpose()?);
         }
 
-        Ok(self.inner.set_key(key)?)
+        map_res_opt_decode(self.inner.set_key(key))
     }
 
-    async fn next(&mut self) -> anyhow::Result<Option<(Bytes<'txn>, Bytes<'txn>)>> {
-        Ok(self
-            .inner
-            .next()?
-            .map(|(k, v)| auto_dup_sort_from_db(self.t.as_ref(), k, v)))
+    async fn next(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>> {
+        map_opt_decode(
+            self.inner
+                .next()?
+                .map(|(k, v)| auto_dup_sort_from_db(&self.table_info, k, v)),
+        )
     }
 
-    async fn prev(&mut self) -> anyhow::Result<Option<(Bytes<'txn>, Bytes<'txn>)>> {
-        Ok(self
-            .inner
-            .prev()?
-            .map(|(k, v)| auto_dup_sort_from_db(self.t.as_ref(), k, v)))
+    async fn prev(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>> {
+        map_opt_decode(
+            self.inner
+                .prev()?
+                .map(|(k, v)| auto_dup_sort_from_db(&self.table_info, k, v)),
+        )
     }
 
-    async fn last(&mut self) -> anyhow::Result<Option<(Bytes<'txn>, Bytes<'txn>)>> {
-        Ok(self
-            .inner
-            .last()?
-            .map(|(k, v)| auto_dup_sort_from_db(self.t.as_ref(), k, v)))
+    async fn last(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>> {
+        map_opt_decode(
+            self.inner
+                .last()?
+                .map(|(k, v)| auto_dup_sort_from_db(&self.table_info, k, v)),
+        )
     }
 
-    async fn current(&mut self) -> anyhow::Result<Option<(Bytes<'txn>, Bytes<'txn>)>> {
-        Ok(self
-            .inner
-            .get_current()?
-            .map(|(k, v)| auto_dup_sort_from_db(self.t.as_ref(), k, v)))
+    async fn current(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>> {
+        map_opt_decode(
+            self.inner
+                .get_current()?
+                .map(|(k, v)| auto_dup_sort_from_db(&self.table_info, k, v)),
+        )
     }
 }
 
 #[async_trait]
-impl<'txn, K, T> CursorDupSort<'txn, T> for MdbxCursor<'txn, K>
+impl<'tx, K, T> CursorDupSort<'tx, T> for MdbxCursor<'tx, K>
 where
     K: TransactionKind,
     T: DupSort,
 {
     async fn seek_both_range(
         &mut self,
-        key: &[u8],
-        value: &[u8],
-    ) -> anyhow::Result<Option<Bytes<'txn>>> {
-        Ok(self.inner.get_both_range(key, value)?)
+        key: T::Key,
+        value: T::SeekBothKey,
+    ) -> anyhow::Result<Option<T::Value>> {
+        Ok(self
+            .inner
+            .get_both_range(key, value)?
+            .map(T::Value::decode)
+            .transpose()?)
     }
 
-    async fn next_dup(&mut self) -> anyhow::Result<Option<(Bytes<'txn>, Bytes<'txn>)>> {
-        Ok(self.inner.next_dup()?)
+    async fn next_dup(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>> {
+        map_res_opt_decode(self.inner.next_dup())
     }
 
-    async fn next_no_dup(&mut self) -> anyhow::Result<Option<(Bytes<'txn>, Bytes<'txn>)>> {
-        Ok(self.inner.next_nodup()?)
+    async fn next_no_dup(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>> {
+        map_res_opt_decode(self.inner.next_nodup())
     }
 }
 
-fn delete_autodupsort<'txn>(
-    c: &mut MdbxCursor<'txn, RW>,
+fn delete_autodupsort<'tx>(
+    c: &mut MdbxCursor<'tx, RW>,
     &AutoDupSortConfig { from, to }: &AutoDupSortConfig,
     key: &[u8],
 ) -> anyhow::Result<()> {
@@ -429,8 +522,8 @@ fn delete_autodupsort<'txn>(
     Ok(())
 }
 
-fn put_autodupsort<'txn>(
-    c: &mut MdbxCursor<'txn, RW>,
+fn put_autodupsort<'tx>(
+    c: &mut MdbxCursor<'tx, RW>,
     &AutoDupSortConfig { from, to }: &AutoDupSortConfig,
     key: &[u8],
     value: &[u8],
@@ -485,38 +578,54 @@ fn put_autodupsort<'txn>(
 }
 
 #[async_trait]
-impl<'txn, T> MutableCursor<'txn, T> for MdbxCursor<'txn, RW>
+impl<'tx, T> MutableCursor<'tx, T> for MdbxCursor<'tx, RW>
 where
     T: Table,
 {
-    async fn put(&mut self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+    async fn put(&mut self, key: T::Key, value: T::Value) -> anyhow::Result<()> {
         if key.is_empty() {
             bail!("Key must not be empty");
         }
 
-        if let Some(info) = tables::DUP_SORT_TABLES
-            .get(&self.t.clone().as_ref())
-            .and_then(|dup| dup.as_ref())
+        if let Some(info) = self
+            .table_info
+            .dup_sort
+            .as_ref()
+            .and_then(|dup| dup.auto.as_ref())
+            .cloned()
         {
-            return put_autodupsort(self, info, key, value);
+            return put_autodupsort(self, &info, key, value);
         }
 
         Ok(self.inner.put(key, value, WriteFlags::default())?)
     }
 
-    async fn append(&mut self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
-        Ok(self.inner.put(&key, &value, WriteFlags::APPEND)?)
+    async fn append(&mut self, key: T::Key, value: T::Value) -> anyhow::Result<()> {
+        Ok(self.inner.put(
+            key.encode().as_ref(),
+            value.encode().as_ref(),
+            WriteFlags::APPEND,
+        )?)
     }
 
-    async fn delete(&mut self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
-        if let Some(info) = tables::DUP_SORT_TABLES
-            .get(&self.t.clone().as_ref())
-            .and_then(|dup| dup.as_ref())
+    async fn delete(&mut self, key: T::Key, value: T::Value) -> anyhow::Result<()> {
+        let key = key.encode();
+        let value = value.encode();
+
+        let key = key.as_ref();
+        let value = value.as_ref();
+
+        if let Some(info) = self
+            .table_info
+            .dup_sort
+            .as_ref()
+            .and_then(|dup| dup.auto.as_ref())
+            .cloned()
         {
-            return delete_autodupsort(self, info, key);
+            return delete_autodupsort(self, &info, key);
         }
 
-        if tables::DUP_SORT_TABLES.contains_key(&self.t.as_ref()) {
+        if self.table_info.dup_sort.is_some() {
             if self.inner.get_both(key, value)?.is_some() {
                 self.inner.del(WriteFlags::CURRENT)?;
             }
@@ -543,14 +652,18 @@ where
 }
 
 #[async_trait]
-impl<'txn, T> MutableCursorDupSort<'txn, T> for MdbxCursor<'txn, RW>
+impl<'tx, T> MutableCursorDupSort<'tx, T> for MdbxCursor<'tx, RW>
 where
     T: DupSort,
 {
     async fn delete_current_duplicates(&mut self) -> anyhow::Result<()> {
         Ok(self.inner.del(WriteFlags::NO_DUP_DATA)?)
     }
-    async fn append_dup(&mut self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
-        Ok(self.inner.put(&key, &value, WriteFlags::APPEND_DUP)?)
+    async fn append_dup(&mut self, key: T::Key, value: T::Value) -> anyhow::Result<()> {
+        Ok(self.inner.put(
+            key.encode().as_ref(),
+            value.encode().as_ref(),
+            WriteFlags::APPEND_DUP,
+        )?)
     }
 }

@@ -36,7 +36,7 @@ where
         'db: 'tx,
     {
         let mut bodies_cursor = tx.mutable_cursor(&tables::BlockBody).await?;
-        let mut tx_hash_cursor = tx.mutable_cursor(&tables::TxLookup).await?;
+        let mut tx_hash_cursor = tx.mutable_cursor(&tables::BlockTransactionLookup).await?;
 
         let mut block_txs_cursor = tx.cursor(&tables::BlockTransaction).await?;
 
@@ -44,7 +44,7 @@ where
 
         let mut start_block_number = [0; 8];
         let (_, last_processed_block_number) = tx
-            .mutable_cursor(&tables::TxLookup)
+            .mutable_cursor(&tables::BlockTransactionLookup)
             .await?
             .last()
             .await?
@@ -268,13 +268,13 @@ mod tests {
         let hash2 = H256::random();
         let hash3 = H256::random();
 
-        chain::storage_body::write(&tx, hash1, 1, &block1)
+        chain::storage_body::write(&tx, hash1, 1, block1)
             .await
             .unwrap();
-        chain::storage_body::write(&tx, hash2, 2, &block2)
+        chain::storage_body::write(&tx, hash2, 2, block2)
             .await
             .unwrap();
-        chain::storage_body::write(&tx, hash3, 3, &block3)
+        chain::storage_body::write(&tx, hash3, 3, block3)
             .await
             .unwrap();
 

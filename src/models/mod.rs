@@ -11,28 +11,42 @@ mod transaction;
 pub use self::{
     account::*, block::*, bloom::*, config::*, header::*, log::*, receipt::*, transaction::*,
 };
+pub use ethereum_types::Address;
 
+use derive_more::{Display, From};
 use ethereum_types::{H256, U256};
 use hex_literal::hex;
 use once_cell::sync::Lazy;
+use rlp_derive::{RlpDecodableWrapper, RlpEncodableWrapper};
+use serde::{Deserialize, Serialize};
 use std::mem::size_of;
-
-pub use ethereum_types::Address;
-pub type Incarnation = u64;
 
 pub const KECCAK_LENGTH: usize = H256::len_bytes();
 pub const ADDRESS_LENGTH: usize = Address::len_bytes();
 pub const BLOCK_NUMBER_LENGTH: usize = size_of::<u64>();
 pub const INCARNATION_LENGTH: usize = size_of::<u64>();
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Display,
+    PartialEq,
+    Eq,
+    From,
+    PartialOrd,
+    Ord,
+    Hash,
+    RlpEncodableWrapper,
+    RlpDecodableWrapper,
+    Serialize,
+    Deserialize,
+)]
+#[serde(transparent)]
 pub struct BlockNumber(pub u64);
 
-impl BlockNumber {
-    pub fn db_key(self) -> [u8; 8] {
-        self.0.to_be_bytes()
-    }
-}
+#[derive(Clone, Copy, Debug, Display, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Incarnation(pub u64);
 
 #[allow(non_upper_case_globals)]
 pub const value_to_bytes: fn(U256) -> [u8; 32] = From::<U256>::from;

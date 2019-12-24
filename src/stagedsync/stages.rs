@@ -42,9 +42,9 @@ impl Display for StageId {
 
 impl StageId {
     #[instrument]
-    async fn get<'db, Tx: Transaction<'db>, T: Table>(
+    async fn get<'db: 'tx, 'tx, Tx: Transaction<'db>, T: Table>(
         &self,
-        tx: &Tx,
+        tx: &'tx Tx,
         table: &T,
     ) -> anyhow::Result<Option<u64>> {
         if let Some(b) = tx.get(table, self.as_ref()).await? {
@@ -60,9 +60,9 @@ impl StageId {
     }
 
     #[instrument]
-    async fn save<'db, RwTx: MutableTransaction<'db>, T: Table>(
+    async fn save<'db: 'tx, 'tx, RwTx: MutableTransaction<'db>, T: Table>(
         &self,
-        tx: &RwTx,
+        tx: &'tx RwTx,
         table: &T,
         block: u64,
     ) -> anyhow::Result<()> {
@@ -70,9 +70,9 @@ impl StageId {
     }
 
     #[instrument]
-    pub async fn get_progress<'db, Tx: Transaction<'db>>(
+    pub async fn get_progress<'db: 'tx, 'tx, Tx: Transaction<'db>>(
         &self,
-        tx: &Tx,
+        tx: &'tx Tx,
     ) -> anyhow::Result<Option<u64>> {
         self.get(tx, &tables::SyncStage).await
     }
@@ -84,22 +84,5 @@ impl StageId {
         block: u64,
     ) -> anyhow::Result<()> {
         self.save(tx, &tables::SyncStage, block).await
-    }
-
-    #[instrument]
-    pub async fn get_unwind<'db, Tx: Transaction<'db>>(
-        &self,
-        tx: &Tx,
-    ) -> anyhow::Result<Option<u64>> {
-        self.get(tx, &tables::SyncStageUnwind).await
-    }
-
-    #[instrument]
-    pub async fn save_unwind<'db, RwTx: MutableTransaction<'db>>(
-        &self,
-        tx: &RwTx,
-        block: u64,
-    ) -> anyhow::Result<()> {
-        self.save(tx, &tables::SyncStageUnwind, block).await
     }
 }

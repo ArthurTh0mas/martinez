@@ -1,35 +1,36 @@
+use super::BlockNumber;
 use ethereum_types::*;
 use evmodin::Revision;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashSet};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct DaoConfig {
-    pub block_number: u64,
+    pub block_number: BlockNumber,
     pub drain: HashSet<Address>,
     pub beneficiary: Address,
 }
 
 #[allow(non_snake_case)]
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChainConfig {
     pub chain_id: u64,
-    pub homestead_block: Option<u64>,
+    pub homestead_block: Option<BlockNumber>,
     pub dao_fork: Option<DaoConfig>,
-    pub tangerine_block: Option<u64>,
-    pub spurious_block: Option<u64>,
-    pub byzantium_block: Option<u64>,
-    pub constantinople_block: Option<u64>,
-    pub petersburg_block: Option<u64>,
-    pub istanbul_block: Option<u64>,
-    pub muir_glacier_block: Option<u64>,
-    pub berlin_block: Option<u64>,
-    pub london_block: Option<u64>,
+    pub tangerine_block: Option<BlockNumber>,
+    pub spurious_block: Option<BlockNumber>,
+    pub byzantium_block: Option<BlockNumber>,
+    pub constantinople_block: Option<BlockNumber>,
+    pub petersburg_block: Option<BlockNumber>,
+    pub istanbul_block: Option<BlockNumber>,
+    pub muir_glacier_block: Option<BlockNumber>,
+    pub berlin_block: Option<BlockNumber>,
+    pub london_block: Option<BlockNumber>,
 }
 
 impl ChainConfig {
-    pub fn gather_forks(&self) -> BTreeSet<u64> {
+    pub fn gather_forks(&self) -> BTreeSet<BlockNumber> {
         [
             self.homestead_block,
             self.dao_fork.as_ref().map(|c| c.block_number),
@@ -56,7 +57,7 @@ impl ChainConfig {
         .collect()
     }
 
-    pub fn revision(&self, block_num: u64) -> Revision {
+    pub fn revision(&self, block_num: BlockNumber) -> Revision {
         for (fork, revision) in [
             (self.london_block, Revision::London),
             (self.berlin_block, Revision::Berlin),
@@ -69,7 +70,7 @@ impl ChainConfig {
             (self.homestead_block, Revision::Homestead),
         ] {
             if let Some(fork_block) = fork {
-                if block_num >= fork_block {
+                if block_num.0 >= fork_block.0 {
                     return revision;
                 }
             }
