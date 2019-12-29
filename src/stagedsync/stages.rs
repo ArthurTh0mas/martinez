@@ -42,12 +42,11 @@ impl Display for StageId {
 
 impl StageId {
     #[instrument]
-    async fn get<'db: 'tx, 'tx, Tx: Transaction<'db>, T: Table>(
+    pub async fn get_progress<'db, Tx: Transaction<'db>>(
         &self,
-        tx: &'tx Tx,
-        table: &T,
+        tx: &Tx,
     ) -> anyhow::Result<Option<u64>> {
-        if let Some(b) = tx.get(table, self.as_ref()).await? {
+        if let Some(b) = tx.get(&tables::SyncStage, self.as_ref()).await? {
             return Ok(Some(u64::from_be_bytes(*array_ref![
                 b.get(0..BLOCK_NUMBER_LENGTH)
                     .context("failed to read block number from bytes")?,
@@ -60,29 +59,12 @@ impl StageId {
     }
 
     #[instrument]
-    async fn save<'db: 'tx, 'tx, RwTx: MutableTransaction<'db>, T: Table>(
-        &self,
-        tx: &'tx RwTx,
-        table: &T,
-        block: u64,
-    ) -> anyhow::Result<()> {
-        tx.set(table, self.as_ref(), &block.to_be_bytes()).await
-    }
-
-    #[instrument]
-    pub async fn get_progress<'db: 'tx, 'tx, Tx: Transaction<'db>>(
-        &self,
-        tx: &'tx Tx,
-    ) -> anyhow::Result<Option<u64>> {
-        self.get(tx, &tables::SyncStage).await
-    }
-
-    #[instrument]
     pub async fn save_progress<'db, RwTx: MutableTransaction<'db>>(
         &self,
         tx: &RwTx,
         block: u64,
     ) -> anyhow::Result<()> {
-        self.save(tx, &tables::SyncStage, block).await
+        tx.set(&tables::SyncStage, self.as_ref(), &block.to_be_bytes())
+            .await
     }
 }

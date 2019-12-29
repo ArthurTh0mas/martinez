@@ -1,6 +1,7 @@
 use crate::{
     bitmapdb,
     changeset::{AccountHistory, Change, HistoryKind, StorageHistory},
+    dbutils,
     kv::tables,
     models::*,
     ChangeSet, MutableCursor, MutableCursorDupSort, MutableTransaction, Transaction,
@@ -131,9 +132,9 @@ impl WriterWithChangesets for Noop {
 
 pub struct ChangeSetWriter<'db: 'tx, 'tx, Tx: MutableTransaction<'db>> {
     tx: &'tx Tx,
-    account_changes: HashMap<<AccountHistory as HistoryKind>::Key, EncodedAccount>,
+    account_changes: HashMap<<AccountHistory as HistoryKind>::Key, Bytes<'static>>,
     storage_changed: HashSet<Address>,
-    storage_changes: HashMap<<StorageHistory as HistoryKind>::Key, H256>,
+    storage_changes: HashMap<<StorageHistory as HistoryKind>::Key, Bytes<'static>>,
     block_number: u64,
     _marker: PhantomData<&'db ()>,
 }
@@ -150,14 +151,14 @@ impl<'db: 'tx, 'tx, Tx: MutableTransaction<'db>> ChangeSetWriter<'db, 'tx, Tx> {
         }
     }
 
-    pub fn get_account_changes(&self) -> ChangeSet<AccountHistory> {
+    pub fn get_account_changes(&self) -> ChangeSet<'static, AccountHistory> {
         self.account_changes
             .iter()
             .map(|(k, v)| Change::new(*k, v.clone()))
             .collect()
     }
 
-    pub fn get_storage_changes(&self) -> ChangeSet<StorageHistory> {
+    pub fn get_storage_changes(&self) -> ChangeSet<'static, StorageHistory> {
         self.storage_changes
             .iter()
             .map(|(k, v)| Change::new(*k, v.clone()))
@@ -175,7 +176,7 @@ impl<'db: 'tx, 'tx, Tx: MutableTransaction<'db>> StateWriter for ChangeSetWriter
     ) -> anyhow::Result<()> {
         if original != account || self.storage_changed.contains(&address) {
             self.account_changes
-                .insert(address, original.encode_for_storage(true));
+                .insert(address, original.encode_for_storage(true).into());
         }
 
         Ok(())
@@ -193,7 +194,7 @@ impl<'db: 'tx, 'tx, Tx: MutableTransaction<'db>> StateWriter for ChangeSetWriter
 
     async fn delete_account(&mut self, address: Address, original: &Account) -> anyhow::Result<()> {
         self.account_changes
-            .insert(address, original.encode_for_storage(false));
+            .insert(address, original.encode_for_storage(false).into());
 
         Ok(())
     }
@@ -210,9 +211,13 @@ impl<'db: 'tx, 'tx, Tx: MutableTransaction<'db>> StateWriter for ChangeSetWriter
             return Ok(());
         }
 
-        let composite_key = (address, incarnation, key);
+        let composite_key =
+            dbutils::plain_generate_composite_storage_key(address, incarnation, key);
 
-        self.storage_changes.insert(composite_key, original);
+        let mut v = [0; 32];
+        original.to_big_endian(&mut v);
+        self.storage_changes
+            .insert(composite_key, v.to_vec().into());
         self.storage_changed.insert(address);
 
         Ok(())
@@ -225,28 +230,24 @@ impl<'db: 'tx, 'tx, Tx: MutableTransaction<'db>> StateWriter for ChangeSetWriter
 
 async fn write_index<'db: 'tx, 'tx, K: HistoryKind, Tx: MutableTransaction<'db>>(
     tx: &'tx Tx,
-    block_number: BlockNumber,
-    changes: ChangeSet<K>,
+    block_number: u64,
+    changes: ChangeSet<'tx, K>,
 ) -> anyhow::Result<()> {
     let mut buf = vec![];
     for change in changes {
-        let mut index = bitmapdb::get(
-            tx,
-            &K::IndexTable::<'tx>::default(),
-            change.key,
-            BlockNumber(0),
-            BlockNumber(u64::MAX),
-        )
-        .await
-        .context("failed to find chunk")?;
+        let k = dbutils::composite_key_without_incarnation::<K>(&change.key);
+
+        let mut index = bitmapdb::get(tx, &K::IndexTable::default(), &k, 0, u64::MAX)
+            .await
+            .context("failed to find chunk")?;
 
         index.push(block_number);
 
-        for (chunk_key, chunk) in bitmapdb::Chunks::new(index, bitmapdb::CHUNK_LIMIT).with_keys() {
+        for (chunk_key, chunk) in bitmapdb::Chunks::new(index, bitmapdb::CHUNK_LIMIT).with_keys(&k)
+        {
             buf.clear();
             chunk.serialize_into(&mut buf)?;
-            tx.set(&K::IndexTable::<'tx>::default(), &chunk_key, &buf)
-                .await?;
+            tx.set(&K::IndexTable::default(), &chunk_key, &buf).await?;
         }
     }
 
@@ -265,8 +266,8 @@ impl<'db: 'tx, 'tx, Tx: MutableTransaction<'db>> WriterWithChangesets
             C: MutableCursorDupSort<'tx, K::ChangeSetTable>,
         >(
             cursor: &mut C,
-            block_number: BlockNumber,
-            changes: &'cs ChangeSet<K>,
+            block_number: u64,
+            changes: &'cs ChangeSet<'tx, K>,
         ) -> anyhow::Result<()> {
             let mut prev_k = None;
             // TODO: fix lifetimes to return collect
@@ -375,7 +376,7 @@ impl<'db: 'tx, 'tx, Tx: MutableTransaction<'db>> StateWriter for PlainStateWrite
         self.tx
             .set(
                 &tables::PlainCodeHash,
-                (address, incarnation),
+                &dbutils::plain_generate_storage_prefix(address, incarnation),
                 code_hash.as_bytes(),
             )
             .await?;
@@ -420,13 +421,14 @@ impl<'db: 'tx, 'tx, Tx: MutableTransaction<'db>> StateWriter for PlainStateWrite
             return Ok(());
         }
 
-        let composite_key = (address, incarnation, key);
+        let composite_key =
+            dbutils::plain_generate_composite_storage_key(address, incarnation, key);
 
         let mut c = self.tx.mutable_cursor(&tables::PlainState).await?;
         if value.is_zero() {
-            c.delete(composite_key, &[]).await?;
+            c.delete(&composite_key, &[]).await?;
         } else {
-            c.put(composite_key, &value_to_bytes(value)).await?;
+            c.put(&composite_key, &value_to_bytes(value)).await?;
         }
 
         Ok(())
@@ -454,10 +456,7 @@ pub async fn read_account_data<'db: 'tx, 'tx, Tx: Transaction<'db>>(
     tx: &'tx Tx,
     address: Address,
 ) -> anyhow::Result<Option<Account>> {
-    if let Some(encoded) = tx
-        .get(&tables::PlainState, tables::PlainStateKey::Account(address))
-        .await?
-    {
+    if let Some(encoded) = tx.get(&tables::PlainState, address.as_bytes()).await? {
         return Account::decode_for_storage(&*encoded);
     }
 
@@ -470,8 +469,8 @@ pub async fn read_account_storage<'db: 'tx, 'tx, Tx: Transaction<'db>>(
     incarnation: Incarnation,
     key: H256,
 ) -> anyhow::Result<Option<Bytes<'tx>>> {
-    tx.get(&tables::PlainState, (address, incarnation, key))
-        .await
+    let composite_key = dbutils::plain_generate_composite_storage_key(address, incarnation, key);
+    tx.get(&tables::PlainState, &composite_key).await
 }
 
 pub async fn read_account_code<'db: 'tx, 'tx, Tx: Transaction<'db>>(

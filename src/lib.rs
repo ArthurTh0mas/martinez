@@ -3,7 +3,6 @@
     destructuring_assignment,
     entry_insert,
     generic_associated_types,
-    generic_const_exprs,
     linked_list_cursors,
     never_type,
     type_alias_impl_trait
@@ -22,6 +21,7 @@ mod bitmapdb;
 pub mod chain;
 mod changeset;
 pub mod crypto;
+mod dbutils;
 pub mod downloader;
 pub mod etl;
 pub mod execution;

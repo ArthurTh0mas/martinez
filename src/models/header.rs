@@ -3,8 +3,6 @@ use bytes::Bytes;
 use ethereum_types::*;
 use rlp::*;
 
-use super::BlockNumber;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// Ethereum block header definition.
 pub struct BlockHeader {
@@ -16,7 +14,7 @@ pub struct BlockHeader {
     pub receipts_root: H256,
     pub logs_bloom: Bloom,
     pub difficulty: U256,
-    pub number: BlockNumber,
+    pub number: u64,
     pub gas_limit: u64,
     pub gas_used: u64,
     pub timestamp: u64,
@@ -161,7 +159,7 @@ pub struct PartialHeader {
     pub receipts_root: H256,
     pub logs_bloom: Bloom,
     pub difficulty: U256,
-    pub number: BlockNumber,
+    pub number: u64,
     pub gas_limit: u64,
     pub gas_used: u64,
     pub timestamp: u64,
