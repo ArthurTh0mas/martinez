@@ -2,6 +2,7 @@ use self::kv_client::*;
 use super::*;
 use crate::kv::traits;
 use anyhow::Context;
+use async_stream::stream;
 use async_trait::async_trait;
 use bytes::Bytes;
 pub use ethereum_interfaces::remotekv::*;
@@ -11,7 +12,7 @@ use tokio::sync::{
     oneshot::{channel as oneshot, Sender as OneshotSender},
     Mutex as AsyncMutex,
 };
-use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+use tokio_stream::StreamExt;
 use tonic::{body::BoxBody, client::GrpcService, codegen::Body, Streaming};
 use tracing::*;
 
@@ -19,7 +20,6 @@ use tracing::*;
 #[derive(Debug)]
 pub struct RemoteTransaction {
     // Invariant: cannot send new message until we process response to it.
-    id: u64,
     io: Arc<AsyncMutex<(Sender<Cursor>, Streaming<Pair>)>>,
 }
 
@@ -38,10 +38,6 @@ pub struct RemoteCursor<'tx, B> {
 impl<'env> crate::Transaction<'env> for RemoteTransaction {
     type Cursor<'tx, T: Table> = RemoteCursor<'tx, T>;
     type CursorDupSort<'tx, T: DupSort> = RemoteCursor<'tx, T>;
-
-    fn id(&self) -> u64 {
-        self.id
-    }
 
     async fn cursor<'tx, T>(&'tx self, table: &T) -> anyhow::Result<Self::Cursor<'tx, T>>
     where
@@ -195,16 +191,43 @@ impl RemoteTransaction {
             Into<Box<(dyn std::error::Error + Send + Sync + 'static)>> + Send,
     {
         trace!("Opening transaction");
-        let (sender, rx) = channel(1);
-        let mut receiver = client.tx(ReceiverStream::new(rx)).await?.into_inner();
+        let (sender, mut rx) = channel(1);
+        let mut receiver = client
+            .tx(stream! {
+                // Just a dummy message, workaround for
+                // https://github.com/hyperium/tonic/issues/515
+                yield Cursor {
+                    op: Op::Open as i32,
+                    bucket_name: "DUMMY".into(),
+                    cursor: Default::default(),
+                    k: Default::default(),
+                    v: Default::default(),
+                };
+                while let Some(v) = rx.recv().await {
+                    yield v;
+                }
+            })
+            .await?
+            .into_inner();
 
-        // First message with txid
-        let id = receiver.message().await?.context("no response")?.tx_id;
+        // https://github.com/hyperium/tonic/issues/515
+        let cursor = receiver.message().await?.context("no response")?.cursor_id;
+
+        sender
+            .send(Cursor {
+                op: Op::Close as i32,
+                cursor,
+                bucket_name: Default::default(),
+                k: Default::default(),
+                v: Default::default(),
+            })
+            .await?;
+
+        let _ = receiver.try_next().await?;
 
         trace!("Acquired transaction receiver");
 
         Ok(Self {
-            id,
             io: Arc::new(AsyncMutex::new((sender, receiver))),
         })
     }

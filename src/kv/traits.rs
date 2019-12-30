@@ -26,8 +26,6 @@ pub trait Transaction<'db>: Send + Sync + Debug + Sized {
     type Cursor<'tx, T: Table>: Cursor<'tx, T>;
     type CursorDupSort<'tx, T: DupSort>: CursorDupSort<'tx, T>;
 
-    fn id(&self) -> u64;
-
     async fn cursor<'tx, T>(&'tx self, table: &T) -> anyhow::Result<Self::Cursor<'tx, T>>
     where
         'db: 'tx,
