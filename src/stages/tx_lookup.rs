@@ -92,10 +92,7 @@ where
         collector.load(&mut tx_hash_cursor, None).await?;
         info!("Processed");
         Ok(ExecOutput::Progress {
-            stage_progress: input
-                .previous_stage
-                .map(|(_, stage)| stage)
-                .unwrap_or_default(),
+            stage_progress: input.previous_stage.map(|(_, stage)| stage).unwrap_or(0), // ?
             done: false,
             must_commit: true,
         })
@@ -292,8 +289,8 @@ mod tests {
 
         let stage_input = StageInput {
             restarted: false,
-            previous_stage: Some((StageId("BodyDownload"), 3.into())),
-            stage_progress: Some(0.into()),
+            previous_stage: Some((StageId("BodyDownload"), 3)),
+            stage_progress: Some(0),
         };
 
         let output: ExecOutput = stage.execute(&mut tx, stage_input).await.unwrap();
@@ -301,7 +298,7 @@ mod tests {
         assert_eq!(
             output,
             ExecOutput::Progress {
-                stage_progress: 3.into(),
+                stage_progress: 3,
                 done: false,
                 must_commit: true,
             }
@@ -329,8 +326,8 @@ mod tests {
 
         let stage_input = StageInput {
             restarted: false,
-            previous_stage: Some((StageId("BodyDownload"), 3.into())),
-            stage_progress: Some(0.into()),
+            previous_stage: Some((StageId("BodyDownload"), 3)),
+            stage_progress: Some(0),
         };
 
         let output: ExecOutput = stage.execute(&mut tx, stage_input).await.unwrap();
@@ -338,7 +335,7 @@ mod tests {
         assert_eq!(
             output,
             ExecOutput::Progress {
-                stage_progress: 3.into(),
+                stage_progress: 3,
                 done: false,
                 must_commit: true,
             }

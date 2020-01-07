@@ -73,11 +73,7 @@ where
         let block_number = b.header.number;
 
         let mut chain = self
-            .intermediate_chain(
-                BlockNumber(block_number.0 - 1),
-                b.header.parent_hash,
-                ancestor,
-            )
+            .intermediate_chain(block_number - 1, b.header.parent_hash, ancestor)
             .await?;
         chain.push(WithHash { inner: b, hash });
 
@@ -90,7 +86,7 @@ where
             {
                 if let Some(e) = e.downcast_ref::<ValidationError>() {
                     self.bad_blocks.insert(hash, e.clone());
-                    self.unwind_last_changes(ancestor, ancestor.0 + num_of_executed_chain_blocks)
+                    self.unwind_last_changes(ancestor, ancestor + num_of_executed_chain_blocks)
                         .await?;
                     self.re_execute_canonical_chain(ancestor, current_canonical_block)
                         .await?;
@@ -170,13 +166,7 @@ where
         Ok(())
     }
 
-    async fn re_execute_canonical_chain(
-        &mut self,
-        ancestor: impl Into<BlockNumber>,
-        tip: impl Into<BlockNumber>,
-    ) -> anyhow::Result<()> {
-        let ancestor = ancestor.into();
-        let tip = tip.into();
+    async fn re_execute_canonical_chain(&mut self, ancestor: u64, tip: u64) -> anyhow::Result<()> {
         assert!(ancestor <= tip);
         for block_number in ancestor + 1..=tip {
             let hash = self.state.canonical_hash(block_number).await?.unwrap();
@@ -199,13 +189,7 @@ where
         Ok(())
     }
 
-    async fn unwind_last_changes(
-        &mut self,
-        ancestor: impl Into<BlockNumber>,
-        tip: impl Into<BlockNumber>,
-    ) -> anyhow::Result<()> {
-        let ancestor = ancestor.into();
-        let tip = tip.into();
+    async fn unwind_last_changes(&mut self, ancestor: u64, tip: u64) -> anyhow::Result<()> {
         assert!(ancestor <= tip);
         for block_number in (ancestor + 1..=tip).rev() {
             self.state.unwind_state_changes(block_number).await?;
@@ -216,14 +200,12 @@ where
 
     async fn intermediate_chain(
         &self,
-        block_number: impl Into<BlockNumber>,
+        block_number: u64,
         mut hash: H256,
-        canonical_ancestor: impl Into<BlockNumber>,
+        canonical_ancestor: u64,
     ) -> anyhow::Result<Vec<WithHash<BlockWithSenders>>> {
-        let block_number = block_number.into();
-        let canonical_ancestor = canonical_ancestor.into();
         let mut chain =
-            Vec::with_capacity(usize::try_from(block_number.0 - canonical_ancestor.0).unwrap());
+            Vec::with_capacity(usize::try_from(block_number - canonical_ancestor).unwrap());
         for block_number in (canonical_ancestor + 1..=block_number).rev() {
             let body = self
                 .state
@@ -257,11 +239,7 @@ where
     }
 
     #[async_recursion]
-    async fn canonical_ancestor(
-        &self,
-        header: &PartialHeader,
-        hash: H256,
-    ) -> anyhow::Result<BlockNumber> {
+    async fn canonical_ancestor(&self, header: &PartialHeader, hash: H256) -> anyhow::Result<u64> {
         if let Some(canonical_hash) = self.state.canonical_hash(header.number).await? {
             if canonical_hash == hash {
                 return Ok(header.number);
@@ -269,7 +247,7 @@ where
         }
         let parent = self
             .state
-            .read_header(BlockNumber(header.number.0 - 1), header.parent_hash)
+            .read_header(header.number - 1, header.parent_hash)
             .await?
             .ok_or(ValidationError::UnknownParent)?;
         self.canonical_ancestor(&parent.into(), header.parent_hash)

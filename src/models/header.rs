@@ -1,4 +1,3 @@
-use super::BlockNumber;
 use crate::crypto::*;
 use bytes::Bytes;
 use ethereum_types::*;
@@ -15,7 +14,7 @@ pub struct BlockHeader {
     pub receipts_root: H256,
     pub logs_bloom: Bloom,
     pub difficulty: U256,
-    pub number: BlockNumber,
+    pub number: u64,
     pub gas_limit: u64,
     pub gas_used: u64,
     pub timestamp: u64,
@@ -134,7 +133,7 @@ impl BlockHeader {
             receipts_root: H256::zero(),
             logs_bloom: Bloom::zero(),
             difficulty: U256::zero(),
-            number: BlockNumber(0),
+            number: 0,
             gas_limit: 0,
             gas_used: 0,
             timestamp: 0,
@@ -160,7 +159,7 @@ pub struct PartialHeader {
     pub receipts_root: H256,
     pub logs_bloom: Bloom,
     pub difficulty: U256,
-    pub number: BlockNumber,
+    pub number: u64,
     pub gas_limit: u64,
     pub gas_used: u64,
     pub timestamp: u64,
@@ -201,7 +200,7 @@ impl PartialHeader {
             receipts_root: H256::zero(),
             logs_bloom: Bloom::zero(),
             difficulty: U256::zero(),
-            number: BlockNumber(0),
+            number: 0,
             gas_limit: 0,
             gas_used: 0,
             timestamp: 0,

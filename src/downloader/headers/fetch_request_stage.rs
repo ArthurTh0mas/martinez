@@ -1,15 +1,12 @@
-use crate::{
-    downloader::{
-        block_id,
-        headers::{
-            header_slices,
-            header_slices::{HeaderSliceStatus, HeaderSlices},
-        },
-        messages::{GetBlockHeadersMessage, GetBlockHeadersMessageParams, Message},
-        sentry_client::PeerFilter,
-        sentry_client_reactor::{SendMessageError, SentryClientReactor},
+use crate::downloader::{
+    block_id,
+    headers::{
+        header_slices,
+        header_slices::{HeaderSliceStatus, HeaderSlices},
     },
-    models::BlockNumber,
+    messages::{GetBlockHeadersMessage, GetBlockHeadersMessageParams, Message},
+    sentry_client::PeerFilter,
+    sentry_client_reactor::{SendMessageError, SentryClientReactor},
 };
 use parking_lot::{lock_api::RwLockUpgradableReadGuard, RwLock};
 use std::{
@@ -96,7 +93,7 @@ impl FetchRequestStage {
         })
     }
 
-    fn request(&self, request_id: u64, block_num: BlockNumber, limit: u64) -> anyhow::Result<()> {
+    fn request(&self, request_id: u64, block_num: u64, limit: u64) -> anyhow::Result<()> {
         let message = GetBlockHeadersMessage {
             request_id,
             params: GetBlockHeadersMessageParams {

@@ -7,7 +7,7 @@ use roaring::RoaringTreemap;
 pub async fn get_account_data_as_of<'db: 'tx, 'tx, Tx: Transaction<'db>>(
     tx: &'tx Tx,
     address: Address,
-    timestamp: BlockNumber,
+    timestamp: u64,
 ) -> anyhow::Result<Option<Bytes<'tx>>> {
     if let Some(v) = find_data_by_history(tx, address, timestamp).await? {
         return Ok(Some(v));
@@ -21,10 +21,10 @@ pub async fn get_storage_as_of<'db: 'tx, 'tx, Tx: Transaction<'db>>(
     address: Address,
     incarnation: Incarnation,
     key: H256,
-    block_number: impl Into<BlockNumber>,
+    block_number: u64,
 ) -> anyhow::Result<Option<Bytes<'tx>>> {
     let key = plain_generate_composite_storage_key(address, incarnation, key);
-    if let Some(v) = find_storage_by_history(tx, key, block_number.into()).await? {
+    if let Some(v) = find_storage_by_history(tx, key, block_number).await? {
         return Ok(Some(v));
     }
 
@@ -34,7 +34,7 @@ pub async fn get_storage_as_of<'db: 'tx, 'tx, Tx: Transaction<'db>>(
 pub async fn find_data_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
     tx: &'tx Tx,
     address: Address,
-    block_number: BlockNumber,
+    block_number: u64,
 ) -> anyhow::Result<Option<Bytes<'tx>>> {
     let mut ch = tx.cursor(&tables::AccountHistory).await?;
     if let Some((k, v)) = ch
@@ -44,14 +44,13 @@ pub async fn find_data_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
         if k.starts_with(address.as_fixed_bytes()) {
             let change_set_block = RoaringTreemap::deserialize_from(&*v)?
                 .into_iter()
-                .find(|n| *n >= *block_number);
+                .find(|n| *n >= block_number);
 
             let data = {
                 if let Some(change_set_block) = change_set_block {
                     let data = {
                         let mut c = tx.cursor_dup_sort(&tables::AccountChangeSet).await?;
-                        AccountHistory::find(&mut c, BlockNumber(change_set_block), &address)
-                            .await?
+                        AccountHistory::find(&mut c, change_set_block, &address).await?
                     };
 
                     if let Some(data) = data {
@@ -66,7 +65,7 @@ pub async fn find_data_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
 
             //restore codehash
             if let Some(mut acc) = Account::decode_for_storage(&*data)? {
-                if acc.incarnation.0 > 0 && acc.code_hash == EMPTY_HASH {
+                if acc.incarnation > 0 && acc.code_hash == EMPTY_HASH {
                     if let Some(code_hash) = tx
                         .get(
                             &tables::PlainCodeHash,
@@ -93,7 +92,7 @@ pub async fn find_data_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
 pub async fn find_storage_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
     tx: &'tx Tx,
     key: PlainCompositeStorageKey,
-    timestamp: BlockNumber,
+    timestamp: u64,
 ) -> anyhow::Result<Option<Bytes<'tx>>> {
     let mut ch = tx.cursor(&tables::StorageHistory).await?;
     if let Some((k, v)) = ch
@@ -108,14 +107,13 @@ pub async fn find_storage_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
         }
         let change_set_block = RoaringTreemap::deserialize_from(&*v)?
             .into_iter()
-            .find(|n| *n >= *timestamp);
+            .find(|n| *n >= timestamp);
 
         let data = {
             if let Some(change_set_block) = change_set_block {
                 let data = {
                     let mut c = tx.cursor_dup_sort(&tables::StorageChangeSet).await?;
-                    find_storage_with_incarnation(&mut c, BlockNumber(change_set_block), &key)
-                        .await?
+                    find_storage_with_incarnation(&mut c, change_set_block, &key).await?
                 };
 
                 if let Some(data) = data {
@@ -375,7 +373,7 @@ mod tests {
             // acc_history[i].root = Some(Hash::from_slice(
             //     &hex::decode(format!("{:0>64}", 10 + i)).unwrap(),
             // ));
-            acc_history[i].incarnation = Incarnation(i as u64 + 1);
+            acc_history[i].incarnation = i as u64 + 1;
 
             acc_state.push(acc_history[i].clone());
             acc_state[i].nonce += 1;

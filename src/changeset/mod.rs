@@ -7,7 +7,7 @@ use std::{collections::BTreeSet, fmt::Debug};
 mod account;
 mod storage;
 
-pub const DEFAULT_INCARNATION: Incarnation = Incarnation(1);
+pub const DEFAULT_INCARNATION: Incarnation = 1;
 
 pub struct AccountHistory;
 pub struct StorageHistory;
@@ -56,19 +56,19 @@ pub trait HistoryKind: Send {
     type IndexTable: Table + Default;
     type EncodedStream<'tx: 'cs, 'cs>: EncodedStream<'tx, 'cs>;
 
-    fn index_chunk_key(key: Self::Key, block_number: BlockNumber) -> Self::IndexChunkKey;
+    fn index_chunk_key(key: Self::Key, block_number: u64) -> Self::IndexChunkKey;
     async fn find<'tx, C>(
         cursor: &mut C,
-        block_number: BlockNumber,
+        block_number: u64,
         needle: &Self::Key,
     ) -> anyhow::Result<Option<Bytes<'tx>>>
     where
         C: CursorDupSort<'tx, Self::ChangeSetTable>;
     /// Encode changes into DB keys and values
     fn encode<'cs, 'tx: 'cs>(
-        block_number: BlockNumber,
+        block_number: u64,
         changes: &'cs ChangeSet<'tx, Self>,
     ) -> Self::EncodedStream<'tx, 'cs>;
     /// Decode `Change` from DB keys and values
-    fn decode<'tx>(k: Bytes<'tx>, v: Bytes<'tx>) -> (BlockNumber, Change<'tx, Self::Key>);
+    fn decode<'tx>(k: Bytes<'tx>, v: Bytes<'tx>) -> (u64, Change<'tx, Self::Key>);
 }

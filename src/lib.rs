@@ -5,7 +5,6 @@
     generic_associated_types,
     linked_list_cursors,
     never_type,
-    step_trait,
     type_alias_impl_trait
 )]
 #![recursion_limit = "256"]

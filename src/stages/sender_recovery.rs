@@ -1,6 +1,5 @@
 use crate::{
     accessors::chain,
-    models::*,
     stagedsync::stage::{ExecOutput, Stage, StageInput, UnwindInput},
     MutableTransaction, StageId,
 };
@@ -13,17 +12,14 @@ use tracing::error;
 #[derive(Error, Debug)]
 pub enum SenderRecoveryError {
     #[error("Canonical hash for block {0} not found")]
-    HashNotFound(BlockNumber),
+    HashNotFound(u64),
     #[error("Block body for block {0} not found")]
-    BlockBodyNotFound(BlockNumber),
+    BlockBodyNotFound(u64),
 }
 
 const BUFFER_SIZE: u64 = 5000;
 
-async fn process_block<'db: 'tx, 'tx, RwTx>(
-    tx: &'tx mut RwTx,
-    height: BlockNumber,
-) -> anyhow::Result<()>
+async fn process_block<'db: 'tx, 'tx, RwTx>(tx: &'tx mut RwTx, height: u64) -> anyhow::Result<()>
 where
     RwTx: MutableTransaction<'db>,
 {
@@ -63,11 +59,12 @@ where
     where
         'db: 'tx,
     {
-        let from_height = input.stage_progress.unwrap_or_default();
-        let max_height = input
-            .previous_stage
-            .map(|(_, height)| height)
-            .unwrap_or_default();
+        let from_height = input.stage_progress.unwrap_or(0);
+        let max_height = if let Some((_, height)) = input.previous_stage {
+            height
+        } else {
+            0
+        };
         let to_height = cmp::min(max_height, from_height + BUFFER_SIZE);
 
         let mut height = from_height;
@@ -75,7 +72,7 @@ where
             process_block(tx, height + 1)
                 .await
                 .with_context(|| format!("Failed to recover senders for block {}", height + 1))?;
-            height.0 += 1;
+            height += 1;
         }
 
         let made_progress = height > from_height;
@@ -97,7 +94,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{kv::traits::MutableKV, new_mem_database};
+    use crate::{kv::traits::MutableKV, models::*, new_mem_database};
     use bytes::Bytes;
     use ethereum_types::*;
     use hex_literal::hex;
@@ -270,8 +267,8 @@ mod tests {
 
         let stage_input = StageInput {
             restarted: false,
-            previous_stage: Some((StageId("BodyDownload"), 3.into())),
-            stage_progress: Some(0.into()),
+            previous_stage: Some((StageId("BodyDownload"), 3)),
+            stage_progress: Some(0),
         };
 
         let output: ExecOutput = stage.execute(&mut tx, stage_input).await.unwrap();
@@ -279,7 +276,7 @@ mod tests {
         assert_eq!(
             output,
             ExecOutput::Progress {
-                stage_progress: 3.into(),
+                stage_progress: 3,
                 done: false,
                 must_commit: true,
             }

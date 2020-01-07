@@ -5,15 +5,15 @@ use ethereum_types::{Address, H256};
 use std::marker::PhantomData;
 
 pub struct StateReader<'db: 'tx, 'tx, Tx: Transaction<'db> + ?Sized> {
-    block_number: BlockNumber,
+    block_nr: u64,
     tx: &'tx Tx,
     _marker: PhantomData<&'db ()>,
 }
 
 impl<'db: 'tx, 'tx, Tx: Transaction<'db> + ?Sized> StateReader<'db, 'tx, Tx> {
-    pub fn new(tx: &'tx Tx, block_number: BlockNumber) -> Self {
+    pub fn new(tx: &'tx Tx, block_nr: u64) -> Self {
         Self {
-            block_number,
+            block_nr,
             tx,
             _marker: PhantomData,
         }
@@ -21,7 +21,7 @@ impl<'db: 'tx, 'tx, Tx: Transaction<'db> + ?Sized> StateReader<'db, 'tx, Tx> {
 
     pub async fn read_account_data(&mut self, address: Address) -> anyhow::Result<Option<Account>> {
         if let Some(enc) =
-            crate::state::get_account_data_as_of(self.tx, address, self.block_number + 1).await?
+            crate::state::get_account_data_as_of(self.tx, address, self.block_nr + 1).await?
         {
             return Account::decode_for_storage(&enc);
         }

@@ -4,7 +4,6 @@ use crate::{
         data_provider::Entry,
     },
     kv::tables,
-    models::*,
     stagedsync::stage::{ExecOutput, Stage, StageInput},
     Cursor, MutableTransaction, StageId,
 };
@@ -33,11 +32,11 @@ where
     where
         'db: 'tx,
     {
-        let past_progress = input.stage_progress.unwrap_or(BlockNumber(0));
+        let past_progress = input.stage_progress.unwrap_or(0);
 
         let mut bodies_cursor = tx.mutable_cursor(&tables::BlockBody).await?;
         let mut blockhashes_cursor = tx.mutable_cursor(&tables::HeaderNumber).await?;
-        let processed = BlockNumber(0);
+        let processed = 0;
 
         let start_key = past_progress.to_be_bytes();
         let mut collector = Collector::new(OPTIMAL_BUFFER_CAPACITY);
