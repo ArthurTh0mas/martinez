@@ -5,6 +5,7 @@
     generic_associated_types,
     linked_list_cursors,
     never_type,
+    step_trait,
     type_alias_impl_trait
 )]
 #![recursion_limit = "256"]
@@ -34,7 +35,7 @@ pub(crate) mod util;
 
 pub use changeset::*;
 pub use kv::{
-    mdbx::{table_sizes as mdbx_table_sizes, Environment as MdbxEnvironment},
+    mdbx::Environment as MdbxEnvironment,
     new_mem_database,
     remote::{kv_client::KvClient as RemoteKvClient, RemoteCursor, RemoteTransaction},
     traits::{

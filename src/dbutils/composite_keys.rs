@@ -19,10 +19,11 @@ pub type PlainCompositeStorageKey = [u8; PLAIN_COMPOSITE_STORAGE_KEY_LENGTH];
 pub type StoragePrefix = [u8; STORAGE_PREFIX_LENGTH];
 pub type PlainStoragePrefix = [u8; PLAIN_STORAGE_PREFIX_LENGTH];
 
-#[allow(non_upper_case_globals)]
-pub const encode_block_number: fn(u64) -> [u8; 8] = u64::to_be_bytes;
+pub fn encode_block_number(block_number: impl Into<BlockNumber>) -> [u8; 8] {
+    block_number.into().to_be_bytes()
+}
 
-pub fn header_key(number: u64, hash: H256) -> HeaderKey {
+pub fn header_key(number: impl Into<BlockNumber>, hash: H256) -> HeaderKey {
     let mut v: HeaderKey = [0; HEADER_KEY_LEN];
 
     v[..BLOCK_NUMBER_LENGTH].copy_from_slice(&encode_block_number(number));
@@ -93,14 +94,15 @@ pub fn plain_generate_storage_prefix(
     prefix
 }
 
-pub fn plain_parse_storage_prefix(prefix: &[u8]) -> (Address, u64) {
+pub fn plain_parse_storage_prefix(prefix: &[u8]) -> (Address, Incarnation) {
     (
         Address::from_slice(&prefix[..ADDRESS_LENGTH]),
         u64::from_be_bytes(*array_ref!(
             prefix[ADDRESS_LENGTH..ADDRESS_LENGTH + INCARNATION_LENGTH],
             0,
             8
-        )),
+        ))
+        .into(),
     )
 }
 
@@ -112,7 +114,7 @@ mod tests {
     #[test]
     fn plain_storage_prefix() {
         let expected_addr = hex!("5A0b54D5dc17e0AadC383d2db43B0a0D3E029c4c").into();
-        let expected_incarnation = 999_000_999_u64;
+        let expected_incarnation = 999_000_999_u64.into();
 
         let prefix = plain_generate_storage_prefix(expected_addr, expected_incarnation);
 
@@ -128,7 +130,7 @@ mod tests {
     #[test]
     fn plain_composite_storage_key() {
         let expected_addr = hex!("5A0b54D5dc17e0AadC383d2db43B0a0D3E029c4c").into();
-        let expected_incarnation = 999_000_999_u64;
+        let expected_incarnation = 999_000_999_u64.into();
         let expected_key =
             hex!("58833f949125129fb8c6c93d2c6003c5bab7c0b116d695f4ca137b1debf4e472").into();
 
