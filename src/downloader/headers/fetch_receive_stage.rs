@@ -77,17 +77,13 @@ impl FetchReceiveStage {
         }
         let start_block_num = headers[0].number;
 
-        self.header_slices.find(
-            start_block_num,
-            move |slice_lock_opt: Option<&RwLock<HeaderSlice>>| {
-                self.update_slice(slice_lock_opt, headers, start_block_num);
-            },
-        );
+        let slice_lock_opt = self.header_slices.find_by_start_block_num(start_block_num);
+        self.update_slice(slice_lock_opt, headers, start_block_num);
     }
 
     fn update_slice(
         &self,
-        slice_lock_opt: Option<&RwLock<HeaderSlice>>,
+        slice_lock_opt: Option<Arc<RwLock<HeaderSlice>>>,
         headers: Vec<Header>,
         start_block_num: BlockNumber,
     ) {
@@ -101,13 +97,13 @@ impl FetchReceiveStage {
                             .set_slice_status(slice.deref_mut(), HeaderSliceStatus::Downloaded);
                     }
                     unexpected_status => {
-                        warn!("FetchReceiveStage ignores a headers slice that we didn't request starting at: {}; status = {:?}", start_block_num, unexpected_status);
+                        debug!("FetchReceiveStage ignores a headers slice that we didn't request starting at: {:?}; status = {:?}", start_block_num, unexpected_status);
                     }
                 }
             }
             None => {
-                warn!(
-                    "FetchReceiveStage ignores a headers slice that we didn't request starting at: {}",
+                debug!(
+                    "FetchReceiveStage ignores a headers slice that we didn't request starting at: {:?}",
                     start_block_num
                 );
             }
