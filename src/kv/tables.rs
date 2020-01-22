@@ -135,26 +135,7 @@ impl traits::TableDecode for Vec<u8> {
     }
 }
 
-#[derive(Clone, Debug, Default, Deref, DerefMut, PartialEq, Eq, PartialOrd, Ord)]
-pub struct VariableVec<const LEN: usize> {
-    pub inner: ArrayVec<u8, LEN>,
-}
-
-impl<const LEN: usize> FromIterator<u8> for VariableVec<LEN> {
-    fn from_iter<T: IntoIterator<Item = u8>>(iter: T) -> Self {
-        Self {
-            inner: ArrayVec::from_iter(iter),
-        }
-    }
-}
-
-impl<const LEN: usize> AsRef<[u8]> for VariableVec<LEN> {
-    fn as_ref(&self) -> &[u8] {
-        self.inner.as_ref()
-    }
-}
-
-impl<const LEN: usize> traits::TableEncode for VariableVec<LEN> {
+impl<const LEN: usize> traits::TableEncode for ArrayVec<u8, LEN> {
     type Encoded = Self;
 
     fn encode(self) -> Self::Encoded {
@@ -162,17 +143,11 @@ impl<const LEN: usize> traits::TableEncode for VariableVec<LEN> {
     }
 }
 
-impl<const LEN: usize> traits::TableDecode for VariableVec<LEN> {
+impl<const LEN: usize> traits::TableDecode for ArrayVec<u8, LEN> {
     fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        let mut out = Self::default();
+        let mut out = Self::new();
         out.try_extend_from_slice(b)?;
         Ok(out)
-    }
-}
-
-impl<const LEN: usize> From<VariableVec<LEN>> for Vec<u8> {
-    fn from(v: VariableVec<LEN>) -> Self {
-        v.to_vec()
     }
 }
 
@@ -220,14 +195,14 @@ macro_rules! u64_table_object {
             type Encoded = [u8; 8];
 
             fn encode(self) -> Self::Encoded {
-                self.to_be_bytes()
+                self.0.to_be_bytes()
             }
         }
 
         impl TableDecode for $ty {
             fn decode(b: &[u8]) -> anyhow::Result<Self> {
                 match b.len() {
-                    8 => Ok(u64::from_be_bytes(*array_ref!(&*b, 0, 8)).into()),
+                    8 => Ok(Self(u64::from_be_bytes(*array_ref!(&*b, 0, 8)))),
                     other => Err(InvalidLength::<8> { got: other }.into()),
                 }
             }
@@ -235,7 +210,6 @@ macro_rules! u64_table_object {
     };
 }
 
-u64_table_object!(u64);
 u64_table_object!(BlockNumber);
 u64_table_object!(Incarnation);
 u64_table_object!(TxIndex);
@@ -264,12 +238,12 @@ impl<T, const LEN: usize> TableEncode for TruncateStart<T>
 where
     T: TableEncode<Encoded = [u8; LEN]>,
 {
-    type Encoded = VariableVec<LEN>;
+    type Encoded = ArrayVec<u8, LEN>;
 
     fn encode(self) -> Self::Encoded {
         let arr = self.0.encode();
 
-        let mut out = Self::Encoded::default();
+        let mut out = ArrayVec::new();
         out.try_extend_from_slice(zeroless_view(&arr)).unwrap();
         out
     }
@@ -392,10 +366,10 @@ where
 pub struct ZerolessH256(pub H256);
 
 impl TableEncode for ZerolessH256 {
-    type Encoded = VariableVec<KECCAK_LENGTH>;
+    type Encoded = ArrayVec<u8, KECCAK_LENGTH>;
 
     fn encode(self) -> Self::Encoded {
-        let mut out = Self::Encoded::default();
+        let mut out = ArrayVec::new();
         out.try_extend_from_slice(zeroless_view(&self.0)).unwrap();
         out
     }
@@ -503,14 +477,13 @@ impl<A, B, const A_LEN: usize, const B_LEN: usize> TableEncode for (A, B)
 where
     A: TableObject<Encoded = [u8; A_LEN]>,
     B: TableObject<Encoded = [u8; B_LEN]>,
-    [u8; A_LEN + B_LEN]: AsRef<[u8]>,
 {
-    type Encoded = [u8; A_LEN + B_LEN];
+    type Encoded = ArrayVec<u8, 256>;
 
     fn encode(self) -> Self::Encoded {
-        let mut v = [0; A_LEN + B_LEN];
-        v[..A_LEN].copy_from_slice(&self.0.encode());
-        v[A_LEN..].copy_from_slice(&self.1.encode());
+        let mut v = ArrayVec::new();
+        v.try_extend_from_slice(&self.0.encode()).unwrap();
+        v.try_extend_from_slice(&self.1.encode()).unwrap();
         v
     }
 }
@@ -556,10 +529,10 @@ pub struct AccountChange {
 }
 
 impl TableEncode for AccountChange {
-    type Encoded = VariableVec<{ ADDRESS_LENGTH + MAX_ACCOUNT_LEN }>;
+    type Encoded = ArrayVec<u8, { ADDRESS_LENGTH + MAX_ACCOUNT_LEN }>;
 
     fn encode(self) -> Self::Encoded {
-        let mut out = Self::Encoded::default();
+        let mut out = ArrayVec::new();
         out.try_extend_from_slice(&self.address.encode()).unwrap();
         out.try_extend_from_slice(&self.account).unwrap();
         out
@@ -627,10 +600,10 @@ pub enum StorageChangeSeekKey {
 }
 
 impl TableEncode for StorageChangeSeekKey {
-    type Encoded = VariableVec<{ BLOCK_NUMBER_LENGTH + ADDRESS_LENGTH + INCARNATION_LENGTH }>;
+    type Encoded = ArrayVec<u8, { BLOCK_NUMBER_LENGTH + ADDRESS_LENGTH + INCARNATION_LENGTH }>;
 
     fn encode(self) -> Self::Encoded {
-        let mut out = Self::Encoded::default();
+        let mut out = ArrayVec::new();
         match self {
             StorageChangeSeekKey::Block(block) => {
                 out.try_extend_from_slice(&block.encode()).unwrap();
@@ -654,10 +627,10 @@ pub struct StorageChange {
 }
 
 impl TableEncode for StorageChange {
-    type Encoded = VariableVec<{ KECCAK_LENGTH + KECCAK_LENGTH }>;
+    type Encoded = ArrayVec<u8, { KECCAK_LENGTH + KECCAK_LENGTH }>;
 
     fn encode(self) -> Self::Encoded {
-        let mut out = Self::Encoded::default();
+        let mut out = ArrayVec::new();
         out.try_extend_from_slice(&self.location.encode()).unwrap();
         out.try_extend_from_slice(&self.value.encode()).unwrap();
         out
@@ -733,10 +706,10 @@ pub enum PlainStateKey {
 }
 
 impl TableEncode for PlainStateKey {
-    type Encoded = VariableVec<{ ADDRESS_LENGTH + INCARNATION_LENGTH }>;
+    type Encoded = ArrayVec<u8, { ADDRESS_LENGTH + INCARNATION_LENGTH }>;
 
     fn encode(self) -> Self::Encoded {
-        let mut out = Self::Encoded::default();
+        let mut out = ArrayVec::new();
         match self {
             PlainStateKey::Account(address) => {
                 out.try_extend_from_slice(&address.encode()).unwrap();
@@ -777,10 +750,10 @@ pub enum PlainStateSeekKey {
 }
 
 impl TableEncode for PlainStateSeekKey {
-    type Encoded = VariableVec<{ ADDRESS_LENGTH + INCARNATION_LENGTH }>;
+    type Encoded = ArrayVec<u8, { ADDRESS_LENGTH + INCARNATION_LENGTH }>;
 
     fn encode(self) -> Self::Encoded {
-        let mut out = Self::Encoded::default();
+        let mut out = ArrayVec::new();
         match self {
             Self::Account(address) | Self::StorageAllIncarnations(address) => {
                 out.try_extend_from_slice(&address.encode()).unwrap();
@@ -837,7 +810,7 @@ pub struct PlainState;
 
 impl Table for PlainState {
     type Key = PlainStateKey;
-    type Value = VariableVec<MAX_ACCOUNT_LEN>;
+    type Value = ArrayVec<u8, MAX_ACCOUNT_LEN>;
     type SeekKey = PlainStateSeekKey;
     type FusedValue = PlainStateFusedValue;
 
@@ -889,7 +862,7 @@ impl Table for PlainState {
                 location,
                 value,
             } => {
-                let mut v = Self::Value::default();
+                let mut v = Self::Value::new();
                 v.try_extend_from_slice(&location.encode()).unwrap();
                 v.try_extend_from_slice(&value.encode()).unwrap();
                 (PlainStateKey::Storage(address, incarnation), v)
