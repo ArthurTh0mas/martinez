@@ -1,7 +1,5 @@
 use crate::{
     accessors::chain,
-    etl::collector::{Collector, OPTIMAL_BUFFER_CAPACITY},
-    kv::tables,
     models::*,
     stagedsync::stage::{ExecOutput, Stage, StageInput, UnwindInput},
     MutableTransaction, StageId,
@@ -24,7 +22,6 @@ const BUFFER_SIZE: u64 = 5000;
 
 async fn process_block<'db: 'tx, 'tx, RwTx>(
     tx: &'tx mut RwTx,
-    collector: &mut Collector<tables::TxSender>,
     height: BlockNumber,
 ) -> anyhow::Result<()>
 where
@@ -43,9 +40,7 @@ where
         senders.push(tx.recover_sender()?);
     }
 
-    chain::tx_sender::write_to_etl(collector, body.base_tx_id, &senders);
-
-    Ok(())
+    chain::tx_sender::write(tx, body.base_tx_id, &senders).await
 }
 
 #[derive(Debug)]
@@ -75,23 +70,17 @@ where
             .unwrap_or_default();
         let to_height = cmp::min(max_height, from_height + BUFFER_SIZE);
 
-        let made_progress = to_height > from_height;
-
-        if made_progress {
-            let mut collector = Collector::new(OPTIMAL_BUFFER_CAPACITY);
-
-            for height in from_height + 1..=to_height {
-                process_block(tx, &mut collector, height)
-                    .await
-                    .with_context(|| format!("Failed to recover senders for block {}", height))?;
-            }
-
-            let mut write_cursor = tx.mutable_cursor(&tables::TxSender.erased()).await?;
-            collector.load(&mut write_cursor).await?;
+        let mut height = from_height;
+        while height < to_height {
+            process_block(tx, height + 1)
+                .await
+                .with_context(|| format!("Failed to recover senders for block {}", height + 1))?;
+            height.0 += 1;
         }
 
+        let made_progress = height > from_height;
         Ok(ExecOutput::Progress {
-            stage_progress: to_height,
+            stage_progress: height,
             done: !made_progress,
             must_commit: made_progress,
         })
@@ -125,7 +114,7 @@ mod tests {
         let recipient2 = H160::from(hex!("d7fa8303df7073290f66ced1add5fe89dac0c462"));
 
         let block1 = BodyForStorage {
-            base_tx_id: 1.into(),
+            base_tx_id: 1,
             tx_amount: 2,
             uncles: vec![],
         };
@@ -175,7 +164,7 @@ mod tests {
         };
 
         let block2 = BodyForStorage {
-            base_tx_id: 3.into(),
+            base_tx_id: 3,
             tx_amount: 3,
             uncles: vec![],
         };
@@ -247,7 +236,7 @@ mod tests {
         };
 
         let block3 = BodyForStorage {
-            base_tx_id: 6.into(),
+            base_tx_id: 6,
             tx_amount: 0,
             uncles: vec![],
         };

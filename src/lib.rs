@@ -3,7 +3,6 @@
     destructuring_assignment,
     entry_insert,
     generic_associated_types,
-    generic_const_exprs,
     linked_list_cursors,
     never_type,
     step_trait,
@@ -14,7 +13,6 @@
     dead_code,
     incomplete_features,
     clippy::mutable_key_type,
-    clippy::type_complexity,
     clippy::unused_io_amount
 )]
 
@@ -24,6 +22,7 @@ mod bitmapdb;
 pub mod chain;
 mod changeset;
 pub mod crypto;
+mod dbutils;
 pub mod downloader;
 pub mod etl;
 pub mod execution;

@@ -6,17 +6,18 @@ use std::{
 };
 use tempfile::tempfile;
 
-#[derive(Eq, Clone, PartialEq, PartialOrd, Ord)]
-pub struct Entry<Key, Value> {
-    pub key: Key,
-    pub value: Value,
-    pub id: usize,
+pub trait Provider {
+    fn new(buffer: Vec<Entry>, id: usize) -> anyhow::Result<Self, std::io::Error>
+    where
+        Self: Sized;
+    fn to_next(&mut self) -> anyhow::Result<(Vec<u8>, Vec<u8>)>;
 }
 
-impl<Key, Value> Entry<Key, Value> {
-    pub fn new(key: Key, value: Value) -> Self {
-        Self { key, value, id: 0 }
-    }
+#[derive(Eq, Clone, PartialEq, PartialOrd, Ord)]
+pub struct Entry {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+    pub id: usize,
 }
 
 pub struct DataProvider {
@@ -24,26 +25,17 @@ pub struct DataProvider {
     pub id: usize,
 }
 
-impl DataProvider {
-    pub fn new<Key, Value>(
-        buffer: Vec<Entry<Key, Value>>,
-        id: usize,
-    ) -> anyhow::Result<DataProvider, std::io::Error>
+impl Provider for DataProvider {
+    fn new(buffer: Vec<Entry>, id: usize) -> anyhow::Result<DataProvider, std::io::Error>
     where
         Self: Sized,
-        Key: AsRef<[u8]>,
-        Value: AsRef<[u8]>,
     {
         let mut file = tempfile()?;
-
         for entry in buffer {
-            let k = entry.key.as_ref();
-            let v = entry.value.as_ref();
-
-            file.write(&k.len().to_be_bytes())?;
-            file.write(&v.len().to_be_bytes())?;
-            file.write(k)?;
-            file.write(v)?;
+            file.write(&entry.key.len().to_be_bytes())?;
+            file.write(&entry.value.len().to_be_bytes())?;
+            file.write(&entry.key)?;
+            file.write(&entry.value)?;
         }
         // Reset position at 0 byte
         file.seek(SeekFrom::Start(0))?;
@@ -51,7 +43,7 @@ impl DataProvider {
     }
 
     #[allow(clippy::wrong_self_convention)]
-    pub fn to_next(&mut self) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    fn to_next(&mut self) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
         let mut buffer_key_length = [0; 8];
         let mut buffer_value_length = [0; 8];
 

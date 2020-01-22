@@ -4,6 +4,7 @@ use crate::{
     kv::traits::MutableTransaction,
 };
 use parking_lot::lock_api::RwLockUpgradableReadGuard;
+use sha3::Digest;
 use std::{cell::RefCell, ops::DerefMut, sync::Arc};
 use tokio::sync::watch;
 use tracing::*;
@@ -67,11 +68,10 @@ impl<DB: kv::traits::MutableKV> SaveStage<DB> {
         let tx = self.db.begin_mutable().await?;
         if let Some(headers) = slice.headers.as_ref() {
             for header in headers {
-                tx.set(
-                    &kv::tables::Header,
-                    ((header.number, header.hash()), header.clone()),
-                )
-                .await?;
+                let table = &kv::tables::Header;
+                let value = rlp::encode(header);
+                let key = sha3::Keccak256::digest(&value);
+                tx.set(table, &key, &value).await?;
             }
         }
         tx.commit().await

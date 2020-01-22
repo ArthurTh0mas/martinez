@@ -1,62 +1,57 @@
-use crate::{
-    changeset::*,
-    kv::{tables::BitmapKey, *},
-    models::*,
-    read_account_storage, Cursor, Transaction,
-};
+use crate::{changeset::*, dbutils, dbutils::*, kv::*, models::*, Cursor, Transaction};
+use arrayref::array_ref;
+use bytes::Bytes;
 use ethereum_types::*;
+use roaring::RoaringTreemap;
 
 pub async fn get_account_data_as_of<'db: 'tx, 'tx, Tx: Transaction<'db>>(
     tx: &'tx Tx,
     address: Address,
     timestamp: BlockNumber,
-) -> anyhow::Result<Option<EncodedAccount>> {
+) -> anyhow::Result<Option<Bytes<'tx>>> {
     if let Some(v) = find_data_by_history(tx, address, timestamp).await? {
         return Ok(Some(v));
     }
 
-    tx.get(&tables::PlainState, tables::PlainStateKey::Account(address))
-        .await
-        .map(|opt| opt.map(From::from))
+    tx.get(&tables::PlainState, address.as_fixed_bytes()).await
 }
 
 pub async fn get_storage_as_of<'db: 'tx, 'tx, Tx: Transaction<'db>>(
     tx: &'tx Tx,
     address: Address,
     incarnation: Incarnation,
-    location: H256,
+    key: H256,
     block_number: impl Into<BlockNumber>,
-) -> anyhow::Result<Option<H256>> {
-    if let Some(v) =
-        find_storage_by_history(tx, address, incarnation, location, block_number.into()).await?
-    {
+) -> anyhow::Result<Option<Bytes<'tx>>> {
+    let key = plain_generate_composite_storage_key(address, incarnation, key);
+    if let Some(v) = find_storage_by_history(tx, key, block_number.into()).await? {
         return Ok(Some(v));
     }
 
-    read_account_storage(tx, address, incarnation, location).await
+    tx.get(&tables::PlainState, &key).await
 }
 
 pub async fn find_data_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
     tx: &'tx Tx,
     address: Address,
     block_number: BlockNumber,
-) -> anyhow::Result<Option<EncodedAccount>> {
+) -> anyhow::Result<Option<Bytes<'tx>>> {
     let mut ch = tx.cursor(&tables::AccountHistory).await?;
     if let Some((k, v)) = ch
-        .seek(BitmapKey {
-            inner: address,
-            block_number,
-        })
+        .seek(&AccountHistory::index_chunk_key(address, block_number))
         .await?
     {
-        if k.inner == address {
-            let change_set_block = v.iter().find(|n| *n >= *block_number);
+        if k.starts_with(address.as_fixed_bytes()) {
+            let change_set_block = RoaringTreemap::deserialize_from(&*v)?
+                .into_iter()
+                .find(|n| *n >= *block_number);
 
             let data = {
                 if let Some(change_set_block) = change_set_block {
                     let data = {
                         let mut c = tx.cursor_dup_sort(&tables::AccountChangeSet).await?;
-                        AccountHistory::find(&mut c, BlockNumber(change_set_block), address).await?
+                        AccountHistory::find(&mut c, BlockNumber(change_set_block), &address)
+                            .await?
                     };
 
                     if let Some(data) = data {
@@ -73,15 +68,18 @@ pub async fn find_data_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
             if let Some(mut acc) = Account::decode_for_storage(&*data)? {
                 if acc.incarnation.0 > 0 && acc.code_hash == EMPTY_HASH {
                     if let Some(code_hash) = tx
-                        .get(&tables::PlainCodeHash, (address, acc.incarnation))
+                        .get(
+                            &tables::PlainCodeHash,
+                            &dbutils::plain_generate_storage_prefix(address, acc.incarnation),
+                        )
                         .await?
                     {
-                        acc.code_hash = code_hash;
+                        acc.code_hash = H256(*array_ref![&*code_hash, 0, 32]);
                     }
 
                     let data = acc.encode_for_storage(false);
 
-                    return Ok(Some(data));
+                    return Ok(Some(data.into()));
                 }
             }
 
@@ -94,34 +92,30 @@ pub async fn find_data_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
 
 pub async fn find_storage_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
     tx: &'tx Tx,
-    address: Address,
-    incarnation: Incarnation,
-    location: H256,
+    key: PlainCompositeStorageKey,
     timestamp: BlockNumber,
-) -> anyhow::Result<Option<H256>> {
+) -> anyhow::Result<Option<Bytes<'tx>>> {
     let mut ch = tx.cursor(&tables::StorageHistory).await?;
     if let Some((k, v)) = ch
-        .seek(BitmapKey {
-            inner: (address, location),
-            block_number: timestamp,
-        })
+        .seek(&StorageHistory::index_chunk_key(key, timestamp))
         .await?
     {
-        if k.inner.0 != address || k.inner.1 != location {
+        if k[..ADDRESS_LENGTH] != key[..ADDRESS_LENGTH]
+            || k[ADDRESS_LENGTH..ADDRESS_LENGTH + KECCAK_LENGTH]
+                != key[ADDRESS_LENGTH + INCARNATION_LENGTH..]
+        {
             return Ok(None);
         }
-        let change_set_block = v.iter().find(|n| *n >= *timestamp);
+        let change_set_block = RoaringTreemap::deserialize_from(&*v)?
+            .into_iter()
+            .find(|n| *n >= *timestamp);
 
         let data = {
             if let Some(change_set_block) = change_set_block {
                 let data = {
                     let mut c = tx.cursor_dup_sort(&tables::StorageChangeSet).await?;
-                    StorageHistory::find(
-                        &mut c,
-                        change_set_block.into(),
-                        (address, incarnation, location),
-                    )
-                    .await?
+                    find_storage_with_incarnation(&mut c, BlockNumber(change_set_block), &key)
+                        .await?
                 };
 
                 if let Some(data) = data {
@@ -143,15 +137,7 @@ pub async fn find_storage_by_history<'db: 'tx, 'tx, Tx: Transaction<'db>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        bitmapdb, crypto,
-        kv::{
-            tables::{StorageChangeKey, StorageChangeSeekKey},
-            traits::{ttw, MutableKV},
-        },
-        state::database::*,
-        MutableTransaction,
-    };
+    use crate::{bitmapdb, crypto, kv::traits::MutableKV, state::database::*, MutableTransaction};
     use pin_utils::pin_mut;
     use std::collections::HashMap;
     use tokio_stream::StreamExt;
@@ -190,7 +176,7 @@ mod tests {
         block_writer.write_history().await.unwrap();
 
         let mut cursor = tx.cursor(&tables::AccountChangeSet).await.unwrap();
-        let s = cursor.walk(None);
+        let s = cursor.walk(&[], |_, _| true);
 
         pin_mut!(s);
 
@@ -201,19 +187,21 @@ mod tests {
 
         assert_eq!(addrs.len(), i);
 
-        let index = bitmapdb::get(&tx, &tables::AccountHistory, addrs[0], 0, u64::MAX)
-            .await
-            .unwrap();
+        let index = bitmapdb::get(
+            &tx,
+            &tables::AccountHistory,
+            &addrs[0].to_fixed_bytes(),
+            0,
+            u64::MAX,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(index.iter().next(), Some(1));
 
         let mut cursor = tx.cursor(&tables::StorageChangeSet).await.unwrap();
-        let bn = BlockNumber(1);
-        let s = cursor
-            .walk(Some(StorageChangeSeekKey::Block(bn)))
-            .take_while(ttw(|(StorageChangeKey { block_number, .. }, _)| {
-                *block_number == bn
-            }));
+        let bn = BlockNumber(1).db_key();
+        let s = cursor.walk(&bn, |key, _| key.starts_with(&bn));
 
         pin_mut!(s);
 
@@ -225,15 +213,9 @@ mod tests {
         assert_eq!(count, 0, "changeset must be deleted");
 
         assert_eq!(
-            tx.get(
-                &tables::AccountHistory,
-                BitmapKey {
-                    inner: addrs[0],
-                    block_number: bn
-                }
-            )
-            .await
-            .unwrap(),
+            tx.get(&tables::AccountHistory, &addrs[0].to_fixed_bytes())
+                .await
+                .unwrap(),
             None,
             "account must be deleted"
         );
@@ -258,40 +240,33 @@ mod tests {
         let mut plain_state = tx.cursor(&tables::PlainState).await.unwrap();
 
         for i in 0..num_of_accounts {
-            let a = addrs[i];
-            let acc = read_account_data(&tx, a).await.unwrap().unwrap();
+            let address = addrs[i];
+            let acc = read_account_data(&tx, address).await.unwrap().unwrap();
 
             assert_eq!(acc_state[i], acc);
 
-            let index = bitmapdb::get(&tx, &tables::AccountHistory, a, 0, u64::MAX)
-                .await
-                .unwrap();
+            let index = bitmapdb::get(
+                &tx,
+                &tables::AccountHistory,
+                address.as_bytes(),
+                0,
+                u64::MAX,
+            )
+            .await
+            .unwrap();
 
             assert_eq!(index.iter().next().unwrap(), 2);
             assert_eq!(index.len(), 1);
 
+            let prefix = plain_generate_storage_prefix(address, acc.incarnation);
             let res_account_storage = plain_state
-                .walk(Some(tables::PlainStateSeekKey::StorageWithIncarnation(
-                    a,
-                    acc.incarnation,
-                )))
-                .take_while(ttw(|fv: &tables::PlainStateFusedValue| {
-                    if let tables::PlainStateFusedValue::Storage {
-                        address,
-                        incarnation,
-                        ..
-                    } = fv
-                    {
-                        if *address == a && *incarnation == acc.incarnation {
-                            return true;
-                        }
-                    }
-
-                    false
-                }))
+                .walk(&prefix, |key, _| key.starts_with(&prefix))
                 .fold(HashMap::new(), |mut accum, res| {
-                    let (_, _, location, value) = res.unwrap().as_storage().unwrap();
-                    accum.insert(location, value);
+                    let (k, v) = res.unwrap();
+                    accum.insert(
+                        H256::from_slice(&k[ADDRESS_LENGTH + 8..]),
+                        U256::from_big_endian(&v),
+                    );
                     accum
                 })
                 .await;
@@ -301,21 +276,22 @@ mod tests {
             for (&key, &v) in &acc_history_state_storage[i] {
                 assert_eq!(
                     v,
-                    get_storage_as_of(&tx, a, acc.incarnation, key, 1)
-                        .await
-                        .unwrap()
-                        .unwrap()
+                    U256::from_big_endian(
+                        &get_storage_as_of(&tx, address, acc.incarnation, key, 1)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                    )
                 );
             }
         }
 
-        let bn = BlockNumber(2);
+        let bn = encode_block_number(2);
         let changeset_in_db = tx
             .cursor(&tables::AccountChangeSet)
             .await
             .unwrap()
-            .walk(Some(bn))
-            .take_while(ttw(|(key, _)| *key == bn))
+            .walk(&bn, |key, _| key.starts_with(&bn))
             .map(|res| {
                 let (k, v) = res.unwrap();
                 AccountHistory::decode(k, v).1
@@ -328,20 +304,17 @@ mod tests {
         let mut expected_changeset = AccountChangeSet::new();
         for i in 0..num_of_accounts {
             let b = acc_history[i].encode_for_storage(true);
-            expected_changeset.insert((addrs[i], b));
+            expected_changeset.insert(Change::new(addrs[i], b.into()));
         }
 
         assert_eq!(changeset_in_db, expected_changeset);
 
-        let bn = BlockNumber(2);
+        let bn = encode_block_number(2);
         let cs = tx
             .cursor(&tables::StorageChangeSet)
             .await
             .unwrap()
-            .walk(Some(StorageChangeSeekKey::Block(bn)))
-            .take_while(ttw(|(StorageChangeKey { block_number, .. }, _)| {
-                *block_number == bn
-            }))
+            .walk(&bn, |key, _| key.starts_with(&bn))
             .map(|res| {
                 let (k, v) = res.unwrap();
                 StorageHistory::decode(k, v).1
@@ -358,9 +331,12 @@ mod tests {
         for (i, &address) in addrs.iter().enumerate() {
             for j in 0..num_of_state_keys {
                 let key = H256::from_slice(&hex::decode(format!("{:0>64}", i * 100 + j)).unwrap());
-                let value = H256::from_low_u64_be(10 + j as u64);
+                let value = value_to_bytes(U256::from(10 + j as u64)).to_vec().into();
 
-                expected_changeset.insert(((address, acc_history[i].incarnation, key), value));
+                expected_changeset.insert(Change::new(
+                    plain_generate_composite_storage_key(address, acc_history[i].incarnation, key),
+                    value,
+                ));
             }
         }
 
@@ -378,9 +354,9 @@ mod tests {
     ) -> (
         Vec<Address>,
         Vec<Account>,
-        Vec<HashMap<H256, H256>>,
+        Vec<HashMap<H256, U256>>,
         Vec<Account>,
-        Vec<HashMap<H256, H256>>,
+        Vec<HashMap<H256, U256>>,
     ) {
         let mut addrs = vec![];
         let mut acc_state = vec![];
@@ -409,13 +385,13 @@ mod tests {
             acc_history_state_storage.push(HashMap::new());
             for j in 0..num_of_state_keys {
                 let key = H256::from_slice(&hex::decode(format!("{:0>64}", i * 100 + j)).unwrap());
-                let new_value = H256::from_low_u64_be(j as u64);
+                let new_value = U256::from(j as usize);
                 if !new_value.is_zero() {
                     // Empty value is not considered to be present
                     acc_state_storage[i].insert(key, new_value);
                 }
 
-                let value = H256::from_low_u64_be(10 + j as u64);
+                let value = (10 + j as u64).into();
                 acc_history_state_storage[i].insert(key, value);
                 block_writer
                     .write_account_storage(

@@ -26,7 +26,7 @@ async fn blockhashes(chaindata: PathBuf) -> anyhow::Result<()> {
     let env = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_rw(
         mdbx::Environment::new(),
         &chaindata,
-        martinez::kv::tables::CHAINDATA_TABLES.clone(),
+        &martinez::kv::tables::TABLE_MAP,
     )?;
 
     let mut staged_sync = stagedsync::StagedSync::new();
@@ -38,7 +38,7 @@ async fn table_sizes(chaindata: PathBuf, csv: bool) -> anyhow::Result<()> {
     let env = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
         mdbx::Environment::new(),
         &chaindata,
-        Default::default(),
+        2,
     )?;
     let mut sizes = env
         .begin(0)

@@ -1,4 +1,3 @@
-#![allow(clippy::suspicious_else_formatting)]
 use martinez::{
     chain::{
         blockchain::Blockchain,
