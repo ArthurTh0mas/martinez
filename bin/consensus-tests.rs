@@ -416,10 +416,7 @@ enum Status {
 }
 
 #[instrument]
-async fn init_pre_state<'storage, S: State<'storage>>(
-    pre: &HashMap<Address, AccountState>,
-    state: &mut S,
-) {
+async fn init_pre_state<S: State>(pre: &HashMap<Address, AccountState>, state: &mut S) {
     for (address, j) in pre {
         let mut account = Account {
             balance: j.balance,
@@ -436,7 +433,7 @@ async fn init_pre_state<'storage, S: State<'storage>>(
                     *address,
                     account.incarnation,
                     account.code_hash,
-                    j.code.clone(),
+                    j.code.clone().into(),
                 )
                 .await
                 .unwrap();
@@ -474,13 +471,12 @@ struct BlockCommon {
 }
 
 #[instrument(skip(block_common, blockchain))]
-async fn run_block<'storage: 'state, 'state, S, C>(
+async fn run_block<'state, C>(
     consensus: &C,
     block_common: &BlockCommon,
-    blockchain: &mut Blockchain<'storage, 'state, S>,
+    blockchain: &mut Blockchain<'state>,
 ) -> anyhow::Result<()>
 where
-    S: State<'storage>,
     C: Consensus,
 {
     let block = rlp::decode::<Block>(&block_common.rlp)?;
@@ -497,11 +493,11 @@ where
 }
 
 #[instrument]
-async fn post_check<'storage, S: State<'storage>>(
-    state: &S,
+async fn post_check(
+    state: &InMemoryState,
     expected: &HashMap<Address, AccountState>,
 ) -> anyhow::Result<()> {
-    let number_of_accounts = state.number_of_accounts().await.unwrap();
+    let number_of_accounts = state.number_of_accounts();
     let expected_number_of_accounts: u64 = expected.len().try_into().unwrap();
     if number_of_accounts != expected_number_of_accounts {
         bail!(
@@ -543,10 +539,7 @@ async fn post_check<'storage, S: State<'storage>>(
             hex::encode(&expected_account_state.code)
         );
 
-        let storage_size = state
-            .storage_size(address, account.incarnation)
-            .await
-            .unwrap();
+        let storage_size = state.storage_size(address, account.incarnation);
 
         let expected_storage_size: u64 = expected_account_state.storage.len().try_into().unwrap();
         ensure!(
@@ -613,7 +606,7 @@ async fn blockchain_test(testdata: BlockchainTest, _: Option<ChainConfig>) -> an
     }
 
     if let Some(expected_hash) = testdata.post_state_hash {
-        let state_root = state.state_root_hash().await.unwrap();
+        let state_root = state.state_root_hash();
 
         ensure!(
             state_root == expected_hash,

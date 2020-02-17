@@ -1,34 +1,22 @@
 use crate::{
-    accessors, h256_to_u256,
-    kv::{
-        tables::{self, AccountChange, StorageChange, StorageChangeKey},
-        traits::*,
-    },
-    models::*,
-    state::database::*,
-    u256_to_h256, State,
+    accessors,
+    kv::tables,
+    models::{Receipt, *},
+    MutableTransaction, State, Transaction,
 };
 use async_trait::async_trait;
-use bytes::Bytes;
+use ethereum_types::{Address, H256, *};
+use static_bytes::Bytes;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     marker::PhantomData,
 };
-use tokio::pin;
-use tokio_stream::StreamExt;
-use tracing::*;
 
 // address -> storage-encoded initial value
-pub type AccountChanges = BTreeMap<Address, Option<Account>>;
+pub type AccountChanges = BTreeMap<Address, EncodedAccount>;
 
-// address -> location -> zeroless initial value
-pub type StorageChanges = BTreeMap<Address, BTreeMap<U256, U256>>;
-
-#[derive(Default, Debug)]
-struct OverlayStorage {
-    erased: bool,
-    slots: HashMap<U256, U256>,
-}
+// address -> incarnation -> location -> zeroless initial value
+pub type StorageChanges = BTreeMap<Address, BTreeMap<Incarnation, BTreeMap<H256, H256>>>;
 
 #[derive(Debug)]
 pub struct Buffer<'db, 'tx, Tx>
@@ -44,14 +32,17 @@ where
 
     accounts: HashMap<Address, Option<Account>>,
 
-    // address -> location -> value
-    storage: HashMap<Address, OverlayStorage>,
+    // address -> incarnation -> location -> value
+    storage: HashMap<Address, BTreeMap<Incarnation, HashMap<H256, H256>>>,
 
     account_changes: BTreeMap<BlockNumber, AccountChanges>, // per block
     storage_changes: BTreeMap<BlockNumber, StorageChanges>, // per block
 
+    incarnations: BTreeMap<Address, Incarnation>,
     hash_to_code: BTreeMap<H256, Bytes>,
-    logs: BTreeMap<(BlockNumber, TxIndex), Vec<Log>>,
+    storage_prefix_to_code_hash: BTreeMap<(Address, Incarnation), H256>,
+    receipts: BTreeMap<BlockNumber, Vec<Receipt>>,
+    logs: BTreeMap<(BlockNumber, u64), Vec<Log>>,
 
     // Current block stuff
     block_number: BlockNumber,
@@ -77,17 +68,13 @@ where
             storage: Default::default(),
             account_changes: Default::default(),
             storage_changes: Default::default(),
+            incarnations: Default::default(),
             hash_to_code: Default::default(),
+            storage_prefix_to_code_hash: Default::default(),
+            receipts: Default::default(),
             logs: Default::default(),
             block_number: Default::default(),
             changed_storage: Default::default(),
-        }
-    }
-
-    pub fn insert_receipts(&mut self, block_number: BlockNumber, receipts: Vec<Receipt>) {
-        for (i, receipt) in receipts.into_iter().enumerate() {
-            self.logs
-                .insert((block_number, TxIndex(i.try_into().unwrap())), receipt.logs);
         }
     }
 }
@@ -100,10 +87,16 @@ where
 {
     async fn read_account(&self, address: Address) -> anyhow::Result<Option<Account>> {
         if let Some(account) = self.accounts.get(&address) {
-            return Ok(*account);
+            return Ok(account.clone());
         }
 
-        accessors::state::account::read(self.txn, address, self.historical_block).await
+        if let Some(enc) =
+            crate::state::get_account_data_as_of(self.txn, address, self.block_number + 1).await?
+        {
+            return Account::decode_for_storage(&enc);
+        }
+
+        Ok(None)
     }
 
     async fn read_code(&self, code_hash: H256) -> anyhow::Result<Bytes> {
@@ -112,78 +105,48 @@ where
         } else {
             Ok(self
                 .txn
-                .get(tables::Code, code_hash)
+                .get(&tables::Code, code_hash)
                 .await?
                 .map(From::from)
                 .unwrap_or_default())
         }
     }
 
-    async fn read_storage(&self, address: Address, location: U256) -> anyhow::Result<U256> {
-        if let Some(account_storage) = self.storage.get(&address) {
-            if let Some(value) = account_storage.slots.get(&location) {
-                return Ok(*value);
-            } else if account_storage.erased {
-                return Ok(U256::ZERO);
+    async fn read_storage(
+        &self,
+        address: Address,
+        incarnation: Incarnation,
+        location: H256,
+    ) -> anyhow::Result<H256> {
+        if let Some(it1) = self.storage.get(&address) {
+            if let Some(it2) = it1.get(&incarnation) {
+                if let Some(it3) = it2.get(&location) {
+                    return Ok(*it3);
+                }
             }
         }
 
-        accessors::state::storage::read(self.txn, address, location, self.historical_block).await
+        accessors::state::storage::read(
+            self.txn,
+            address,
+            incarnation,
+            location,
+            self.historical_block,
+        )
+        .await
     }
 
-    async fn erase_storage(&mut self, address: Address) -> anyhow::Result<()> {
-        let mut mark_database_as_discarded = false;
-        let overlay_storage = self.storage.entry(address).or_insert_with(|| {
-            // If we don't have any overlay storage, we must mark slots in database as zeroed.
-            mark_database_as_discarded = true;
-
-            OverlayStorage {
-                erased: true,
-                slots: Default::default(),
-            }
-        });
-
-        let storage_changes = self
-            .storage_changes
-            .entry(self.block_number)
-            .or_default()
-            .entry(address)
-            .or_default();
-
-        for (slot, value) in overlay_storage.slots.drain() {
-            storage_changes.insert(slot, value);
+    // Previous non-zero incarnation of an account; 0 if none exists.
+    async fn previous_incarnation(&self, address: Address) -> anyhow::Result<Incarnation> {
+        if let Some(inc) = self.incarnations.get(&address).copied() {
+            return Ok(inc);
         }
 
-        if !overlay_storage.erased {
-            // If we haven't erased before, we also must mark unmodified slots as zeroed.
-            mark_database_as_discarded = true;
-            overlay_storage.erased = true;
-        }
-
-        if mark_database_as_discarded {
-            let mut storage_table = self.txn.cursor_dup_sort(tables::Storage).await?;
-
-            let walker = walk(&mut storage_table, Some(address));
-            pin!(walker);
-
-            let storage_changes = self
-                .storage_changes
-                .entry(self.block_number)
-                .or_default()
-                .entry(address)
-                .or_default();
-
-            while let Some((a, (slot, initial))) = walker.try_next().await? {
-                if a != address {
-                    break;
-                }
-
-                // Only insert slot from db if it's not in storage buffer yet.
-                storage_changes.entry(h256_to_u256(slot)).or_insert(initial);
-            }
-        }
-
-        Ok(())
+        Ok(
+            accessors::state::read_previous_incarnation(self.txn, address, self.historical_block)
+                .await?
+                .unwrap_or_else(|| 0.into()),
+        )
     }
 
     async fn read_header(
@@ -202,12 +165,37 @@ where
         accessors::chain::block_body::read_without_senders(self.txn, block_hash, block_number).await
     }
 
+    async fn read_body_with_senders(
+        &self,
+        block_number: BlockNumber,
+        block_hash: H256,
+    ) -> anyhow::Result<Option<BlockBodyWithSenders>> {
+        accessors::chain::block_body::read_with_senders(self.txn, block_hash, block_number).await
+    }
+
     async fn total_difficulty(
         &self,
         block_number: BlockNumber,
         block_hash: H256,
     ) -> anyhow::Result<Option<U256>> {
         accessors::chain::td::read(self.txn, block_hash, block_number).await
+    }
+
+    async fn insert_receipts(
+        &mut self,
+        block_number: BlockNumber,
+        receipts: Vec<Receipt>,
+    ) -> anyhow::Result<()> {
+        for (i, receipt) in receipts.iter().enumerate() {
+            if !receipt.logs.is_empty() {
+                self.logs
+                    .insert((block_number, i as u64), receipt.logs.clone());
+            }
+        }
+
+        self.receipts.insert(block_number, receipts);
+
+        Ok(())
     }
 
     /// State changes
@@ -220,35 +208,58 @@ where
         self.changed_storage.clear();
     }
 
-    fn update_account(
+    async fn update_account(
         &mut self,
         address: Address,
         initial: Option<Account>,
         current: Option<Account>,
-    ) {
+    ) -> anyhow::Result<()> {
         let equal = current == initial;
         let account_deleted = current.is_none();
 
         if equal && !account_deleted && !self.changed_storage.contains(&address) {
-            return;
+            return Ok(());
         }
 
         if self.block_number >= self.prune_from {
+            let mut encoded_initial = EncodedAccount::default();
+            if let Some(initial) = &initial {
+                let omit_code_hash = !account_deleted;
+                encoded_initial = initial.encode_for_storage(omit_code_hash);
+            }
+
             self.account_changes
                 .entry(self.block_number)
                 .or_default()
-                .insert(address, initial);
+                .insert(address, encoded_initial);
         }
 
         if equal {
-            return;
+            return Ok(());
         }
 
         self.accounts.insert(address, current);
+
+        if account_deleted {
+            let initial = initial.expect("deleted account must have existed before");
+            if initial.incarnation.0 > 0 {
+                self.incarnations.insert(address, initial.incarnation);
+            }
+        }
+
+        Ok(())
     }
 
-    async fn update_code(&mut self, code_hash: H256, code: Bytes) -> anyhow::Result<()> {
+    async fn update_account_code(
+        &mut self,
+        address: Address,
+        incarnation: Incarnation,
+        code_hash: H256,
+        code: Bytes,
+    ) -> anyhow::Result<()> {
         self.hash_to_code.insert(code_hash, code);
+        self.storage_prefix_to_code_hash
+            .insert((address, incarnation), code_hash);
 
         Ok(())
     }
@@ -256,9 +267,10 @@ where
     async fn update_storage(
         &mut self,
         address: Address,
-        location: U256,
-        initial: U256,
-        current: U256,
+        incarnation: Incarnation,
+        location: H256,
+        initial: H256,
+        current: H256,
     ) -> anyhow::Result<()> {
         if current == initial {
             return Ok(());
@@ -271,13 +283,16 @@ where
                 .or_default()
                 .entry(address)
                 .or_default()
+                .entry(incarnation)
+                .or_default()
                 .insert(location, initial);
         }
 
         self.storage
             .entry(address)
             .or_default()
-            .slots
+            .entry(incarnation)
+            .or_default()
             .insert(location, current);
 
         Ok(())
@@ -289,124 +304,20 @@ where
     'db: 'tx,
     Tx: MutableTransaction<'db>,
 {
-    pub async fn write_history(&mut self) -> anyhow::Result<()> {
-        debug!("Writing account changes");
-        let mut account_change_table = self
-            .txn
-            .mutable_cursor_dupsort(tables::AccountChangeSet)
-            .await?;
-        for (block_number, account_entries) in std::mem::take(&mut self.account_changes) {
-            for (address, account) in account_entries {
-                account_change_table
-                    .append_dup(block_number, AccountChange { address, account })
-                    .await?;
-            }
-        }
-
-        debug!("Writing storage changes");
-        let mut storage_change_table = self
-            .txn
-            .mutable_cursor_dupsort(tables::StorageChangeSet)
-            .await?;
-        for (block_number, storage_entries) in std::mem::take(&mut self.storage_changes) {
-            for (address, storage_entries) in storage_entries {
-                for (location, value) in storage_entries {
-                    let location = u256_to_h256(location);
-                    storage_change_table
-                        .append_dup(
-                            StorageChangeKey {
-                                block_number,
-                                address,
-                            },
-                            StorageChange { location, value },
-                        )
-                        .await?;
-                }
-            }
-        }
-
-        debug!("Writing logs");
-        let mut log_table = self.txn.mutable_cursor(tables::Log).await?;
-        for ((block_number, idx), logs) in std::mem::take(&mut self.logs) {
-            log_table.append((block_number, idx), logs).await?;
-        }
-
-        debug!("History write complete");
-
-        Ok(())
-    }
-
-    pub async fn write_to_db(mut self) -> anyhow::Result<()> {
-        self.write_history().await?;
-
-        // Write to state tables
-        let mut account_table = self.txn.mutable_cursor(tables::Account).await?;
-        let mut storage_table = self.txn.mutable_cursor_dupsort(tables::Storage).await?;
-
-        debug!("Writing accounts");
-        let mut account_addresses = self.accounts.keys().collect::<Vec<_>>();
-        account_addresses.sort_unstable();
-        let mut written_accounts = 0;
-        for &address in account_addresses {
-            let account = self.accounts[&address];
-
-            if let Some(account) = account {
-                account_table.upsert(address, account).await?;
-            } else if account_table.seek_exact(address).await?.is_some() {
-                account_table.delete_current().await?;
-            }
-
-            written_accounts += 1;
-            if written_accounts % 500_000 == 0 {
-                debug!(
-                    "Written {} updated acccounts, current entry: {}",
-                    written_accounts, address
-                )
-            }
-        }
-
-        debug!("Writing {} accounts complete", written_accounts);
-
-        debug!("Writing storage");
-        let mut storage_addresses = self.storage.keys().collect::<Vec<_>>();
-        storage_addresses.sort_unstable();
-        let mut written_slots = 0;
-        for &address in storage_addresses {
-            let overlay_storage = &self.storage[&address];
-
-            if overlay_storage.erased && storage_table.seek_exact(address).await?.is_some() {
-                storage_table.delete_current_duplicates().await?;
-            }
-
-            for (&k, &v) in &overlay_storage.slots {
-                upsert_storage_value(&mut storage_table, address, k, v).await?;
-
-                written_slots += 1;
-                if written_slots % 500_000 == 0 {
-                    debug!(
-                        "Written {} storage slots, current entry: address {}, slot {}",
-                        written_slots, address, k
-                    );
-                }
-            }
-        }
-
-        debug!("Writing {} slots complete", written_slots);
-
-        debug!("Writing code");
-        let mut code_table = self.txn.mutable_cursor(tables::Code).await?;
-        for (code_hash, code) in self.hash_to_code {
-            code_table.upsert(code_hash, code).await?;
-        }
-
-        Ok(())
+    pub async fn write_to_db(self) -> anyhow::Result<()> {
+        todo!()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{h256_to_u256, kv::new_mem_database};
+    use crate::{
+        kv::{tables::PlainStateFusedValue, traits::*},
+        new_mem_database,
+        state::database::PlainStateCursorExt,
+        DEFAULT_INCARNATION,
+    };
     use hex_literal::hex;
 
     #[tokio::test]
@@ -416,30 +327,47 @@ mod tests {
 
         let address: Address = hex!("be00000000000000000000000000000000000000").into();
 
-        let location_a = H256(hex!(
-            "0000000000000000000000000000000000000000000000000000000000000013"
-        ));
-        let value_a1 = 0x6b.as_u256();
-        let value_a2 = 0x85.as_u256();
+        let location_a =
+            hex!("0000000000000000000000000000000000000000000000000000000000000013").into();
+        let value_a1 =
+            hex!("000000000000000000000000000000000000000000000000000000000000006b").into();
+        let value_a2 =
+            hex!("0000000000000000000000000000000000000000000000000000000000000085").into();
 
-        let location_b = H256(hex!(
-            "0000000000000000000000000000000000000000000000000000000000000002"
-        ));
-        let value_b = 0x132.as_u256();
+        let location_b =
+            hex!("0000000000000000000000000000000000000000000000000000000000000002").into();
+        let value_b =
+            hex!("0000000000000000000000000000000000000000000000000000000000000132").into();
 
-        txn.set(tables::Storage, address, (location_a, value_a1))
-            .await
-            .unwrap();
+        txn.set(
+            &tables::PlainState,
+            PlainStateFusedValue::Storage {
+                address,
+                incarnation: DEFAULT_INCARNATION,
+                location: location_a,
+                value: value_a1,
+            },
+        )
+        .await
+        .unwrap();
 
-        txn.set(tables::Storage, address, (location_b, value_b))
-            .await
-            .unwrap();
+        txn.set(
+            &tables::PlainState,
+            PlainStateFusedValue::Storage {
+                address,
+                incarnation: DEFAULT_INCARNATION,
+                location: location_b,
+                value: value_b,
+            },
+        )
+        .await
+        .unwrap();
 
         let mut buffer = Buffer::new(&txn, 0.into(), None);
 
         assert_eq!(
             buffer
-                .read_storage(address, h256_to_u256(location_a))
+                .read_storage(address, DEFAULT_INCARNATION, location_a)
                 .await
                 .unwrap(),
             value_a1
@@ -447,31 +375,31 @@ mod tests {
 
         // Update only location A
         buffer
-            .update_storage(address, h256_to_u256(location_a), value_a1, value_a2)
+            .update_storage(address, DEFAULT_INCARNATION, location_a, value_a1, value_a2)
             .await
             .unwrap();
         buffer.write_to_db().await.unwrap();
 
         // Location A should have the new value
-        let db_value_a = seek_storage_key(
-            &mut txn.cursor_dup_sort(tables::Storage).await.unwrap(),
-            address,
-            h256_to_u256(location_a),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let db_value_a = txn
+            .cursor_dup_sort(&tables::PlainState)
+            .await
+            .unwrap()
+            .seek_storage_key(address, DEFAULT_INCARNATION, location_a)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(db_value_a, value_a2);
 
         // Location B should not change
-        let db_value_b = seek_storage_key(
-            &mut txn.cursor_dup_sort(tables::Storage).await.unwrap(),
-            address,
-            h256_to_u256(location_b),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let db_value_b = txn
+            .cursor_dup_sort(&tables::PlainState)
+            .await
+            .unwrap()
+            .seek_storage_key(address, DEFAULT_INCARNATION, location_b)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(db_value_b, value_b);
     }
 }
