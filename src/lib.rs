@@ -31,6 +31,7 @@ pub mod models;
 pub mod stagedsync;
 pub mod stages;
 mod state;
+pub mod trie;
 pub(crate) mod util;
 
 pub use changeset::*;
