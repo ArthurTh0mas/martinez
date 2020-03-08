@@ -31,6 +31,7 @@ ethereum-interfaces = { git = "https://github.com/ledgerwatch/interfaces", featu
 ] }
 ethereum-types = "0.12"
 evmodin = { git = "https://github.com/vorot93/evmodin", branch = "nightly" }
+fixedbitset = "0.4"
 futures-core = "0.3"
 futures-util = "0.3"
 hash-db = "0.15"
