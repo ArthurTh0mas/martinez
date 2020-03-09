@@ -3,7 +3,7 @@ use crate::{
         collector::{Collector, OPTIMAL_BUFFER_CAPACITY},
         data_provider::Entry,
     },
-    kv::tables,
+    kv::*,
     stagedsync::stage::{ExecOutput, Stage, StageInput, UnwindInput},
     Cursor, MutableCursor, MutableTransaction, StageId,
 };
@@ -61,7 +61,7 @@ where
             pin!(walker_block_txs);
 
             while let Some((_, tx)) = walker_block_txs.try_next().await? {
-                collector.collect(Entry::new(tx.hash(), tables::TruncateStart(block_number)));
+                collector.collect(Entry::new(tx.hash(), TruncateStart(block_number)));
             }
         }
 

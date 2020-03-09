@@ -1,5 +1,5 @@
-use super::{consensus::*, difficulty::*, intrinsic_gas::*, protocol_param::param};
-use crate::{models::*, state::*};
+use super::{intrinsic_gas::*, protocol_param::param};
+use crate::{consensus::*, models::*, state::*};
 use anyhow::Context;
 use async_recursion::*;
 use ethereum_types::*;
@@ -101,13 +101,13 @@ impl std::error::Error for ValidationError {}
 pub fn pre_validate_transaction(
     txn: &TransactionMessage,
     block_number: impl Into<BlockNumber>,
-    config: &ChainConfig,
+    config: &BlockChainSpec,
     base_fee_per_gas: Option<U256>,
 ) -> Result<(), ValidationError> {
-    let rev = config.revision(block_number);
+    let rev = config.revision;
 
     if let Some(chain_id) = txn.chain_id() {
-        if rev < Revision::Spurious || chain_id != config.chain_id {
+        if rev < Revision::Spurious || chain_id != config.params.chain_id {
             return Err(ValidationError::WrongChainId);
         }
     }
@@ -162,39 +162,37 @@ where
 fn expected_base_fee_per_gas(
     header: &BlockHeader,
     parent: &BlockHeader,
-    config: &ChainConfig,
+    config: &BlockChainSpec,
 ) -> Option<U256> {
-    if let Some(fork_block) = config.london_block {
-        if header.number >= fork_block {
-            if header.number == fork_block {
-                return Some(param::INITIAL_BASE_FEE.into());
-            }
+    if config.revision >= Revision::London {
+        if config.active_transitions.contains(&Revision::London) {
+            return Some(param::INITIAL_BASE_FEE.into());
+        }
 
-            let parent_gas_target = parent.gas_limit / param::ELASTICITY_MULTIPLIER;
+        let parent_gas_target = parent.gas_limit / param::ELASTICITY_MULTIPLIER;
 
-            let parent_base_fee_per_gas = parent.base_fee_per_gas.unwrap();
+        let parent_base_fee_per_gas = parent.base_fee_per_gas.unwrap();
 
-            if parent.gas_used == parent_gas_target {
-                return Some(parent_base_fee_per_gas);
-            }
+        if parent.gas_used == parent_gas_target {
+            return Some(parent_base_fee_per_gas);
+        }
 
-            if parent.gas_used > parent_gas_target {
-                let gas_used_delta = parent.gas_used - parent_gas_target;
-                let base_fee_per_gas_delta = std::cmp::max(
-                    U256::one(),
-                    parent_base_fee_per_gas * U256::from(gas_used_delta)
-                        / U256::from(parent_gas_target)
-                        / U256::from(param::BASE_FEE_MAX_CHANGE_DENOMINATOR),
-                );
-                return Some(parent_base_fee_per_gas + base_fee_per_gas_delta);
-            } else {
-                let gas_used_delta = parent_gas_target - parent.gas_used;
-                let base_fee_per_gas_delta = parent_base_fee_per_gas * U256::from(gas_used_delta)
+        if parent.gas_used > parent_gas_target {
+            let gas_used_delta = parent.gas_used - parent_gas_target;
+            let base_fee_per_gas_delta = std::cmp::max(
+                U256::one(),
+                parent_base_fee_per_gas * U256::from(gas_used_delta)
                     / U256::from(parent_gas_target)
-                    / U256::from(param::BASE_FEE_MAX_CHANGE_DENOMINATOR);
+                    / U256::from(param::BASE_FEE_MAX_CHANGE_DENOMINATOR),
+            );
+            return Some(parent_base_fee_per_gas + base_fee_per_gas_delta);
+        } else {
+            let gas_used_delta = parent_gas_target - parent.gas_used;
+            let base_fee_per_gas_delta = parent_base_fee_per_gas * U256::from(gas_used_delta)
+                / U256::from(parent_gas_target)
+                / U256::from(param::BASE_FEE_MAX_CHANGE_DENOMINATOR);
 
-                return Some(parent_base_fee_per_gas.saturating_sub(base_fee_per_gas_delta));
-            }
+            return Some(parent_base_fee_per_gas.saturating_sub(base_fee_per_gas_delta));
         }
     }
 
@@ -205,7 +203,7 @@ async fn validate_block_header<C: Consensus, S: State>(
     consensus: &C,
     header: &BlockHeader,
     state: &S,
-    config: &ChainConfig,
+    config: &BlockChainSpec,
 ) -> anyhow::Result<()> {
     if header.gas_used > header.gas_limit {
         return Err(ValidationError::GasAboveLimit {
@@ -242,10 +240,8 @@ async fn validate_block_header<C: Consensus, S: State>(
     }
 
     let mut parent_gas_limit = parent.gas_limit;
-    if let Some(fork_block) = config.london_block {
-        if fork_block == header.number {
-            parent_gas_limit = parent.gas_limit * param::ELASTICITY_MULTIPLIER; // EIP-1559
-        }
+    if config.active_transitions.contains(&Revision::London) {
+        parent_gas_limit = parent.gas_limit * param::ELASTICITY_MULTIPLIER; // EIP-1559
     }
 
     let gas_delta = if header.gas_limit > parent_gas_limit {
@@ -257,19 +253,6 @@ async fn validate_block_header<C: Consensus, S: State>(
         return Err(ValidationError::InvalidGasLimit.into());
     }
 
-    let parent_has_uncles = parent.ommers_hash != EMPTY_LIST_HASH;
-    let difficulty = canonical_difficulty(
-        header.number,
-        header.timestamp,
-        parent.difficulty,
-        parent.timestamp,
-        parent_has_uncles,
-        config,
-    );
-    if difficulty != header.difficulty {
-        return Err(ValidationError::WrongDifficulty.into());
-    }
-
     let expected_base_fee_per_gas = expected_base_fee_per_gas(header, &parent, config);
     if header.base_fee_per_gas != expected_base_fee_per_gas {
         return Err(ValidationError::WrongBaseFee {
@@ -279,7 +262,7 @@ async fn validate_block_header<C: Consensus, S: State>(
         .into());
     }
 
-    consensus.verify_header(header).await?;
+    consensus.verify_header(header, &parent).await?;
 
     Ok(())
 }
@@ -331,7 +314,7 @@ pub async fn pre_validate_block<C: Consensus, S: State>(
     consensus: &C,
     block: &Block,
     state: &S,
-    config: &ChainConfig,
+    config: &BlockChainSpec,
 ) -> anyhow::Result<()> {
     validate_block_header(consensus, &block.header, state, config).await?;
 
@@ -447,10 +430,11 @@ mod tests {
                 access_list: vec![],
             };
 
+            let block_number = 13_500_001;
             let res = pre_validate_transaction(
                 &txn,
-                13_500_001,
-                &*MAINNET_CONFIG,
+                block_number,
+                &MAINNET_CONFIG.collect_block_spec(block_number),
                 Some(base_fee_per_gas.into()),
             );
 

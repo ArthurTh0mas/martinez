@@ -1,6 +1,7 @@
 use super::validity::ValidationError;
 use crate::{
-    chain::{consensus::Consensus, validity::pre_validate_block},
+    chain::validity::pre_validate_block,
+    consensus::{init_consensus, Consensus},
     execution::processor::ExecutionProcessor,
     models::*,
     state::*,
@@ -13,15 +14,31 @@ use std::{collections::HashMap, convert::TryFrom};
 #[derive(Debug)]
 pub struct Blockchain<'state> {
     state: &'state mut InMemoryState,
-    config: ChainConfig,
+    consensus: Box<dyn Consensus>,
+    config: ChainSpec,
     bad_blocks: HashMap<H256, ValidationError>,
     receipts: Vec<Receipt>,
 }
 
 impl<'state> Blockchain<'state> {
-    pub async fn new(
+    pub fn new(
         state: &'state mut InMemoryState,
-        config: ChainConfig,
+        consensus_spec: ConsensusSpec,
+        config: ChainSpec,
+        genesis_block: Block,
+    ) -> anyhow::Result<Blockchain<'state>> {
+        Self::new_with_engine(
+            state,
+            init_consensus(consensus_spec)?,
+            config,
+            genesis_block,
+        )
+    }
+
+    pub fn new_with_engine(
+        state: &'state mut InMemoryState,
+        consensus: Box<dyn Consensus>,
+        config: ChainSpec,
         genesis_block: Block,
     ) -> anyhow::Result<Blockchain<'state>> {
         let hash = genesis_block.header.hash();
@@ -31,6 +48,7 @@ impl<'state> Blockchain<'state> {
 
         Ok(Self {
             state,
+            consensus,
             config,
             bad_blocks: Default::default(),
             receipts: Default::default(),
@@ -46,7 +64,13 @@ impl<'state> Blockchain<'state> {
     where
         C: Consensus,
     {
-        pre_validate_block(consensus, &block, self.state, &self.config).await?;
+        pre_validate_block(
+            consensus,
+            &block,
+            self.state,
+            &self.config.collect_block_spec(block.header.number),
+        )
+        .await?;
 
         let hash = block.header.hash();
         if let Some(error) = self.bad_blocks.get(&hash) {
@@ -140,7 +164,14 @@ impl<'state> Blockchain<'state> {
             ommers: block.ommers.clone(),
         };
 
-        let processor = ExecutionProcessor::new(self.state, &block.header, &body, &self.config);
+        let block_spec = self.config.collect_block_spec(block.header.number);
+        let processor = ExecutionProcessor::new(
+            self.state,
+            &*self.consensus,
+            &block.header,
+            &body,
+            &block_spec,
+        );
 
         let _ = processor.execute_and_write_block().await?;
 

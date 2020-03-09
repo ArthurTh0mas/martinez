@@ -1,16 +1,18 @@
 mod account;
 mod block;
 mod bloom;
-mod chainspec;
-mod config;
+pub mod config;
 mod header;
 mod log;
 mod receipt;
+mod spec;
 mod transaction;
 
 pub use self::{
-    account::*, block::*, bloom::*, config::*, header::*, log::*, receipt::*, transaction::*,
+    account::*, block::*, bloom::*, config::*, header::*, log::*, receipt::*, spec::*,
+    transaction::*,
 };
+pub use ethereum_types::Address;
 
 use derive_more::{Deref, DerefMut, Display, From};
 use ethereum_types::{H256, U256};
@@ -19,8 +21,6 @@ use once_cell::sync::Lazy;
 use rlp::{Decodable, Encodable};
 use serde::{Deserialize, Serialize};
 use std::{iter::Step, mem::size_of, ops::Add};
-
-pub use ethereum_types::Address;
 
 pub const KECCAK_LENGTH: usize = H256::len_bytes();
 pub const ADDRESS_LENGTH: usize = Address::len_bytes();

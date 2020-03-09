@@ -1,10 +1,7 @@
 use crate::{
     bitmapdb,
     changeset::{AccountHistory, HistoryKind, StorageHistory},
-    kv::{
-        tables::{self, BitmapKey, PlainStateFusedValue},
-        Table, TableDecode,
-    },
+    kv::*,
     models::*,
     ChangeSet, CursorDupSort, MutableCursor, MutableCursorDupSort, MutableTransaction, Transaction,
 };
@@ -359,7 +356,7 @@ impl<'db: 'tx, 'tx, Tx: MutableTransaction<'db>> StateWriter for PlainStateWrite
         self.tx
             .set(
                 &tables::PlainState,
-                tables::PlainStateFusedValue::Account {
+                PlainStateFusedValue::Account {
                     address,
                     account: value,
                 },
@@ -392,11 +389,7 @@ impl<'db: 'tx, 'tx, Tx: MutableTransaction<'db>> StateWriter for PlainStateWrite
         self.csw.delete_account(address, original).await?;
 
         self.tx
-            .del(
-                &tables::PlainState,
-                tables::PlainStateKey::Account(address),
-                None,
-            )
+            .del(&tables::PlainState, PlainStateKey::Account(address), None)
             .await?;
         if original.incarnation.0 > 0 {
             self.tx
@@ -431,7 +424,7 @@ impl<'db: 'tx, 'tx, Tx: MutableTransaction<'db>> StateWriter for PlainStateWrite
             c.delete_current().await?;
         }
         if !value.is_zero() {
-            c.put(tables::PlainStateFusedValue::Storage {
+            c.put(PlainStateFusedValue::Storage {
                 address,
                 incarnation,
                 location,
@@ -470,10 +463,7 @@ pub trait PlainStateCursorExt<'tx>: CursorDupSort<'tx, tables::PlainState> {
         location: H256,
     ) -> anyhow::Result<Option<H256>> {
         if let Some(v) = self
-            .seek_both_range(
-                tables::PlainStateKey::Storage(address, incarnation),
-                location,
-            )
+            .seek_both_range(PlainStateKey::Storage(address, incarnation), location)
             .await?
         {
             if let Some((a, inc, l, v)) = v.as_storage() {
@@ -532,7 +522,7 @@ pub async fn read_account_data<'db, Tx: Transaction<'db>>(
     address: Address,
 ) -> anyhow::Result<Option<Account>> {
     if let Some(encoded) = tx
-        .get(&tables::PlainState, tables::PlainStateKey::Account(address))
+        .get(&tables::PlainState, PlainStateKey::Account(address))
         .await?
     {
         return Account::decode_for_storage(&*encoded);
@@ -550,10 +540,7 @@ pub async fn read_account_storage<'db, Tx: Transaction<'db>>(
     if let Some(v) = tx
         .cursor_dup_sort(&tables::PlainState)
         .await?
-        .seek_both_range(
-            tables::PlainStateKey::Storage(address, incarnation),
-            location,
-        )
+        .seek_both_range(PlainStateKey::Storage(address, incarnation), location)
         .await?
     {
         if let Some((a, inc, l, v)) = v.as_storage() {

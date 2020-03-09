@@ -32,7 +32,7 @@ where
     state: &'state mut IntraBlockState<'r, B>,
     header: &'h PartialHeader,
     revision: Revision,
-    chain_config: &'c ChainConfig,
+    chain_config: &'c BlockChainSpec,
     txn: &'t TransactionWithSender,
     address_stack: Vec<Address>,
 }
@@ -40,11 +40,11 @@ where
 pub async fn execute<B: State>(
     state: &mut IntraBlockState<'_, B>,
     header: &PartialHeader,
-    chain_config: &ChainConfig,
+    chain_config: &BlockChainSpec,
     txn: &TransactionWithSender,
     gas: u64,
 ) -> anyhow::Result<CallResult> {
-    let revision = chain_config.revision(header.number);
+    let revision = chain_config.revision;
     let mut evm = Evm {
         header,
         state,
@@ -496,7 +496,7 @@ where
                     let block_timestamp = self.header.timestamp;
                     let block_gas_limit = self.header.gas_limit;
                     let block_difficulty = self.header.difficulty;
-                    let chain_id = self.chain_config.chain_id.into();
+                    let chain_id = self.chain_config.params.chain_id.into();
                     let block_base_fee = base_fee_per_gas;
 
                     let context = TxContext {
@@ -616,9 +616,15 @@ mod tests {
         txn: &TransactionWithSender,
         gas: u64,
     ) -> CallResult {
-        super::execute(state, header, &MAINNET_CONFIG, txn, gas)
-            .await
-            .unwrap()
+        super::execute(
+            state,
+            header,
+            &MAINNET_CONFIG.collect_block_spec(header.number),
+            txn,
+            gas,
+        )
+        .await
+        .unwrap()
     }
 
     #[test]

@@ -40,10 +40,7 @@ impl<'db: 'tx, 'tx, Tx: Transaction<'db> + ?Sized> StateReader<'db, 'tx, Tx> {
         self.tx
             .cursor_dup_sort(&tables::PlainState)
             .await?
-            .seek_both_range(
-                tables::PlainStateKey::Storage(address, incarnation),
-                location,
-            )
+            .seek_both_range(PlainStateKey::Storage(address, incarnation), location)
             .await
             .map(|opt| opt.map(|v| v.as_storage().unwrap().3))
     }

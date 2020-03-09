@@ -1,4 +1,4 @@
-use crate::{kv::tables::VariableVec, models::*, util::*};
+use crate::{kv::VariableVec, models::*, util::*};
 use anyhow::bail;
 use arrayvec::ArrayVec;
 use bytes::{Buf, Bytes};

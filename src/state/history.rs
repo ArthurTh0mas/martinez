@@ -1,9 +1,4 @@
-use crate::{
-    changeset::*,
-    kv::{tables::BitmapKey, *},
-    models::*,
-    read_account_storage, Cursor, Transaction,
-};
+use crate::{changeset::*, kv::*, models::*, read_account_storage, Cursor, Transaction};
 use ethereum_types::*;
 
 pub async fn get_account_data_as_of<'db: 'tx, 'tx, Tx: Transaction<'db>>(
@@ -15,7 +10,7 @@ pub async fn get_account_data_as_of<'db: 'tx, 'tx, Tx: Transaction<'db>>(
         return Ok(Some(v));
     }
 
-    tx.get(&tables::PlainState, tables::PlainStateKey::Account(address))
+    tx.get(&tables::PlainState, PlainStateKey::Account(address))
         .await
         .map(|opt| opt.map(From::from))
 }
@@ -146,8 +141,8 @@ mod tests {
     use crate::{
         bitmapdb, crypto,
         kv::{
-            tables::{StorageChangeKey, StorageChangeSeekKey},
             traits::{ttw, MutableKV},
+            *,
         },
         state::database::*,
         MutableTransaction,
@@ -271,12 +266,12 @@ mod tests {
             assert_eq!(index.len(), 1);
 
             let res_account_storage = plain_state
-                .walk(Some(tables::PlainStateSeekKey::StorageWithIncarnation(
+                .walk(Some(PlainStateSeekKey::StorageWithIncarnation(
                     a,
                     acc.incarnation,
                 )))
-                .take_while(ttw(|fv: &tables::PlainStateFusedValue| {
-                    if let tables::PlainStateFusedValue::Storage {
+                .take_while(ttw(|fv: &PlainStateFusedValue| {
+                    if let PlainStateFusedValue::Storage {
                         address,
                         incarnation,
                         ..

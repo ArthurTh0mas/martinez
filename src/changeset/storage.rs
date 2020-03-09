@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    kv::tables::{StorageChange, StorageChangeKey},
+    kv::{StorageChange, StorageChangeKey},
     CursorDupSort,
 };
 use ethereum_types::*;

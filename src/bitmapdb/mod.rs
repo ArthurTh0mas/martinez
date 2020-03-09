@@ -1,5 +1,5 @@
 use crate::{
-    kv::{tables::BitmapKey, traits::ttw, Table, TableDecode},
+    kv::{traits::ttw, BitmapKey, Table, TableDecode},
     models::*,
     Cursor, Transaction,
 };

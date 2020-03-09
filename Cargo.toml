@@ -22,8 +22,9 @@ bytes-literal = { git = "https://github.com/vorot93/bytes-literal" }
 bytesize = "1"
 clap = "2"
 console-subscriber = { git = "https://github.com/tokio-rs/console" }
-crossterm = { version = "0.20", optional = true }
+crossterm = { version = "0.21", optional = true }
 derive_more = "0.99"
+downcast-rs = "1"
 educe = { version = "0.4", features = ["Debug"] }
 ethereum-interfaces = { git = "https://github.com/ledgerwatch/interfaces", features = [
     "remotekv",
@@ -31,7 +32,6 @@ ethereum-interfaces = { git = "https://github.com/ledgerwatch/interfaces", featu
 ] }
 ethereum-types = "0.12"
 evmodin = { git = "https://github.com/vorot93/evmodin", branch = "nightly" }
-fixedbitset = "0.4"
 futures-core = "0.3"
 futures-util = "0.3"
 hash-db = "0.15"
@@ -52,14 +52,16 @@ ripemd160 = "0.9"
 rlp = "0.5"
 rlp-derive = "0.1"
 roaring = "0.7"
+ron = "0.6"
 secp256k1 = { version = "0.20", features = ["global-context", "recovery"] }
 serde = "1"
 serde_json = "1"
+serde_with = "1"
 sha2 = "0.9"
 sha3 = "0.9"
 string = { git = "https://github.com/vorot93/string", branch = "update-bytes" }
 structopt = "0.3"
-strum = { version = "0.21", features = ["derive"] }
+strum = { version = "0.22", features = ["derive"] }
 substrate-bn = "0.6"
 tempfile = "3"
 thiserror = "1"

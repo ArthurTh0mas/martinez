@@ -50,8 +50,9 @@ pub mod tests {
     use super::*;
     use crate::{
         kv::{
-            tables::{self, PlainStateFusedValue},
+            tables,
             traits::{MutableKV, MutableTransaction},
+            PlainStateFusedValue,
         },
         new_mem_database, DEFAULT_INCARNATION,
     };

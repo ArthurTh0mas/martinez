@@ -1,12 +1,7 @@
 #![allow(clippy::suspicious_else_formatting)]
 use martinez::{
-    chain::{
-        blockchain::Blockchain,
-        config::*,
-        consensus::{Consensus, NoProof},
-        difficulty::canonical_difficulty,
-        validity::pre_validate_transaction,
-    },
+    chain::{blockchain::Blockchain, config::*, validity::pre_validate_transaction},
+    consensus::{Consensus, NoProof},
     crypto::keccak256,
     models::*,
     *,
@@ -124,159 +119,154 @@ impl FromStr for Network {
     }
 }
 
-static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
+static NETWORK_CONFIG: Lazy<HashMap<Network, ChainSpec>> = Lazy::new(|| {
+    let make_config = |upgrades| ChainSpec {
+        params: Params {
+            chain_id: 1,
+            network_id: 1,
+            maximum_extra_data_size: 32,
+            min_gas_limit: 5000,
+        },
+        upgrades,
+        name: "test",
+        genesis: Genesis {
+            author: Default::default(),
+            difficulty: Default::default(),
+            gas_limit: Default::default(),
+            timestamp: Default::default(),
+            seal: Seal::Raw {
+                bytes: Default::default(),
+            },
+        },
+        contracts: Default::default(),
+        balances: Default::default(),
+    };
+
     hashmap! {
-        Network::Frontier => ChainConfig {
-            chain_id: 1,
-            ..ChainConfig::default()
-        },
-        Network::Homestead => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            ..ChainConfig::default()
-        },
-        Network::EIP150 => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(0.into()),
-            ..ChainConfig::default()
-        },
-        Network::EIP158 => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(0.into()),
-            spurious_block: Some(0.into()),
-            ..ChainConfig::default()
-        },
-        Network::Byzantium => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(0.into()),
-            spurious_block: Some(0.into()),
-            byzantium_block: Some(0.into()),
-            ..ChainConfig::default()
-        },
-        Network::Constantinople => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(0.into()),
-            spurious_block: Some(0.into()),
-            byzantium_block: Some(0.into()),
-            constantinople_block: Some(0.into()),
-            ..ChainConfig::default()
-        },
-        Network::ConstantinopleFix => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(0.into()),
-            spurious_block: Some(0.into()),
-            byzantium_block: Some(0.into()),
-            constantinople_block: Some(0.into()),
-            petersburg_block: Some(0.into()),
-            ..ChainConfig::default()
-        },
-        Network::Istanbul => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(0.into()),
-            spurious_block: Some(0.into()),
-            byzantium_block: Some(0.into()),
-            constantinople_block: Some(0.into()),
-            petersburg_block: Some(0.into()),
-            istanbul_block: Some(0.into()),
-            ..ChainConfig::default()
-        },
-        Network::Berlin => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(0.into()),
-            spurious_block: Some(0.into()),
-            byzantium_block: Some(0.into()),
-            constantinople_block: Some(0.into()),
-            petersburg_block: Some(0.into()),
-            istanbul_block: Some(0.into()),
-            muir_glacier_block: Some(0.into()),
-            berlin_block: Some(0.into()),
-            ..ChainConfig::default()
-        },
-        Network::London => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(0.into()),
-            spurious_block: Some(0.into()),
-            byzantium_block: Some(0.into()),
-            constantinople_block: Some(0.into()),
-            petersburg_block: Some(0.into()),
-            istanbul_block: Some(0.into()),
-            muir_glacier_block: Some(0.into()),
-            berlin_block: Some(0.into()),
-            london_block: Some(0.into()),
-            ..ChainConfig::default()
-        },
-        Network::FrontierToHomesteadAt5 => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(5.into()),
-            ..ChainConfig::default()
-        },
-        Network::HomesteadToEIP150At5 => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(5.into()),
-            ..ChainConfig::default()
-        },
-        Network::HomesteadToDaoAt5 => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            dao_fork: Some(DaoConfig {
-                block_number: 5.into(),
-                ..MAINNET_CONFIG.dao_fork.clone().unwrap()
-            }),
-            ..ChainConfig::default()
-        },
-        Network::EIP158ToByzantiumAt5 => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(0.into()),
-            spurious_block: Some(0.into()),
-            byzantium_block: Some(5.into()),
-            ..ChainConfig::default()
-        },
-        Network::ByzantiumToConstantinopleFixAt5 => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(0.into()),
-            spurious_block: Some(0.into()),
-            byzantium_block: Some(0.into()),
-            constantinople_block: Some(5.into()),
-            petersburg_block: Some(5.into()),
-            ..ChainConfig::default()
-        },
-        Network::BerlinToLondonAt5 => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(0.into()),
-            spurious_block: Some(0.into()),
-            byzantium_block: Some(0.into()),
-            constantinople_block: Some(0.into()),
-            petersburg_block: Some(0.into()),
-            istanbul_block: Some(0.into()),
-            muir_glacier_block: Some(0.into()),
-            berlin_block: Some(0.into()),
-            london_block: Some(5.into()),
-            ..ChainConfig::default()
-        },
-        Network::EIP2384 => ChainConfig {
-            chain_id: 1,
-            homestead_block: Some(0.into()),
-            tangerine_block: Some(0.into()),
-            spurious_block: Some(0.into()),
-            byzantium_block: Some(0.into()),
-            constantinople_block: Some(0.into()),
-            petersburg_block: Some(0.into()),
-            istanbul_block: Some(0.into()),
-            muir_glacier_block: Some(0.into()),
-            ..ChainConfig::default()
-        },
+        Network::Frontier => (make_config)(Upgrades::default()),
+        Network::Homestead => (make_config)(Upgrades {
+            homestead: Some(0.into()),
+            ..Default::default()
+        }),
+        Network::EIP150 => (make_config)(Upgrades {
+            homestead: Some(0.into()),
+            tangerine: Some(0.into()),
+            ..Default::default()
+        }),
+        Network::EIP158 => (make_config)(Upgrades {
+            homestead: Some(0.into()),
+            tangerine: Some(0.into()),
+            spurious: Some(0.into()),
+            ..Default::default()
+        }),
+        Network::Byzantium => (make_config)(Upgrades {
+            homestead: Some(0.into()),
+            tangerine: Some(0.into()),
+            spurious: Some(0.into()),
+            byzantium: Some(0.into()),
+            ..Default::default()
+        }),
+        Network::Constantinople => (make_config)(Upgrades {
+            homestead: Some(0.into()),
+            tangerine: Some(0.into()),
+            spurious: Some(0.into()),
+            byzantium: Some(0.into()),
+            constantinople: Some(0.into()),
+            ..Default::default()
+        }),
+        Network::ConstantinopleFix => (make_config)(Upgrades {
+            homestead: Some(0.into()),
+            tangerine: Some(0.into()),
+            spurious: Some(0.into()),
+            byzantium: Some(0.into()),
+            constantinople: Some(0.into()),
+            petersburg: Some(0.into()),
+            ..Default::default()
+        }),
+        Network::Istanbul => (make_config)(Upgrades {
+            homestead: Some(0.into()),
+            tangerine: Some(0.into()),
+            spurious: Some(0.into()),
+            byzantium: Some(0.into()),
+            constantinople: Some(0.into()),
+            petersburg: Some(0.into()),
+            istanbul: Some(0.into()),
+            ..Default::default()
+        }),
+        Network::Berlin => (make_config)(Upgrades {
+            homestead: Some(0.into()),
+            tangerine: Some(0.into()),
+            spurious: Some(0.into()),
+            byzantium: Some(0.into()),
+            constantinople: Some(0.into()),
+            petersburg: Some(0.into()),
+            istanbul: Some(0.into()),
+            berlin: Some(0.into()),
+            ..Default::default()
+        }),
+        Network::London => (make_config)(Upgrades {
+            homestead: Some(0.into()),
+            tangerine: Some(0.into()),
+            spurious: Some(0.into()),
+            byzantium: Some(0.into()),
+            constantinople: Some(0.into()),
+            petersburg: Some(0.into()),
+            istanbul: Some(0.into()),
+            berlin: Some(0.into()),
+            london: Some(0.into()),
+            ..Default::default()
+        }),
+        Network::FrontierToHomesteadAt5 => (make_config)(Upgrades {
+            homestead: Some(5.into()),
+            ..Default::default()
+        }),
+        Network::HomesteadToEIP150At5 => (make_config)(Upgrades {
+            homestead: Some(0.into()),
+            tangerine: Some(5.into()),
+            ..Default::default()
+        }),
+        Network::HomesteadToDaoAt5 => (make_config)(Upgrades {
+            homestead: Some(0.into()),
+            ..Default::default()
+        }),
+        Network::EIP158ToByzantiumAt5 => (make_config)(Upgrades {
+            homestead: Some(0.into()),
+            tangerine: Some(0.into()),
+            spurious: Some(0.into()),
+            byzantium: Some(5.into()),
+            ..Default::default()
+        }),
+        Network::ByzantiumToConstantinopleFixAt5 => (make_config)(Upgrades {
+            homestead: Some(0.into()),
+            tangerine: Some(0.into()),
+            spurious: Some(0.into()),
+            byzantium: Some(0.into()),
+            constantinople: Some(5.into()),
+            petersburg: Some(5.into()),
+            ..Default::default()
+        }),
+        Network::BerlinToLondonAt5 => (make_config)(Upgrades {
+            homestead: Some(0.into()),
+            tangerine: Some(0.into()),
+            spurious: Some(0.into()),
+            byzantium: Some(0.into()),
+            constantinople: Some(0.into()),
+            petersburg: Some(0.into()),
+            istanbul: Some(0.into()),
+            berlin: Some(0.into()),
+            london: Some(5.into()),
+            ..Default::default()
+        }),
+        Network::EIP2384 => (make_config)(Upgrades {
+            homestead: Some(0.into()),
+            tangerine: Some(0.into()),
+            spurious: Some(0.into()),
+            byzantium: Some(0.into()),
+            constantinople: Some(0.into()),
+            petersburg: Some(0.into()),
+            istanbul: Some(0.into()),
+            ..Default::default()
+        }),
     }
 });
 
@@ -715,7 +705,7 @@ async fn difficulty_test(
         .map(|hash| hash != EMPTY_LIST_HASH)
         .unwrap_or(false);
 
-    let calculated_difficulty = canonical_difficulty(
+    let calculated_difficulty = martinez::consensus::ethash::difficulty::canonical_difficulty(
         testdata.current_block_number,
         testdata.current_timestamp,
         testdata.parent_difficulty.into(),

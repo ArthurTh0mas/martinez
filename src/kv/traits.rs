@@ -202,6 +202,7 @@ where
     }
 }
 
+/// try_take_while
 pub fn ttw<'a, T, E>(f: impl Fn(&T) -> bool + 'a) -> impl Fn(&Result<T, E>) -> bool + 'a {
     move |res| match res {
         Ok(v) => (f)(v),

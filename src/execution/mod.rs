@@ -1,5 +1,5 @@
 use self::processor::ExecutionProcessor;
-use crate::{crypto::*, models::*, State};
+use crate::{consensus::init_consensus, crypto::*, models::*, State};
 
 mod address;
 pub mod evm;
@@ -8,13 +8,17 @@ pub mod processor;
 
 pub async fn execute_block<S: State>(
     state: &mut S,
-    config: &ChainConfig,
+    consensus_spec: &ConsensusSpec,
+    config: &BlockChainSpec,
     header: &PartialHeader,
     block: &BlockBodyWithSenders,
 ) -> anyhow::Result<Vec<Receipt>> {
-    Ok(ExecutionProcessor::new(state, header, block, config)
-        .execute_and_write_block()
-        .await?)
+    let consensus = init_consensus(consensus_spec)?;
+    Ok(
+        ExecutionProcessor::new(state, &*consensus, header, block, config)
+            .execute_and_write_block()
+            .await?,
+    )
 }
 
 #[cfg(test)]
@@ -136,7 +140,7 @@ mod tests {
 
             execute_block(
                 &mut state,
-                &MAINNET_CONFIG,
+                &MAINNET_CONFIG.collect_block_spec(header.number),
                 &header,
                 &BlockBodyWithSenders {
                     transactions: vec![tx.clone()],
@@ -201,7 +205,7 @@ mod tests {
 
             execute_block(
                 &mut state,
-                &MAINNET_CONFIG,
+                &MAINNET_CONFIG.collect_block_spec(header.number),
                 &header,
                 &BlockBodyWithSenders {
                     transactions: vec![tx],
