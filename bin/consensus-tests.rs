@@ -1,7 +1,12 @@
 #![allow(clippy::suspicious_else_formatting)]
 use martinez::{
-    chain::{blockchain::Blockchain, config::*, validity::pre_validate_transaction},
-    consensus::{Consensus, NoProof},
+    chain::{
+        blockchain::Blockchain,
+        config::*,
+        consensus::{Consensus, NoProof},
+        difficulty::canonical_difficulty,
+        validity::pre_validate_transaction,
+    },
     crypto::keccak256,
     models::*,
     *,
@@ -119,154 +124,159 @@ impl FromStr for Network {
     }
 }
 
-static NETWORK_CONFIG: Lazy<HashMap<Network, ChainSpec>> = Lazy::new(|| {
-    let make_config = |upgrades| ChainSpec {
-        params: Params {
-            chain_id: 1,
-            network_id: 1,
-            maximum_extra_data_size: 32,
-            min_gas_limit: 5000,
-        },
-        upgrades,
-        name: "test",
-        genesis: Genesis {
-            author: Default::default(),
-            difficulty: Default::default(),
-            gas_limit: Default::default(),
-            timestamp: Default::default(),
-            seal: Seal::Raw {
-                bytes: Default::default(),
-            },
-        },
-        contracts: Default::default(),
-        balances: Default::default(),
-    };
-
+static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
     hashmap! {
-        Network::Frontier => (make_config)(Upgrades::default()),
-        Network::Homestead => (make_config)(Upgrades {
-            homestead: Some(0.into()),
-            ..Default::default()
-        }),
-        Network::EIP150 => (make_config)(Upgrades {
-            homestead: Some(0.into()),
-            tangerine: Some(0.into()),
-            ..Default::default()
-        }),
-        Network::EIP158 => (make_config)(Upgrades {
-            homestead: Some(0.into()),
-            tangerine: Some(0.into()),
-            spurious: Some(0.into()),
-            ..Default::default()
-        }),
-        Network::Byzantium => (make_config)(Upgrades {
-            homestead: Some(0.into()),
-            tangerine: Some(0.into()),
-            spurious: Some(0.into()),
-            byzantium: Some(0.into()),
-            ..Default::default()
-        }),
-        Network::Constantinople => (make_config)(Upgrades {
-            homestead: Some(0.into()),
-            tangerine: Some(0.into()),
-            spurious: Some(0.into()),
-            byzantium: Some(0.into()),
-            constantinople: Some(0.into()),
-            ..Default::default()
-        }),
-        Network::ConstantinopleFix => (make_config)(Upgrades {
-            homestead: Some(0.into()),
-            tangerine: Some(0.into()),
-            spurious: Some(0.into()),
-            byzantium: Some(0.into()),
-            constantinople: Some(0.into()),
-            petersburg: Some(0.into()),
-            ..Default::default()
-        }),
-        Network::Istanbul => (make_config)(Upgrades {
-            homestead: Some(0.into()),
-            tangerine: Some(0.into()),
-            spurious: Some(0.into()),
-            byzantium: Some(0.into()),
-            constantinople: Some(0.into()),
-            petersburg: Some(0.into()),
-            istanbul: Some(0.into()),
-            ..Default::default()
-        }),
-        Network::Berlin => (make_config)(Upgrades {
-            homestead: Some(0.into()),
-            tangerine: Some(0.into()),
-            spurious: Some(0.into()),
-            byzantium: Some(0.into()),
-            constantinople: Some(0.into()),
-            petersburg: Some(0.into()),
-            istanbul: Some(0.into()),
-            berlin: Some(0.into()),
-            ..Default::default()
-        }),
-        Network::London => (make_config)(Upgrades {
-            homestead: Some(0.into()),
-            tangerine: Some(0.into()),
-            spurious: Some(0.into()),
-            byzantium: Some(0.into()),
-            constantinople: Some(0.into()),
-            petersburg: Some(0.into()),
-            istanbul: Some(0.into()),
-            berlin: Some(0.into()),
-            london: Some(0.into()),
-            ..Default::default()
-        }),
-        Network::FrontierToHomesteadAt5 => (make_config)(Upgrades {
-            homestead: Some(5.into()),
-            ..Default::default()
-        }),
-        Network::HomesteadToEIP150At5 => (make_config)(Upgrades {
-            homestead: Some(0.into()),
-            tangerine: Some(5.into()),
-            ..Default::default()
-        }),
-        Network::HomesteadToDaoAt5 => (make_config)(Upgrades {
-            homestead: Some(0.into()),
-            ..Default::default()
-        }),
-        Network::EIP158ToByzantiumAt5 => (make_config)(Upgrades {
-            homestead: Some(0.into()),
-            tangerine: Some(0.into()),
-            spurious: Some(0.into()),
-            byzantium: Some(5.into()),
-            ..Default::default()
-        }),
-        Network::ByzantiumToConstantinopleFixAt5 => (make_config)(Upgrades {
-            homestead: Some(0.into()),
-            tangerine: Some(0.into()),
-            spurious: Some(0.into()),
-            byzantium: Some(0.into()),
-            constantinople: Some(5.into()),
-            petersburg: Some(5.into()),
-            ..Default::default()
-        }),
-        Network::BerlinToLondonAt5 => (make_config)(Upgrades {
-            homestead: Some(0.into()),
-            tangerine: Some(0.into()),
-            spurious: Some(0.into()),
-            byzantium: Some(0.into()),
-            constantinople: Some(0.into()),
-            petersburg: Some(0.into()),
-            istanbul: Some(0.into()),
-            berlin: Some(0.into()),
-            london: Some(5.into()),
-            ..Default::default()
-        }),
-        Network::EIP2384 => (make_config)(Upgrades {
-            homestead: Some(0.into()),
-            tangerine: Some(0.into()),
-            spurious: Some(0.into()),
-            byzantium: Some(0.into()),
-            constantinople: Some(0.into()),
-            petersburg: Some(0.into()),
-            istanbul: Some(0.into()),
-            ..Default::default()
-        }),
+        Network::Frontier => ChainConfig {
+            chain_id: 1,
+            ..ChainConfig::default()
+        },
+        Network::Homestead => ChainConfig {
+            chain_id: 1,
+            homestead_block: Some(0.into()),
+            ..ChainConfig::default()
+        },
+        Network::EIP150 => ChainConfig {
+            chain_id: 1,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(0.into()),
+            ..ChainConfig::default()
+        },
+        Network::EIP158 => ChainConfig {
+            chain_id: 1,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(0.into()),
+            spurious_block: Some(0.into()),
+            ..ChainConfig::default()
+        },
+        Network::Byzantium => ChainConfig {
+            chain_id: 1,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(0.into()),
+            spurious_block: Some(0.into()),
+            byzantium_block: Some(0.into()),
+            ..ChainConfig::default()
+        },
+        Network::Constantinople => ChainConfig {
+            chain_id: 1,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(0.into()),
+            spurious_block: Some(0.into()),
+            byzantium_block: Some(0.into()),
+            constantinople_block: Some(0.into()),
+            ..ChainConfig::default()
+        },
+        Network::ConstantinopleFix => ChainConfig {
+            chain_id: 1,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(0.into()),
+            spurious_block: Some(0.into()),
+            byzantium_block: Some(0.into()),
+            constantinople_block: Some(0.into()),
+            petersburg_block: Some(0.into()),
+            ..ChainConfig::default()
+        },
+        Network::Istanbul => ChainConfig {
+            chain_id: 1,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(0.into()),
+            spurious_block: Some(0.into()),
+            byzantium_block: Some(0.into()),
+            constantinople_block: Some(0.into()),
+            petersburg_block: Some(0.into()),
+            istanbul_block: Some(0.into()),
+            ..ChainConfig::default()
+        },
+        Network::Berlin => ChainConfig {
+            chain_id: 1,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(0.into()),
+            spurious_block: Some(0.into()),
+            byzantium_block: Some(0.into()),
+            constantinople_block: Some(0.into()),
+            petersburg_block: Some(0.into()),
+            istanbul_block: Some(0.into()),
+            muir_glacier_block: Some(0.into()),
+            berlin_block: Some(0.into()),
+            ..ChainConfig::default()
+        },
+        Network::London => ChainConfig {
+            chain_id: 1,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(0.into()),
+            spurious_block: Some(0.into()),
+            byzantium_block: Some(0.into()),
+            constantinople_block: Some(0.into()),
+            petersburg_block: Some(0.into()),
+            istanbul_block: Some(0.into()),
+            muir_glacier_block: Some(0.into()),
+            berlin_block: Some(0.into()),
+            london_block: Some(0.into()),
+            ..ChainConfig::default()
+        },
+        Network::FrontierToHomesteadAt5 => ChainConfig {
+            chain_id: 1,
+            homestead_block: Some(5.into()),
+            ..ChainConfig::default()
+        },
+        Network::HomesteadToEIP150At5 => ChainConfig {
+            chain_id: 1,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(5.into()),
+            ..ChainConfig::default()
+        },
+        Network::HomesteadToDaoAt5 => ChainConfig {
+            chain_id: 1,
+            homestead_block: Some(0.into()),
+            dao_fork: Some(DaoConfig {
+                block_number: 5.into(),
+                ..MAINNET_CONFIG.dao_fork.clone().unwrap()
+            }),
+            ..ChainConfig::default()
+        },
+        Network::EIP158ToByzantiumAt5 => ChainConfig {
+            chain_id: 1,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(0.into()),
+            spurious_block: Some(0.into()),
+            byzantium_block: Some(5.into()),
+            ..ChainConfig::default()
+        },
+        Network::ByzantiumToConstantinopleFixAt5 => ChainConfig {
+            chain_id: 1,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(0.into()),
+            spurious_block: Some(0.into()),
+            byzantium_block: Some(0.into()),
+            constantinople_block: Some(5.into()),
+            petersburg_block: Some(5.into()),
+            ..ChainConfig::default()
+        },
+        Network::BerlinToLondonAt5 => ChainConfig {
+            chain_id: 1,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(0.into()),
+            spurious_block: Some(0.into()),
+            byzantium_block: Some(0.into()),
+            constantinople_block: Some(0.into()),
+            petersburg_block: Some(0.into()),
+            istanbul_block: Some(0.into()),
+            muir_glacier_block: Some(0.into()),
+            berlin_block: Some(0.into()),
+            london_block: Some(5.into()),
+            ..ChainConfig::default()
+        },
+        Network::EIP2384 => ChainConfig {
+            chain_id: 1,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(0.into()),
+            spurious_block: Some(0.into()),
+            byzantium_block: Some(0.into()),
+            constantinople_block: Some(0.into()),
+            petersburg_block: Some(0.into()),
+            istanbul_block: Some(0.into()),
+            muir_glacier_block: Some(0.into()),
+            ..ChainConfig::default()
+        },
     }
 });
 
@@ -292,7 +302,7 @@ pub struct AccountState {
     pub balance: U256,
     #[serde(deserialize_with = "deserialize_str_as_bytes")]
     #[educe(Debug(method = "write_hex_string"))]
-    pub code: Bytes,
+    pub code: Bytes<'static>,
     pub nonce: U64,
     pub storage: HashMap<U256, U256>,
 }
@@ -377,7 +387,7 @@ struct BlockchainTest {
     pre: HashMap<Address, AccountState>,
     #[serde(rename = "genesisRLP", deserialize_with = "deserialize_str_as_bytes")]
     #[educe(Debug(method = "write_hex_string"))]
-    genesis_rlp: Bytes,
+    genesis_rlp: Bytes<'static>,
     blocks: Vec<Map<String, Value>>,
     #[serde(default)]
     post_state_hash: Option<H256>,
@@ -406,7 +416,10 @@ enum Status {
 }
 
 #[instrument]
-async fn init_pre_state<S: State>(pre: &HashMap<Address, AccountState>, state: &mut S) {
+async fn init_pre_state<'storage, S: State<'storage>>(
+    pre: &HashMap<Address, AccountState>,
+    state: &mut S,
+) {
     for (address, j) in pre {
         let mut account = Account {
             balance: j.balance,
@@ -457,16 +470,17 @@ struct BlockCommon {
     expect_exception: Option<String>,
     #[educe(Debug(method = "write_hex_string"))]
     #[serde(deserialize_with = "deserialize_str_as_bytes")]
-    rlp: Bytes,
+    rlp: Bytes<'static>,
 }
 
 #[instrument(skip(block_common, blockchain))]
-async fn run_block<'state, C>(
+async fn run_block<'storage: 'state, 'state, S, C>(
     consensus: &C,
     block_common: &BlockCommon,
-    blockchain: &mut Blockchain<'state>,
+    blockchain: &mut Blockchain<'storage, 'state, S>,
 ) -> anyhow::Result<()>
 where
+    S: State<'storage>,
     C: Consensus,
 {
     let block = rlp::decode::<Block>(&block_common.rlp)?;
@@ -483,11 +497,11 @@ where
 }
 
 #[instrument]
-async fn post_check(
-    state: &InMemoryState,
+async fn post_check<'storage, S: State<'storage>>(
+    state: &S,
     expected: &HashMap<Address, AccountState>,
 ) -> anyhow::Result<()> {
-    let number_of_accounts = state.number_of_accounts();
+    let number_of_accounts = state.number_of_accounts().await.unwrap();
     let expected_number_of_accounts: u64 = expected.len().try_into().unwrap();
     if number_of_accounts != expected_number_of_accounts {
         bail!(
@@ -529,7 +543,10 @@ async fn post_check(
             hex::encode(&expected_account_state.code)
         );
 
-        let storage_size = state.storage_size(address, account.incarnation);
+        let storage_size = state
+            .storage_size(address, account.incarnation)
+            .await
+            .unwrap();
 
         let expected_storage_size: u64 = expected_account_state.storage.len().try_into().unwrap();
         ensure!(
@@ -596,7 +613,7 @@ async fn blockchain_test(testdata: BlockchainTest, _: Option<ChainConfig>) -> an
     }
 
     if let Some(expected_hash) = testdata.post_state_hash {
-        let state_root = state.state_root_hash();
+        let state_root = state.state_root_hash().await.unwrap();
 
         ensure!(
             state_root == expected_hash,
@@ -705,7 +722,7 @@ async fn difficulty_test(
         .map(|hash| hash != EMPTY_LIST_HASH)
         .unwrap_or(false);
 
-    let calculated_difficulty = martinez::consensus::ethash::difficulty::canonical_difficulty(
+    let calculated_difficulty = canonical_difficulty(
         testdata.current_block_number,
         testdata.current_timestamp,
         testdata.parent_difficulty.into(),

@@ -15,16 +15,14 @@ async-recursion = "0.3"
 async-stream = "0.3"
 async-trait = "0.1"
 auto_impl = "0.4"
-bincode = "1"
 byte-unit = "4"
-bytes = "1"
-bytes-literal = { git = "https://github.com/vorot93/bytes-literal" }
+static-bytes = { package = "bytes", version = "1" }
+bytes = { package = "lifetimed-bytes", git = "https://github.com/vorot93/lifetimed-bytes" }
 bytesize = "1"
 clap = "2"
 console-subscriber = { git = "https://github.com/tokio-rs/console" }
-crossterm = { version = "0.21", optional = true }
+crossterm = { version = "0.20", optional = true }
 derive_more = "0.99"
-downcast-rs = "1"
 educe = { version = "0.4", features = ["Debug"] }
 ethereum-interfaces = { git = "https://github.com/ledgerwatch/interfaces", features = [
     "remotekv",
@@ -52,16 +50,14 @@ ripemd160 = "0.9"
 rlp = "0.5"
 rlp-derive = "0.1"
 roaring = "0.7"
-ron = "0.6"
 secp256k1 = { version = "0.20", features = ["global-context", "recovery"] }
 serde = "1"
 serde_json = "1"
-serde_with = "1"
 sha2 = "0.9"
 sha3 = "0.9"
 string = { git = "https://github.com/vorot93/string", branch = "update-bytes" }
 structopt = "0.3"
-strum = { version = "0.22", features = ["derive"] }
+strum = { version = "0.21", features = ["derive"] }
 substrate-bn = "0.6"
 tempfile = "3"
 thiserror = "1"

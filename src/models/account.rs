@@ -1,12 +1,13 @@
-use crate::{kv::VariableVec, models::*, util::*};
+use crate::{kv::tables::VariableVec, models::*, util::*};
 use anyhow::bail;
 use arrayvec::ArrayVec;
-use bytes::{Buf, Bytes};
-use educe::*;
+use bytes::Bytes;
+use educe::Educe;
 use ethereum_types::*;
 use modular_bitfield::prelude::*;
 use rlp_derive::*;
 use serde::*;
+use static_bytes::Buf;
 use std::collections::HashMap;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -42,7 +43,7 @@ pub struct SerializedAccount {
     pub balance: U256,
     #[serde(deserialize_with = "deserialize_str_as_bytes")]
     #[educe(Debug(method = "write_hex_string"))]
-    pub code: Bytes,
+    pub code: Bytes<'static>,
     pub nonce: U64,
     pub storage: HashMap<U256, U256>,
 }

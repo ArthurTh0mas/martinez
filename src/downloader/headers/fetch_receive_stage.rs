@@ -12,9 +12,10 @@ use crate::{
 use futures_core::Stream;
 use parking_lot::RwLock;
 use std::{
+    cell::{Cell, RefCell},
     ops::DerefMut,
     pin::Pin,
-    sync::{atomic::*, Arc},
+    sync::Arc,
 };
 use tokio_stream::StreamExt;
 use tracing::*;
@@ -25,23 +26,8 @@ type BlockHeadersMessageStream = Pin<Box<dyn Stream<Item = BlockHeadersMessage> 
 pub struct FetchReceiveStage {
     header_slices: Arc<HeaderSlices>,
     sentry: Arc<RwLock<SentryClientReactor>>,
-    is_over: Arc<AtomicBool>,
-    message_stream: Option<BlockHeadersMessageStream>,
-}
-
-pub struct CanProceed {
-    header_slices: Arc<HeaderSlices>,
-    is_over: Arc<AtomicBool>,
-}
-
-impl CanProceed {
-    pub fn can_proceed(&self) -> bool {
-        let cant_receive_more = self.is_over.load(Ordering::SeqCst)
-            && self
-                .header_slices
-                .has_one_of_statuses(&[HeaderSliceStatus::Empty, HeaderSliceStatus::Waiting]);
-        !cant_receive_more
-    }
+    is_over: Cell<bool>,
+    message_stream: RefCell<Option<RefCell<BlockHeadersMessageStream>>>,
 }
 
 impl FetchReceiveStage {
@@ -49,31 +35,34 @@ impl FetchReceiveStage {
         Self {
             header_slices,
             sentry,
-            is_over: Arc::new(false.into()),
-            message_stream: None,
+            is_over: Cell::new(false),
+            message_stream: RefCell::new(None),
         }
     }
 
-    pub async fn execute(&mut self) -> anyhow::Result<()> {
+    pub async fn execute(&self) -> anyhow::Result<()> {
         debug!("FetchReceiveStage: start");
-        if self.message_stream.is_none() {
-            self.message_stream = Some(self.receive_headers()?);
+        if self.message_stream.borrow().is_none() {
+            let message_stream = self.receive_headers()?;
+            *self.message_stream.borrow_mut() = Some(RefCell::new(message_stream));
         }
 
-        let message_result = self.message_stream.as_mut().unwrap().next().await;
+        let message_stream_opt = self.message_stream.borrow();
+        let mut message_stream = message_stream_opt.as_ref().unwrap().borrow_mut();
+        let message_result = message_stream.next().await;
         match message_result {
             Some(message) => self.on_headers(message.headers),
-            None => self.is_over.store(true, Ordering::SeqCst),
+            None => self.is_over.set(true),
         }
         debug!("FetchReceiveStage: done");
         Ok(())
     }
 
-    pub fn can_proceed_checker(&self) -> CanProceed {
-        CanProceed {
-            is_over: self.is_over.clone(),
-            header_slices: self.header_slices.clone(),
-        }
+    pub fn can_proceed(&self) -> bool {
+        let request_statuses = &[HeaderSliceStatus::Empty, HeaderSliceStatus::Waiting];
+        let cant_receive_more =
+            self.is_over.get() && self.header_slices.has_one_of_statuses(request_statuses);
+        !cant_receive_more
     }
 
     fn on_headers(&self, headers: Vec<Header>) {

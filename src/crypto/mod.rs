@@ -43,7 +43,7 @@ where
 }
 
 pub trait TrieEncode {
-    fn trie_encode(&self) -> Bytes;
+    fn trie_encode(&self) -> Bytes<'static>;
 }
 
 pub fn root_hash<T: TrieEncode>(values: &[T]) -> H256 {

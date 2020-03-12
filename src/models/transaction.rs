@@ -1,5 +1,5 @@
 use crate::{crypto::is_valid_signature, util::*};
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use derive_more::Deref;
 use educe::Educe;
 use ethereum_types::*;
@@ -8,18 +8,18 @@ use secp256k1::{
     recovery::{RecoverableSignature, RecoveryId},
     Message, SECP256K1,
 };
-use serde::*;
 use sha3::*;
+use static_bytes::{BufMut, BytesMut};
 use std::{borrow::Cow, cmp::min};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TxType {
     Legacy = 0,
     EIP2930 = 1,
     EIP1559 = 2,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransactionAction {
     Call(Address),
     Create,
@@ -88,7 +88,7 @@ impl YParityAndChainId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransactionSignature {
     odd_y_parity: bool,
     r: H256,
@@ -134,7 +134,7 @@ impl TransactionSignature {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccessListItem {
     pub address: Address,
     pub slots: Vec<H256>,
@@ -159,7 +159,7 @@ impl Decodable for AccessListItem {
 
 pub type AccessList = Vec<AccessListItem>;
 
-#[derive(Clone, Educe, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Educe, PartialEq, Eq)]
 #[educe(Debug)]
 pub enum TransactionMessage {
     Legacy {
@@ -170,7 +170,7 @@ pub enum TransactionMessage {
         action: TransactionAction,
         value: U256,
         #[educe(Debug(method = "write_hex_string"))]
-        input: Bytes,
+        input: Bytes<'static>,
     },
     EIP2930 {
         chain_id: u64,
@@ -180,7 +180,7 @@ pub enum TransactionMessage {
         action: TransactionAction,
         value: U256,
         #[educe(Debug(method = "write_hex_string"))]
-        input: Bytes,
+        input: Bytes<'static>,
         access_list: Vec<AccessListItem>,
     },
     EIP1559 {
@@ -192,7 +192,7 @@ pub enum TransactionMessage {
         action: TransactionAction,
         value: U256,
         #[educe(Debug(method = "write_hex_string"))]
-        input: Bytes,
+        input: Bytes<'static>,
         access_list: Vec<AccessListItem>,
     },
 }
@@ -288,7 +288,7 @@ impl TransactionMessage {
     }
 }
 
-#[derive(Clone, Debug, Deref, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deref, PartialEq, Eq)]
 pub struct Transaction {
     #[deref]
     pub message: TransactionMessage,
@@ -396,10 +396,10 @@ impl Transaction {
         }
     }
 
-    pub fn encode(&self) -> Bytes {
+    pub fn encode(&self) -> Bytes<'static> {
         let mut s = RlpStream::new();
         self.encode_inner(&mut s, true);
-        s.out().freeze()
+        s.out().freeze().into()
     }
 }
 
@@ -595,7 +595,7 @@ impl TransactionMessage {
         }
     }
 
-    pub const fn input(&self) -> &Bytes {
+    pub const fn input(&self) -> &Bytes<'static> {
         match self {
             Self::Legacy { input, .. }
             | Self::EIP2930 { input, .. }

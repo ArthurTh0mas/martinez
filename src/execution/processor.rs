@@ -6,7 +6,6 @@ use crate::{
         protocol_param::{fee, param},
         validity::{pre_validate_transaction, ValidationError},
     },
-    consensus::*,
     execution::evm,
     models::*,
     state::IntraBlockState,
@@ -18,34 +17,31 @@ use evmodin::{Revision, StatusCode};
 use std::cmp::min;
 use TransactionAction;
 
-pub struct ExecutionProcessor<'r, 'consensus, 'h, 'b, 'c, S>
+pub struct ExecutionProcessor<'storage, 'r, 'h, 'b, 'c, S>
 where
-    S: State,
+    S: State<'storage>,
 {
-    state: IntraBlockState<'r, S>,
-    consensus: &'consensus dyn Consensus,
+    state: IntraBlockState<'storage, 'r, S>,
     header: &'h PartialHeader,
     block: &'b BlockBodyWithSenders,
     revision: Revision,
-    chain_config: &'c BlockChainSpec,
+    chain_config: &'c ChainConfig,
     cumulative_gas_used: u64,
 }
 
-impl<'r, 'consensus, 'h, 'b, 'c, S> ExecutionProcessor<'r, 'consensus, 'h, 'b, 'c, S>
+impl<'storage, 'r, 'h, 'b, 'c, S> ExecutionProcessor<'storage, 'r, 'h, 'b, 'c, S>
 where
-    S: State,
+    S: State<'storage>,
 {
     pub fn new(
         state: &'r mut S,
-        consensus: &'consensus dyn Consensus,
         header: &'h PartialHeader,
         block: &'b BlockBodyWithSenders,
-        chain_config: &'c BlockChainSpec,
+        chain_config: &'c ChainConfig,
     ) -> Self {
-        let revision = chain_config.revision;
+        let revision = chain_config.revision(header.number);
         Self {
             state: IntraBlockState::new(state),
-            consensus,
             header,
             block,
             revision,
@@ -58,11 +54,11 @@ where
         self.header.gas_limit - self.cumulative_gas_used
     }
 
-    pub(crate) fn state(&mut self) -> &mut IntraBlockState<'r, S> {
+    pub(crate) fn state(&mut self) -> &mut IntraBlockState<'storage, 'r, S> {
         &mut self.state
     }
 
-    pub(crate) fn into_state(self) -> IntraBlockState<'r, S> {
+    pub(crate) fn into_state(self) -> IntraBlockState<'storage, 'r, S> {
         self.state
     }
 
@@ -118,7 +114,7 @@ where
         &mut self,
         txn: &TransactionWithSender,
     ) -> anyhow::Result<Receipt> {
-        let rev = self.chain_config.revision;
+        let rev = self.chain_config.revision(self.header.number);
 
         self.state.clear_journal_and_substate();
 
@@ -190,8 +186,16 @@ where
     pub async fn execute_block_no_post_validation(&mut self) -> anyhow::Result<Vec<Receipt>> {
         let mut receipts = Vec::with_capacity(self.block.transactions.len());
 
-        for (&address, &balance) in &self.chain_config.balance_changes {
-            self.state.set_balance(address, balance).await?;
+        let block_num = self.header.number;
+        if let Some(dao_config) = &self.chain_config.dao_fork {
+            if dao_config.block_number == block_num {
+                dao::transfer_balances(
+                    &mut self.state,
+                    dao_config.beneficiary,
+                    dao_config.drain.iter().copied(),
+                )
+                .await?;
+            }
         }
 
         for (i, txn) in self.block.transactions.iter().enumerate() {
@@ -201,7 +205,7 @@ where
             receipts.push(self.execute_transaction(txn).await?);
         }
 
-        self.consensus.finalize(&mut self.state, self.block).await?;
+        self.apply_rewards().await?;
 
         Ok(receipts)
     }
@@ -220,7 +224,7 @@ where
         }
 
         let block_num = self.header.number;
-        let rev = self.chain_config.revision;
+        let rev = self.chain_config.revision(block_num);
 
         if rev >= Revision::Byzantium {
             let expected = root_hash(&receipts);
@@ -343,12 +347,8 @@ mod tests {
             };
 
             let mut state = InMemoryState::default();
-            let mut processor = ExecutionProcessor::new(
-                &mut state,
-                &header,
-                &block,
-                &MAINNET_CONFIG.collect_block_spec(header.number),
-            );
+            let mut processor =
+                ExecutionProcessor::new(&mut state, &header, &block, &MAINNET_CONFIG);
 
             let receipt = processor.execute_transaction(&txn).await.unwrap();
             assert!(receipt.success);
@@ -391,16 +391,12 @@ mod tests {
             // 23     BALANCE
 
             let mut state = InMemoryState::default();
-            let mut processor = ExecutionProcessor::new(
-                &mut state,
-                &header,
-                &block,
-                &MAINNET_CONFIG.collect_block_spec(header.number),
-            );
+            let mut processor =
+                ExecutionProcessor::new(&mut state, &header, &block, &MAINNET_CONFIG);
 
             let t = |action, input, nonce, gas_limit| TransactionWithSender {
                 message: TransactionMessage::EIP1559 {
-                    chain_id: MAINNET_CONFIG.params.chain_id,
+                    chain_id: MAINNET_CONFIG.chain_id,
                     nonce,
                     max_priority_fee_per_gas: U256::zero(),
                     max_fee_per_gas: U256::from(59 * GIGA),
@@ -509,12 +505,8 @@ mod tests {
             // 38     CALL
 
             let mut state = InMemoryState::default();
-            let mut processor = ExecutionProcessor::new(
-                &mut state,
-                &header,
-                &block,
-                &MAINNET_CONFIG.collect_block_spec(header.number),
-            );
+            let mut processor =
+                ExecutionProcessor::new(&mut state, &header, &block, &MAINNET_CONFIG);
 
             processor
                 .state()
@@ -534,7 +526,7 @@ mod tests {
 
             let t = |action, input, nonce| TransactionWithSender {
                 message: TransactionMessage::EIP1559 {
-                    chain_id: MAINNET_CONFIG.params.chain_id,
+                    chain_id: MAINNET_CONFIG.chain_id,
                     nonce,
                     max_priority_fee_per_gas: U256::zero(),
                     max_fee_per_gas: U256::from(20 * GIGA),
@@ -612,7 +604,7 @@ mod tests {
 
             let txn = TransactionWithSender{
                 message: TransactionMessage::EIP1559 {
-                    chain_id: MAINNET_CONFIG.params.chain_id,
+                    chain_id: MAINNET_CONFIG.chain_id,
                     nonce,
                     max_priority_fee_per_gas: 0.into(),
                     max_fee_per_gas: U256::from(20 * GIGA),
@@ -627,12 +619,8 @@ mod tests {
                 sender: caller,
             };
 
-            let mut processor = ExecutionProcessor::new(
-                &mut state,
-                &header,
-                &block,
-                &MAINNET_CONFIG.collect_block_spec(header.number),
-            );
+            let mut processor =
+                ExecutionProcessor::new(&mut state, &header, &block, &MAINNET_CONFIG);
             processor
                 .state()
                 .add_to_balance(caller, *ETHER)
@@ -670,7 +658,7 @@ mod tests {
 
             let txn = TransactionWithSender {
                 message: TransactionMessage::EIP1559 {
-                    chain_id: MAINNET_CONFIG.params.chain_id,
+                    chain_id: MAINNET_CONFIG.chain_id,
                     nonce: 0,
                     max_priority_fee_per_gas: U256::zero(),
                     max_fee_per_gas: U256::from(30 * GIGA),
@@ -687,12 +675,8 @@ mod tests {
 
             let mut state = InMemoryState::default();
 
-            let mut processor = ExecutionProcessor::new(
-                &mut state,
-                &header,
-                &block,
-                &MAINNET_CONFIG.collect_block_spec(header.number),
-            );
+            let mut processor =
+                ExecutionProcessor::new(&mut state, &header, &block, &MAINNET_CONFIG);
 
             processor
                 .state()

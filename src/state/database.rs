@@ -1,7 +1,10 @@
 use crate::{
     bitmapdb,
     changeset::{AccountHistory, HistoryKind, StorageHistory},
-    kv::*,
+    kv::{
+        tables::{self, BitmapKey},
+        Table, TableDecode,
+    },
     models::*,
     ChangeSet, CursorDupSort, MutableCursor, MutableCursorDupSort, MutableTransaction, Transaction,
 };
@@ -24,13 +27,13 @@ pub trait StateReader<'storage> {
         address: Address,
         incarnation: Incarnation,
         key: H256,
-    ) -> anyhow::Result<Option<Bytes>>;
+    ) -> anyhow::Result<Option<Bytes<'storage>>>;
     async fn read_account_code(
         &self,
         address: Address,
         incarnation: Incarnation,
         code_hash: H256,
-    ) -> anyhow::Result<Option<Bytes>>;
+    ) -> anyhow::Result<Option<Bytes<'storage>>>;
     async fn read_account_code_size(
         &self,
         address: Address,
@@ -356,7 +359,7 @@ impl<'db: 'tx, 'tx, Tx: MutableTransaction<'db>> StateWriter for PlainStateWrite
         self.tx
             .set(
                 &tables::PlainState,
-                PlainStateFusedValue::Account {
+                tables::PlainStateFusedValue::Account {
                     address,
                     account: value,
                 },
@@ -376,7 +379,7 @@ impl<'db: 'tx, 'tx, Tx: MutableTransaction<'db>> StateWriter for PlainStateWrite
             .await?;
 
         self.tx
-            .set(&tables::Code, (code_hash, code.to_vec().into()))
+            .set(&tables::Code, (code_hash, code.to_vec()))
             .await?;
         self.tx
             .set(&tables::PlainCodeHash, ((address, incarnation), code_hash))
@@ -389,7 +392,11 @@ impl<'db: 'tx, 'tx, Tx: MutableTransaction<'db>> StateWriter for PlainStateWrite
         self.csw.delete_account(address, original).await?;
 
         self.tx
-            .del(&tables::PlainState, PlainStateKey::Account(address), None)
+            .del(
+                &tables::PlainState,
+                tables::PlainStateKey::Account(address),
+                None,
+            )
             .await?;
         if original.incarnation.0 > 0 {
             self.tx
@@ -424,11 +431,11 @@ impl<'db: 'tx, 'tx, Tx: MutableTransaction<'db>> StateWriter for PlainStateWrite
             c.delete_current().await?;
         }
         if !value.is_zero() {
-            c.put(PlainStateFusedValue::Storage {
+            c.put(tables::PlainStateFusedValue::Storage {
                 address,
                 incarnation,
                 location,
-                value,
+                value: value.into(),
             })
             .await?;
         }
@@ -463,7 +470,10 @@ pub trait PlainStateCursorExt<'tx>: CursorDupSort<'tx, tables::PlainState> {
         location: H256,
     ) -> anyhow::Result<Option<H256>> {
         if let Some(v) = self
-            .seek_both_range(PlainStateKey::Storage(address, incarnation), location)
+            .seek_both_range(
+                tables::PlainStateKey::Storage(address, incarnation),
+                location,
+            )
             .await?
         {
             if let Some((a, inc, l, v)) = v.as_storage() {
@@ -479,50 +489,12 @@ pub trait PlainStateCursorExt<'tx>: CursorDupSort<'tx, tables::PlainState> {
 
 impl<'tx, C: CursorDupSort<'tx, tables::PlainState>> PlainStateCursorExt<'tx> for C {}
 
-#[async_trait]
-pub trait PlainStateMutableCursorExt<'tx>:
-    PlainStateCursorExt<'tx> + MutableCursorDupSort<'tx, tables::PlainState>
-{
-    async fn upsert_storage_value(
-        &mut self,
-        address: Address,
-        incarnation: Incarnation,
-        location: H256,
-        value: H256,
-    ) -> anyhow::Result<()> {
-        if self
-            .seek_storage_key(address, incarnation, location)
-            .await?
-            .is_some()
-        {
-            self.delete_current().await?;
-        }
-
-        if !value.is_zero() {
-            self.upsert(PlainStateFusedValue::Storage {
-                address,
-                incarnation,
-                location,
-                value,
-            })
-            .await?;
-        }
-
-        Ok(())
-    }
-}
-
-impl<'tx, C: MutableCursorDupSort<'tx, tables::PlainState> + PlainStateCursorExt<'tx>>
-    PlainStateMutableCursorExt<'tx> for C
-{
-}
-
 pub async fn read_account_data<'db, Tx: Transaction<'db>>(
     tx: &Tx,
     address: Address,
 ) -> anyhow::Result<Option<Account>> {
     if let Some(encoded) = tx
-        .get(&tables::PlainState, PlainStateKey::Account(address))
+        .get(&tables::PlainState, tables::PlainStateKey::Account(address))
         .await?
     {
         return Account::decode_for_storage(&*encoded);
@@ -540,7 +512,10 @@ pub async fn read_account_storage<'db, Tx: Transaction<'db>>(
     if let Some(v) = tx
         .cursor_dup_sort(&tables::PlainState)
         .await?
-        .seek_both_range(PlainStateKey::Storage(address, incarnation), location)
+        .seek_both_range(
+            tables::PlainStateKey::Storage(address, incarnation),
+            location,
+        )
         .await?
     {
         if let Some((a, inc, l, v)) = v.as_storage() {
@@ -558,8 +533,10 @@ pub async fn read_account_code<'db: 'tx, 'tx, Tx: Transaction<'db>>(
     _: Address,
     _: Incarnation,
     code_hash: H256,
-) -> anyhow::Result<Option<Bytes>> {
-    tx.get(&tables::Code, code_hash).await
+) -> anyhow::Result<Option<Bytes<'tx>>> {
+    tx.get(&tables::Code, code_hash)
+        .await
+        .map(|opt| opt.map(|v| v.into()))
 }
 
 pub async fn read_account_code_size<'db: 'tx, 'tx, Tx: Transaction<'db>>(

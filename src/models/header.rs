@@ -3,9 +3,8 @@ use crate::crypto::*;
 use bytes::Bytes;
 use ethereum_types::*;
 use rlp::*;
-use serde::*;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 /// Ethereum block header definition.
 pub struct BlockHeader {
     pub parent_hash: H256,
@@ -20,7 +19,7 @@ pub struct BlockHeader {
     pub gas_limit: u64,
     pub gas_used: u64,
     pub timestamp: u64,
-    pub extra_data: Bytes,
+    pub extra_data: Bytes<'static>,
     pub mix_hash: H256,
     pub nonce: H64,
     pub base_fee_per_gas: Option<U256>,
@@ -165,7 +164,7 @@ pub struct PartialHeader {
     pub gas_limit: u64,
     pub gas_used: u64,
     pub timestamp: u64,
-    pub extra_data: Bytes,
+    pub extra_data: Bytes<'static>,
     pub mix_hash: H256,
     pub nonce: H64,
     pub base_fee_per_gas: Option<U256>,

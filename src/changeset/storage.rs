@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    kv::{StorageChange, StorageChangeKey},
+    kv::tables::{StorageChange, StorageChangeKey},
     CursorDupSort,
 };
 use ethereum_types::*;
@@ -37,7 +37,7 @@ impl HistoryKind for StorageHistory {
             .await?
         {
             if v.location == location {
-                return Ok(Some(v.value));
+                return Ok(Some(v.value.0));
             }
         }
 
@@ -54,7 +54,10 @@ impl HistoryKind for StorageHistory {
                         address,
                         incarnation,
                     },
-                    StorageChange { location, value },
+                    StorageChange {
+                        location,
+                        value: value.into(),
+                    },
                 )
             })
     }
@@ -67,7 +70,7 @@ impl HistoryKind for StorageHistory {
         }: <Self::ChangeSetTable as Table>::Key,
         StorageChange { location, value }: <Self::ChangeSetTable as Table>::Value,
     ) -> (BlockNumber, Change<Self::Key, Self::Value>) {
-        (block_number, ((address, incarnation, location), value))
+        (block_number, ((address, incarnation, location), value.0))
     }
 }
 

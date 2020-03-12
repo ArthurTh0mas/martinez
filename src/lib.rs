@@ -22,7 +22,6 @@ pub mod adapter;
 mod bitmapdb;
 pub mod chain;
 mod changeset;
-pub mod consensus;
 pub mod crypto;
 pub mod downloader;
 pub mod etl;

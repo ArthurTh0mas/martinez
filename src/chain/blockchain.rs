@@ -1,7 +1,6 @@
 use super::validity::ValidationError;
 use crate::{
-    chain::validity::pre_validate_block,
-    consensus::{init_consensus, Consensus},
+    chain::{consensus::Consensus, validity::pre_validate_block},
     execution::processor::ExecutionProcessor,
     models::*,
     state::*,
@@ -9,49 +8,40 @@ use crate::{
 use anyhow::Context;
 use async_recursion::async_recursion;
 use ethereum_types::*;
-use std::{collections::HashMap, convert::TryFrom};
+use std::{collections::HashMap, convert::TryFrom, marker::PhantomData};
 
 #[derive(Debug)]
-pub struct Blockchain<'state> {
-    state: &'state mut InMemoryState,
-    consensus: Box<dyn Consensus>,
-    config: ChainSpec,
+pub struct Blockchain<'storage: 'state, 'state, S>
+where
+    S: State<'storage>,
+{
+    state: &'state mut S,
+    config: ChainConfig,
     bad_blocks: HashMap<H256, ValidationError>,
     receipts: Vec<Receipt>,
+    _marker: PhantomData<&'storage ()>,
 }
 
-impl<'state> Blockchain<'state> {
-    pub fn new(
-        state: &'state mut InMemoryState,
-        consensus_spec: ConsensusSpec,
-        config: ChainSpec,
+impl<'storage: 'state, 'state, S> Blockchain<'storage, 'state, S>
+where
+    S: State<'storage>,
+{
+    pub async fn new(
+        state: &'state mut S,
+        config: ChainConfig,
         genesis_block: Block,
-    ) -> anyhow::Result<Blockchain<'state>> {
-        Self::new_with_engine(
-            state,
-            init_consensus(consensus_spec)?,
-            config,
-            genesis_block,
-        )
-    }
-
-    pub fn new_with_engine(
-        state: &'state mut InMemoryState,
-        consensus: Box<dyn Consensus>,
-        config: ChainSpec,
-        genesis_block: Block,
-    ) -> anyhow::Result<Blockchain<'state>> {
+    ) -> anyhow::Result<Blockchain<'storage, 'state, S>> {
         let hash = genesis_block.header.hash();
         let number = genesis_block.header.number;
-        state.insert_block(genesis_block, hash);
-        state.canonize_block(number, hash);
+        state.insert_block(genesis_block, hash).await?;
+        state.canonize_block(number, hash).await?;
 
         Ok(Self {
             state,
-            consensus,
             config,
             bad_blocks: Default::default(),
             receipts: Default::default(),
+            _marker: PhantomData,
         })
     }
 
@@ -64,13 +54,7 @@ impl<'state> Blockchain<'state> {
     where
         C: Consensus,
     {
-        pre_validate_block(
-            consensus,
-            &block,
-            self.state,
-            &self.config.collect_block_spec(block.header.number),
-        )
-        .await?;
+        pre_validate_block(consensus, &block, self.state, &self.config).await?;
 
         let hash = block.header.hash();
         if let Some(error) = self.bad_blocks.get(&hash) {
@@ -81,7 +65,7 @@ impl<'state> Blockchain<'state> {
 
         let ancestor = self.canonical_ancestor(&b.header, hash).await?;
 
-        let current_canonical_block = self.state.current_canonical_block();
+        let current_canonical_block = self.state.current_canonical_block().await?;
 
         self.unwind_last_changes(ancestor, current_canonical_block)
             .await?;
@@ -118,13 +102,16 @@ impl<'state> Blockchain<'state> {
             num_of_executed_chain_blocks += 1;
         }
 
-        self.state.insert_block(block, hash);
+        self.state.insert_block(block, hash).await?;
 
         let current_total_difficulty = self
             .state
             .total_difficulty(
                 current_canonical_block,
-                self.state.canonical_hash(current_canonical_block).unwrap(),
+                self.state
+                    .canonical_hash(current_canonical_block)
+                    .await?
+                    .unwrap(),
             )
             .await?
             .unwrap();
@@ -138,11 +125,11 @@ impl<'state> Blockchain<'state> {
         {
             // canonize the new chain
             for i in (ancestor + 1..=current_canonical_block).rev() {
-                self.state.decanonize_block(i);
+                self.state.decanonize_block(i).await?;
             }
 
             for x in chain {
-                self.state.canonize_block(x.header.number, x.hash);
+                self.state.canonize_block(x.header.number, x.hash).await?;
             }
         } else {
             self.unwind_last_changes(ancestor, ancestor + num_of_executed_chain_blocks)
@@ -164,21 +151,14 @@ impl<'state> Blockchain<'state> {
             ommers: block.ommers.clone(),
         };
 
-        let block_spec = self.config.collect_block_spec(block.header.number);
-        let processor = ExecutionProcessor::new(
-            self.state,
-            &*self.consensus,
-            &block.header,
-            &body,
-            &block_spec,
-        );
+        let processor = ExecutionProcessor::new(self.state, &block.header, &body, &self.config);
 
         let _ = processor.execute_and_write_block().await?;
 
         if check_state_root {
-            let state_root = self.state.state_root_hash();
+            let state_root = self.state.state_root_hash().await?;
             if state_root != block.header.state_root {
-                self.state.unwind_state_changes(block.header.number);
+                self.state.unwind_state_changes(block.header.number).await?;
                 return Err(ValidationError::WrongStateRoot {
                     expected: block.header.state_root,
                     got: state_root,
@@ -199,7 +179,7 @@ impl<'state> Blockchain<'state> {
         let tip = tip.into();
         assert!(ancestor <= tip);
         for block_number in ancestor + 1..=tip {
-            let hash = self.state.canonical_hash(block_number).unwrap();
+            let hash = self.state.canonical_hash(block_number).await?.unwrap();
             let body = self
                 .state
                 .read_body_with_senders(block_number, hash)
@@ -228,7 +208,7 @@ impl<'state> Blockchain<'state> {
         let tip = tip.into();
         assert!(ancestor <= tip);
         for block_number in (ancestor + 1..=tip).rev() {
-            self.state.unwind_state_changes(block_number);
+            self.state.unwind_state_changes(block_number).await?;
         }
 
         Ok(())
@@ -282,7 +262,7 @@ impl<'state> Blockchain<'state> {
         header: &PartialHeader,
         hash: H256,
     ) -> anyhow::Result<BlockNumber> {
-        if let Some(canonical_hash) = self.state.canonical_hash(header.number) {
+        if let Some(canonical_hash) = self.state.canonical_hash(header.number).await? {
             if canonical_hash == hash {
                 return Ok(header.number);
             }

@@ -1,13 +1,12 @@
 use bytes::Bytes;
 use ethereum_types::*;
 use rlp::*;
-use serde::*;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Log {
     pub address: Address,
     pub topics: Vec<H256>,
-    pub data: Bytes,
+    pub data: Bytes<'static>,
 }
 
 impl Encodable for Log {

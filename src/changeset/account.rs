@@ -1,4 +1,4 @@
-use crate::kv::AccountChange;
+use crate::kv::tables::AccountChange;
 
 use super::*;
 
