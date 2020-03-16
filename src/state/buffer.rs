@@ -1,6 +1,12 @@
 use crate::{
     accessors,
-    kv::{traits::*, *},
+    kv::{
+        tables::{
+            self, AccountChange, PlainStateFusedValue, PlainStateKey, StorageChange,
+            StorageChangeKey,
+        },
+        traits::*,
+    },
     models::{Receipt, *},
     state::database::PlainStateMutableCursorExt,
     MutableTransaction, State, Transaction,
@@ -413,7 +419,7 @@ where
 mod tests {
     use super::*;
     use crate::{
-        kv::{traits::*, *},
+        kv::{tables::PlainStateFusedValue, traits::*},
         new_mem_database,
         state::database::PlainStateCursorExt,
         DEFAULT_INCARNATION,
