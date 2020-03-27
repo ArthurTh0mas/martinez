@@ -1,112 +1,95 @@
+use super::*;
 use crate::{
-    kv::{tables, traits::*},
-    models::*,
-    state::*,
+    kv::tables::{self, PlainStateFusedValue},
+    models::{ChainConfig, *},
+    util::*,
+    InMemoryState, MutableCursor, MutableTransaction,
 };
-use tempfile::TempDir;
+use bytes::Bytes;
+use ethereum_types::*;
+use serde::*;
+use std::collections::HashMap;
 
-#[derive(Clone, Debug)]
-pub struct GenesisState {
-    chain_spec: ChainSpec,
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AllocAccountData {
+    pub balance: U256,
 }
 
-impl GenesisState {
-    pub fn new(chain_spec: ChainSpec) -> Self {
-        Self { chain_spec }
-    }
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenesisData {
+    pub alloc: HashMap<Address, AllocAccountData>,
+    pub coinbase: Address,
+    pub config: ChainConfig,
+    pub difficulty: U256,
+    #[serde(deserialize_with = "deserialize_hexstr_as_bytes")]
+    pub extra_data: Bytes,
+    #[serde(deserialize_with = "deserialize_hexstr_as_u64")]
+    pub gas_limit: u64,
+    pub mix_hash: H256,
+    pub nonce: H64,
+    pub parent_hash: H256,
+    #[serde(deserialize_with = "deserialize_hexstr_as_u64")]
+    pub timestamp: u64,
 }
 
-impl GenesisState {
-    pub fn initial_state(&self) -> InMemoryState {
-        let mut state_buffer = InMemoryState::new();
-        // Allocate accounts
-        if let Some(balances) = self.chain_spec.balances.get(&BlockNumber(0)) {
-            for (&address, &balance) in balances {
-                let current_account = Account {
-                    balance,
-                    ..Default::default()
-                };
-                state_buffer.update_account(address, None, Some(current_account));
-            }
-        }
-        state_buffer
-    }
-
-    pub fn header(&self, initial_state: &InMemoryState) -> BlockHeader {
-        let genesis = &self.chain_spec.genesis;
-        let seal = &genesis.seal;
-        let state_root = initial_state.state_root_hash();
-
-        BlockHeader {
-            parent_hash: H256::zero(),
-            beneficiary: genesis.author,
-            state_root,
-            logs_bloom: Bloom::zero(),
-            difficulty: seal.difficulty(),
-            number: BlockNumber(0),
-            gas_limit: genesis.gas_limit,
-            gas_used: 0,
-            timestamp: genesis.timestamp,
-            extra_data: seal.extra_data(),
-            mix_hash: seal.mix_hash(),
-            nonce: seal.nonce(),
-            base_fee_per_gas: None,
-
-            receipts_root: EMPTY_ROOT,
-            ommers_hash: EMPTY_LIST_HASH,
-            transactions_root: EMPTY_ROOT,
-        }
-    }
-}
-
-pub async fn initialize_genesis<'db, Tx>(
-    txn: &Tx,
-    etl_temp_dir: &TempDir,
-    chainspec: ChainSpec,
-) -> anyhow::Result<bool>
+pub async fn initialize_genesis<'db, Tx>(txn: &Tx, genesis: GenesisData) -> anyhow::Result<bool>
 where
     Tx: MutableTransaction<'db>,
 {
-    let genesis = chainspec.genesis.number;
-    if txn.get(tables::CanonicalHeader, genesis).await?.is_some() {
+    if txn
+        .get(&tables::CanonicalHeader, BlockNumber(0))
+        .await?
+        .is_some()
+    {
         return Ok(false);
     }
 
-    let mut state_buffer = Buffer::new(txn, genesis, None);
-    state_buffer.begin_block(genesis);
+    let mut state_buffer = InMemoryState::new();
     // Allocate accounts
-    if let Some(balances) = chainspec.balances.get(&genesis) {
-        for (&address, &balance) in balances {
-            state_buffer.update_account(
+    for (address, account) in genesis.alloc {
+        let balance = account.balance;
+
+        state_buffer
+            .update_account(
                 address,
                 None,
                 Some(Account {
                     balance,
                     ..Default::default()
                 }),
-            );
-        }
+            )
+            .await?;
     }
 
-    state_buffer.write_to_db().await?;
+    // Write allocations to db - no changes only accounts
+    let mut state_table = txn.mutable_cursor(&tables::PlainState).await?;
+    for (address, account) in state_buffer.accounts() {
+        // Store account plain state
+        state_table
+            .upsert(PlainStateFusedValue::Account {
+                address,
+                account: account.encode_for_storage(false),
+            })
+            .await?;
+    }
 
-    crate::stages::promote_clean_accounts(txn, etl_temp_dir).await?;
-    crate::stages::promote_clean_storage(txn, etl_temp_dir).await?;
-    let state_root = crate::trie::regenerate_intermediate_hashes(txn, etl_temp_dir, None).await?;
+    let state_root = state_buffer.state_root_hash();
 
     let header = BlockHeader {
         parent_hash: H256::zero(),
-        beneficiary: chainspec.genesis.author,
+        beneficiary: genesis.coinbase,
         state_root,
         logs_bloom: Bloom::zero(),
-        difficulty: chainspec.genesis.seal.difficulty(),
-        number: genesis,
-        gas_limit: chainspec.genesis.gas_limit,
+        difficulty: genesis.difficulty,
+        number: BlockNumber(0),
+        gas_limit: genesis.gas_limit,
         gas_used: 0,
-        timestamp: chainspec.genesis.timestamp,
-        extra_data: chainspec.genesis.seal.extra_data(),
-        mix_hash: chainspec.genesis.seal.mix_hash(),
-        nonce: chainspec.genesis.seal.nonce(),
+        timestamp: genesis.timestamp,
+        extra_data: genesis.extra_data,
+        mix_hash: genesis.mix_hash,
+        nonce: genesis.nonce,
         base_fee_per_gas: None,
 
         receipts_root: EMPTY_ROOT,
@@ -115,36 +98,38 @@ where
     };
     let block_hash = header.hash();
 
-    txn.set(tables::Header, (genesis, block_hash), header.clone())
+    txn.set(&tables::Header, ((0.into(), block_hash), header.clone()))
         .await?;
-    txn.set(tables::CanonicalHeader, genesis, block_hash)
+    txn.set(&tables::CanonicalHeader, (0.into(), block_hash))
         .await?;
-    txn.set(tables::HeaderNumber, block_hash, genesis).await?;
+    txn.set(&tables::HeaderNumber, (block_hash, 0.into()))
+        .await?;
     txn.set(
-        tables::HeadersTotalDifficulty,
-        (genesis, block_hash),
-        header.difficulty,
+        &tables::HeadersTotalDifficulty,
+        ((0.into(), block_hash), header.difficulty),
     )
     .await?;
 
     txn.set(
-        tables::BlockBody,
-        (genesis, block_hash),
-        BodyForStorage {
-            base_tx_id: 0.into(),
-            tx_amount: 0,
-            uncles: vec![],
-        },
+        &tables::BlockBody,
+        (
+            (0.into(), block_hash),
+            BodyForStorage {
+                base_tx_id: 0.into(),
+                tx_amount: 0,
+                uncles: vec![],
+            },
+        ),
     )
     .await?;
 
-    txn.set(tables::TotalGas, genesis, 0).await?;
-    txn.set(tables::TotalTx, genesis, 0).await?;
-
-    txn.set(tables::LastHeader, Default::default(), block_hash)
+    txn.set(&tables::LastHeader, (Default::default(), block_hash))
         .await?;
 
-    txn.set(tables::Config, block_hash, chainspec).await?;
+    txn.set(&tables::Receipt, (0.into(), vec![])).await?;
+
+    txn.set(&tables::Config, (block_hash, genesis.config))
+        .await?;
 
     Ok(true)
 }
@@ -152,46 +137,25 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kv::new_mem_database;
+    use crate::{
+        kv::traits::{MutableKV, Transaction},
+        new_mem_database,
+    };
     use hex_literal::hex;
-
-    fn genesis_header_hash(chain_spec: &'static ChainSpec) -> H256 {
-        let genesis = GenesisState::new(chain_spec.clone());
-        let genesis_header = genesis.header(&genesis.initial_state());
-        genesis_header.hash()
-    }
-
-    #[test]
-    fn test_genesis_header_hashes() {
-        assert_eq!(
-            genesis_header_hash(&crate::res::chainspec::MAINNET),
-            hex!("d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3").into()
-        );
-        assert_eq!(
-            genesis_header_hash(&crate::res::chainspec::ROPSTEN),
-            hex!("41941023680923e0fe4d74a34bdac8141f2540e3ae90623718e47d66d1ca4a2d").into()
-        );
-        // TODO: fix rinkeby.ron so that the genesis_header_hash is correct
-        // assert_eq!(
-        //     genesis_header_hash(&crate::res::chainspec::RINKEBY),
-        //     hex!("6341fd3daf94b748c72ced5a5b26028f2474f5f00d824504e4fa37a75767e177").into()
-        // );
-    }
 
     #[tokio::test]
     async fn init_mainnet_genesis() {
         let db = new_mem_database().unwrap();
         let tx = db.begin_mutable().await.unwrap();
 
-        let temp_dir = TempDir::new().unwrap();
         assert!(
-            initialize_genesis(&tx, &temp_dir, crate::res::chainspec::MAINNET.clone())
+            initialize_genesis(&tx, crate::res::genesis::MAINNET.clone())
                 .await
                 .unwrap()
         );
 
         let genesis_hash = tx
-            .get(tables::CanonicalHeader, 0.into())
+            .get(&tables::CanonicalHeader, 0.into())
             .await
             .unwrap()
             .unwrap();
