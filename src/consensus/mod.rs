@@ -138,7 +138,6 @@ pub enum ValidationError {
     WrongBlockGas {
         expected: u64,
         got: u64,
-        transactions: Vec<(usize, u64)>,
     }, // BHg ≠ l(BR)u
 
     InvalidSignature, // EIP-2

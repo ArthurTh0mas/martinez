@@ -18,7 +18,7 @@ use tracing::*;
 
 #[derive(Debug)]
 pub struct Execution {
-    pub batch_size: u128,
+    pub batch_size: usize,
     pub prune_from: BlockNumber,
 }
 
@@ -26,7 +26,7 @@ async fn execute_batch_of_blocks<'db, Tx: MutableTransaction<'db>>(
     tx: &Tx,
     chain_config: ChainConfig,
     max_block: BlockNumber,
-    batch_size: u128,
+    batch_size: usize,
     starting_block: BlockNumber,
     prune_from: BlockNumber,
 ) -> anyhow::Result<BlockNumber> {
@@ -34,7 +34,6 @@ async fn execute_batch_of_blocks<'db, Tx: MutableTransaction<'db>>(
     let mut consensus_engine = engine_factory(chain_config.clone())?;
 
     let mut block_number = starting_block;
-    let mut gas_since_start = 0_u128;
     let mut gas_since_last_message = 0;
     let mut last_message = Instant::now();
     loop {
@@ -65,7 +64,6 @@ async fn execute_batch_of_blocks<'db, Tx: MutableTransaction<'db>>(
             )
         })?;
 
-        gas_since_start += u128::from(header.gas_used);
         gas_since_last_message += header.gas_used;
 
         let now = Instant::now();
@@ -82,7 +80,9 @@ async fn execute_batch_of_blocks<'db, Tx: MutableTransaction<'db>>(
         // TODO: implement pruning
         buffer.insert_receipts(block_number, receipts).await?;
 
-        if block_number == max_block || gas_since_start > batch_size {
+        if block_number == max_block
+            || block_number.0 - starting_block.0 == u64::try_from(batch_size)?
+        {
             break;
         }
 
