@@ -14,8 +14,7 @@ arrayvec = "0.7"
 async-recursion = "0.3"
 async-stream = "0.3"
 async-trait = "0.1"
-auto_impl = "0.4"
-bincode = "1"
+auto_impl = "0.5"
 byte-unit = "4"
 bytes = "1"
 bytes-literal = { git = "https://github.com/vorot93/bytes-literal" }
@@ -24,6 +23,7 @@ clap = "2"
 console-subscriber = { git = "https://github.com/tokio-rs/console" }
 crossterm = { version = "0.22", optional = true }
 derive_more = "0.99"
+directories = "4.0"
 educe = { version = "0.4", features = ["Debug", "Default"] }
 ethereum-interfaces = { git = "https://github.com/ledgerwatch/interfaces", features = [
     "remotekv",
@@ -38,6 +38,8 @@ hash256-std-hasher = "0.15"
 hex = "0.4"
 hex-literal = "0.3"
 http = "0.2"
+itertools = "0.10"
+lru = "0.7"
 maplit = "1"
 mdbx = { git = "https://github.com/vorot93/mdbx-rs" }
 modular-bitfield = "0.11"
@@ -79,7 +81,9 @@ walkdir = "2"
 
 [dev-dependencies]
 bytes-literal = { git = "https://github.com/vorot93/bytes-literal" }
+proptest = "1.0.0"
 tokio = { version = "1", features = ["full"] }
+tokio-test = "0.4.2"
 
 [[bin]]
 path = "bin/martinez.rs"
