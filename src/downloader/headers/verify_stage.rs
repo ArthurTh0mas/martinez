@@ -1,18 +1,18 @@
 use crate::downloader::headers::{
-    header_slice_status_watch::HeaderSliceStatusWatch,
     header_slices,
     header_slices::{HeaderSlice, HeaderSliceStatus, HeaderSlices},
     preverified_hashes_config::PreverifiedHashesConfig,
 };
-use parking_lot::RwLockUpgradableReadGuard;
+use parking_lot::lock_api::RwLockUpgradableReadGuard;
 use std::{ops::DerefMut, sync::Arc};
+use tokio::sync::watch;
 use tracing::*;
 
 /// Checks that block hashes are matching the expected ones and sets Verified status.
 pub struct VerifyStage {
     header_slices: Arc<HeaderSlices>,
-    pending_watch: HeaderSliceStatusWatch,
     preverified_hashes: PreverifiedHashesConfig,
+    pending_watch: watch::Receiver<usize>,
 }
 
 impl VerifyStage {
@@ -21,24 +21,28 @@ impl VerifyStage {
         preverified_hashes: PreverifiedHashesConfig,
     ) -> Self {
         Self {
-            header_slices: header_slices.clone(),
-            pending_watch: HeaderSliceStatusWatch::new(
-                HeaderSliceStatus::Downloaded,
-                header_slices,
-                "VerifyStage",
-            ),
+            pending_watch: header_slices.watch_status_changes(HeaderSliceStatus::Downloaded),
+            header_slices,
             preverified_hashes,
         }
     }
 
+    fn pending_count(&self) -> usize {
+        self.header_slices
+            .count_slices_in_status(HeaderSliceStatus::Downloaded)
+    }
+
     pub async fn execute(&mut self) -> anyhow::Result<()> {
         debug!("VerifyStage: start");
-        self.pending_watch.wait().await?;
+        if self.pending_count() == 0 {
+            debug!("VerifyStage: waiting pending");
+            while *self.pending_watch.borrow_and_update() == 0 {
+                self.pending_watch.changed().await?;
+            }
+            debug!("VerifyStage: waiting pending done");
+        }
 
-        debug!(
-            "VerifyStage: verifying {} slices",
-            self.pending_watch.pending_count()
-        );
+        info!("VerifyStage: verifying {} slices", self.pending_count());
         self.verify_pending()?;
         debug!("VerifyStage: done");
         Ok(())
@@ -65,7 +69,7 @@ impl VerifyStage {
         })
     }
 
-    /// The algorithm verifies that the edges of the slice match to the preverified hashes,
+    /// The algorithm verifies that the top of the slice matches one of the preverified hashes,
     /// and that all blocks down to the root of the slice are connected by the parent_hash field.
     ///
     /// For example, if we have a HeaderSlice[192...384]
@@ -76,7 +80,6 @@ impl VerifyStage {
     /// hash(slice[382]) == slice[383].parent_hash
     /// ...
     /// hash(slice[192]) == slice[193].parent_hash
-    /// hash(slice[192]) == preverified hash(192)
     ///
     /// Thus verifying hashes of all the headers.
     fn verify_slice(&self, slice: &HeaderSlice) -> bool {
@@ -87,16 +90,6 @@ impl VerifyStage {
 
         if headers.is_empty() {
             return true;
-        }
-
-        let first = headers.first().unwrap();
-        let first_hash = first.hash();
-        let expected_first_hash = self.preverified_hash(slice.start_block_num.0);
-        if expected_first_hash.is_none() {
-            return false;
-        }
-        if first_hash != *expected_first_hash.unwrap() {
-            return false;
         }
 
         let last = headers.last().unwrap();
@@ -133,12 +126,5 @@ impl VerifyStage {
         }
         let index = block_num / preverified_step_size;
         self.preverified_hashes.hashes.get(index as usize)
-    }
-}
-
-#[async_trait::async_trait]
-impl super::stage::Stage for VerifyStage {
-    async fn execute(&mut self) -> anyhow::Result<()> {
-        VerifyStage::execute(self).await
     }
 }

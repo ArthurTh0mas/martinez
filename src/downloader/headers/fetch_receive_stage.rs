@@ -1,13 +1,13 @@
 use crate::{
-    downloader::headers::{
-        header_slices,
-        header_slices::{HeaderSlice, HeaderSliceStatus, HeaderSlices},
-    },
-    models::{BlockHeader as Header, BlockNumber},
-    sentry::{
+    downloader::{
+        headers::{
+            header_slices,
+            header_slices::{HeaderSlice, HeaderSliceStatus, HeaderSlices},
+        },
         messages::{BlockHeadersMessage, EthMessageId, Message},
         sentry_client_reactor::SentryClientReactor,
     },
+    models::{BlockHeader as Header, BlockNumber},
 };
 use futures_core::Stream;
 use parking_lot::RwLock;
@@ -16,7 +16,6 @@ use std::{
     pin::Pin,
     sync::{atomic::*, Arc},
 };
-use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
 use tracing::*;
 
@@ -27,7 +26,7 @@ pub struct FetchReceiveStage {
     header_slices: Arc<HeaderSlices>,
     sentry: Arc<RwLock<SentryClientReactor>>,
     is_over: Arc<AtomicBool>,
-    message_stream: Mutex<Option<BlockHeadersMessageStream>>,
+    message_stream: Option<BlockHeadersMessageStream>,
 }
 
 pub struct CanProceed {
@@ -51,18 +50,17 @@ impl FetchReceiveStage {
             header_slices,
             sentry,
             is_over: Arc::new(false.into()),
-            message_stream: Mutex::new(None),
+            message_stream: None,
         }
     }
 
-    pub async fn execute(&self) -> anyhow::Result<()> {
+    pub async fn execute(&mut self) -> anyhow::Result<()> {
         debug!("FetchReceiveStage: start");
-        let mut message_stream = self.message_stream.try_lock()?;
-        if message_stream.is_none() {
-            *message_stream = Some(self.receive_headers()?);
+        if self.message_stream.is_none() {
+            self.message_stream = Some(self.receive_headers()?);
         }
 
-        let message_result = message_stream.as_mut().unwrap().next().await;
+        let message_result = self.message_stream.as_mut().unwrap().next().await;
         match message_result {
             Some(message) => self.on_headers(message.headers),
             None => self.is_over.store(true, Ordering::SeqCst),
@@ -135,12 +133,5 @@ impl FetchReceiveStage {
         });
 
         Ok(Box::pin(out_stream))
-    }
-}
-
-#[async_trait::async_trait]
-impl super::stage::Stage for FetchReceiveStage {
-    async fn execute(&mut self) -> anyhow::Result<()> {
-        FetchReceiveStage::execute(self).await
     }
 }
