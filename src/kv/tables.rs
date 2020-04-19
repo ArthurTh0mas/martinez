@@ -3,8 +3,7 @@ use crate::{models::*, zeroless_view, StageId};
 use anyhow::bail;
 use arrayref::array_ref;
 use arrayvec::ArrayVec;
-use bincode::Options;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use derive_more::*;
 use ethereum_types::*;
 use maplit::hashmap;
@@ -306,30 +305,46 @@ where
     }
 }
 
-macro_rules! bincode_table_object {
+macro_rules! rlp_table_object {
     ($ty:ty) => {
         impl TableEncode for $ty {
-            type Encoded = Vec<u8>;
+            type Encoded = BytesMut;
 
             fn encode(self) -> Self::Encoded {
-                bincode::DefaultOptions::new().serialize(&self).unwrap()
+                rlp::encode(&self)
             }
         }
 
         impl TableDecode for $ty {
             fn decode(b: &[u8]) -> anyhow::Result<Self> {
-                Ok(bincode::DefaultOptions::new().deserialize(b)?)
+                Ok(rlp::decode(b)?)
             }
         }
     };
 }
 
-bincode_table_object!(U256);
-bincode_table_object!(BodyForStorage);
-bincode_table_object!(BlockHeader);
-bincode_table_object!(Transaction);
-bincode_table_object!(Vec<crate::models::Receipt>);
-bincode_table_object!(Vec<crate::models::Log>);
+macro_rules! rlp_standalone_table_object {
+    ($ty:ty) => {
+        impl TableEncode for $ty {
+            type Encoded = Bytes;
+
+            fn encode(self) -> Self::Encoded {
+                crate::crypto::TrieEncode::trie_encode(&self)
+            }
+        }
+
+        impl TableDecode for $ty {
+            fn decode(b: &[u8]) -> anyhow::Result<Self> {
+                Ok(Self::trie_decode(b)?)
+            }
+        }
+    };
+}
+
+rlp_table_object!(U256);
+rlp_table_object!(BodyForStorage);
+rlp_table_object!(BlockHeader);
+rlp_standalone_table_object!(Transaction);
 
 macro_rules! json_table_object {
     ($ty:ident) => {
@@ -365,6 +380,35 @@ impl TableDecode for Address {
             ADDRESS_LENGTH => Ok(Address::from_slice(&*b)),
             other => Err(InvalidLength::<ADDRESS_LENGTH> { got: other }.into()),
         }
+    }
+}
+
+impl TableEncode for Vec<Address> {
+    type Encoded = Vec<u8>;
+
+    fn encode(self) -> Self::Encoded {
+        let mut v = Vec::with_capacity(self.len() * ADDRESS_LENGTH);
+        for addr in self {
+            v.extend_from_slice(&addr.encode());
+        }
+
+        v
+    }
+}
+
+impl TableDecode for Vec<Address> {
+    fn decode(b: &[u8]) -> anyhow::Result<Self> {
+        if b.len() % ADDRESS_LENGTH != 0 {
+            bail!("Slice len should be divisible by {}", ADDRESS_LENGTH);
+        }
+
+        let mut v = Vec::with_capacity(b.len() / ADDRESS_LENGTH);
+        for i in 0..b.len() / ADDRESS_LENGTH {
+            let offset = i * ADDRESS_LENGTH;
+            v.push(Address::decode(&b[offset..offset + ADDRESS_LENGTH])?);
+        }
+
+        Ok(v)
     }
 }
 
@@ -426,6 +470,34 @@ impl TableDecode for ZerolessH256 {
         }
 
         Ok(H256::from_uint(&U256::from_big_endian(b)).into())
+    }
+}
+
+impl TableEncode for (H256, ZerolessH256) {
+    type Encoded = VariableVec<{ KECCAK_LENGTH + KECCAK_LENGTH }>;
+
+    fn encode(self) -> Self::Encoded {
+        let mut out = Self::Encoded::default();
+        out.try_extend_from_slice(&self.0.encode()).unwrap();
+        out.try_extend_from_slice(zeroless_view(&(self.1).0))
+            .unwrap();
+        out
+    }
+}
+
+impl TableDecode for (H256, ZerolessH256) {
+    fn decode(b: &[u8]) -> anyhow::Result<Self> {
+        if b.len() > KECCAK_LENGTH + KECCAK_LENGTH {
+            return Err(TooLong::<{ KECCAK_LENGTH + KECCAK_LENGTH }> { got: b.len() }.into());
+        }
+
+        if b.len() < KECCAK_LENGTH {
+            return Err(TooShort::<{ KECCAK_LENGTH }> { got: b.len() }.into());
+        }
+
+        let (location, value) = b.split_at(KECCAK_LENGTH);
+
+        Ok((H256::decode(location)?, ZerolessH256::decode(value)?))
     }
 }
 
@@ -938,7 +1010,7 @@ decl_table!(PlainCodeHash => (Address, Incarnation) => H256);
 decl_table!(AccountChangeSet => AccountChangeKey => AccountChange);
 decl_table!(StorageChangeSet => StorageChangeKey => StorageChange => StorageChangeSeekKey);
 decl_table!(HashedAccount => H256 => Vec<u8>);
-decl_table!(HashedStorage => Vec<u8> => Vec<u8>);
+decl_table!(HashedStorage => (H256, Incarnation) => (H256, ZerolessH256));
 decl_table!(AccountHistory => BitmapKey<Address> => RoaringTreemap);
 decl_table!(StorageHistory => BitmapKey<(Address, H256)> => RoaringTreemap);
 decl_table!(Code => H256 => Bytes);
@@ -955,8 +1027,6 @@ decl_table!(Header => HeaderKey => BlockHeader => BlockNumber);
 decl_table!(HeadersTotalDifficulty => HeaderKey => U256);
 decl_table!(BlockBody => HeaderKey => BodyForStorage => BlockNumber);
 decl_table!(BlockTransaction => TxIndex => Transaction);
-decl_table!(Receipt => BlockNumber => Vec<crate::models::Receipt>);
-decl_table!(TransactionLog => (BlockNumber, TxIndex) => Vec<crate::models::Log>);
 decl_table!(LogTopicIndex => Vec<u8> => RoaringTreemap);
 decl_table!(LogAddressIndex => Vec<u8> => RoaringTreemap);
 decl_table!(CallTraceSet => BlockNumber => CallTraceSetEntry);
@@ -965,7 +1035,7 @@ decl_table!(CallToIndex => Vec<u8> => RoaringTreemap);
 decl_table!(BlockTransactionLookup => H256 => TruncateStart<BlockNumber>);
 decl_table!(Config => H256 => ChainConfig);
 decl_table!(SyncStage => StageId => BlockNumber);
-decl_table!(TxSender => TxIndex => Address);
+decl_table!(TxSender => HeaderKey => Vec<Address>);
 decl_table!(LastBlock => Vec<u8> => Vec<u8>);
 decl_table!(Migration => Vec<u8> => Vec<u8>);
 decl_table!(Sequence => Vec<u8> => Vec<u8>);
@@ -1006,8 +1076,6 @@ pub static CHAINDATA_TABLES: Lazy<Arc<HashMap<&'static str, TableInfo>>> = Lazy:
         HeadersTotalDifficulty::const_db_name() => TableInfo::default(),
         BlockBody::const_db_name() => TableInfo::default(),
         BlockTransaction::const_db_name() => TableInfo::default(),
-        Receipt::const_db_name() => TableInfo::default(),
-        TransactionLog::const_db_name() => TableInfo::default(),
         LogTopicIndex::const_db_name() => TableInfo::default(),
         LogAddressIndex::const_db_name() => TableInfo::default(),
         CallTraceSet::const_db_name() => TableInfo {
