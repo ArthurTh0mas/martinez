@@ -124,11 +124,15 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use crate::{accessors::chain, kv::traits::MutableKV, models::*, new_mem_database};
     use bytes::Bytes;
     use ethereum_types::*;
     use hex_literal::hex;
+
+    const CHAIN_ID: Option<ChainId> = Some(ChainId(1));
 
     #[tokio::test]
     async fn tx_lookup_stage_with_data() {
@@ -146,7 +150,7 @@ mod tests {
 
         let tx1_1 = Transaction {
             message: TransactionMessage::Legacy {
-                chain_id: Some(1),
+                chain_id: CHAIN_ID,
                 nonce: 1,
                 gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
@@ -169,7 +173,7 @@ mod tests {
 
         let tx1_2 = Transaction {
             message: TransactionMessage::Legacy {
-                chain_id: Some(1),
+                chain_id: CHAIN_ID,
                 nonce: 2,
                 gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
@@ -198,7 +202,7 @@ mod tests {
 
         let tx2_1 = Transaction {
             message: TransactionMessage::Legacy {
-                chain_id: Some(1),
+                chain_id: CHAIN_ID,
                 nonce: 3,
                 gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
@@ -222,7 +226,7 @@ mod tests {
 
         let tx2_2 = Transaction {
             message: TransactionMessage::Legacy {
-                chain_id: Some(1),
+                chain_id: CHAIN_ID,
                 nonce: 6,
                 gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
@@ -246,7 +250,7 @@ mod tests {
 
         let tx2_3 = Transaction {
             message: TransactionMessage::Legacy {
-                chain_id: Some(1),
+                chain_id: CHAIN_ID,
                 nonce: 2,
                 gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
@@ -299,6 +303,7 @@ mod tests {
 
         let stage_input = StageInput {
             restarted: false,
+            first_started_at: (Instant::now(), Some(BlockNumber(0))),
             previous_stage: Some((StageId("BodyDownload"), 3.into())),
             stage_progress: Some(0.into()),
         };
@@ -336,6 +341,7 @@ mod tests {
 
         let stage_input = StageInput {
             restarted: false,
+            first_started_at: (Instant::now(), Some(BlockNumber(0))),
             previous_stage: Some((StageId("BodyDownload"), 3.into())),
             stage_progress: Some(0.into()),
         };
@@ -368,7 +374,7 @@ mod tests {
 
         let tx1_1 = Transaction {
             message: TransactionMessage::Legacy {
-                chain_id: Some(1),
+                chain_id: CHAIN_ID,
                 nonce: 1,
                 gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
@@ -391,7 +397,7 @@ mod tests {
 
         let tx1_2 = Transaction {
             message: TransactionMessage::Legacy {
-                chain_id: Some(1),
+                chain_id: CHAIN_ID,
                 nonce: 2,
                 gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
@@ -420,7 +426,7 @@ mod tests {
 
         let tx2_1 = Transaction {
             message: TransactionMessage::Legacy {
-                chain_id: Some(1),
+                chain_id: CHAIN_ID,
                 nonce: 3,
                 gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
@@ -444,7 +450,7 @@ mod tests {
 
         let tx2_2 = Transaction {
             message: TransactionMessage::Legacy {
-                chain_id: Some(1),
+                chain_id: CHAIN_ID,
                 nonce: 6,
                 gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
@@ -468,7 +474,7 @@ mod tests {
 
         let tx2_3 = Transaction {
             message: TransactionMessage::Legacy {
-                chain_id: Some(1),
+                chain_id: CHAIN_ID,
                 nonce: 2,
                 gas_price: 1_000_000.into(),
                 gas_limit: 21_000,

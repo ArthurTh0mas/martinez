@@ -1,7 +1,8 @@
-use self::processor::ExecutionProcessor;
+use self::{analysis_cache::AnalysisCache, processor::ExecutionProcessor};
 use crate::{consensus, crypto::*, models::*, State};
 
-mod address;
+pub mod address;
+pub mod analysis_cache;
 pub mod evm;
 pub mod precompiled;
 pub mod processor;
@@ -12,10 +13,18 @@ pub async fn execute_block<S: State>(
     header: &PartialHeader,
     block: &BlockBodyWithSenders,
 ) -> anyhow::Result<Vec<Receipt>> {
+    let mut analysis_cache = AnalysisCache::default();
     let mut engine = consensus::engine_factory(config.clone())?;
-    ExecutionProcessor::new(state, &mut *engine, header, block, config)
-        .execute_and_write_block()
-        .await
+    ExecutionProcessor::new(
+        state,
+        &mut analysis_cache,
+        &mut *engine,
+        header,
+        block,
+        config,
+    )
+    .execute_and_write_block()
+    .await
 }
 
 #[cfg(test)]
@@ -104,7 +113,7 @@ mod tests {
 
                     gas_limit: header.gas_limit,
                     max_fee_per_gas: U256::from(20 * GIGA),
-                    chain_id: 1,
+                    chain_id: ChainId(1),
 
                     value: U256::zero(),
                     access_list: Default::default(),
