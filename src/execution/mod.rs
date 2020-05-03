@@ -1,7 +1,7 @@
 use self::{analysis_cache::AnalysisCache, processor::ExecutionProcessor};
 use crate::{consensus, crypto::*, models::*, State};
 
-pub mod address;
+mod address;
 pub mod analysis_cache;
 pub mod evm;
 pub mod precompiled;
@@ -113,7 +113,7 @@ mod tests {
 
                     gas_limit: header.gas_limit,
                     max_fee_per_gas: U256::from(20 * GIGA),
-                    chain_id: ChainId(1),
+                    chain_id: 1,
 
                     value: U256::zero(),
                     access_list: Default::default(),

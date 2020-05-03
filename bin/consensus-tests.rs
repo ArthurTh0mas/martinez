@@ -116,30 +116,28 @@ impl FromStr for Network {
     }
 }
 
-const CHAIN_ID: ChainId = ChainId(1);
-
 static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
     hashmap! {
         Network::Frontier => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             ..ChainConfig::default()
         },
         Network::Homestead => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             ..ChainConfig::default()
         },
         Network::EIP150 => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(0.into()),
             ..ChainConfig::default()
         },
         Network::EIP158 => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(0.into()),
@@ -147,7 +145,7 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
             ..ChainConfig::default()
         },
         Network::Byzantium => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(0.into()),
@@ -156,7 +154,7 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
             ..ChainConfig::default()
         },
         Network::Constantinople => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(0.into()),
@@ -166,7 +164,7 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
             ..ChainConfig::default()
         },
         Network::ConstantinopleFix => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(0.into()),
@@ -177,7 +175,7 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
             ..ChainConfig::default()
         },
         Network::Istanbul => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(0.into()),
@@ -189,7 +187,7 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
             ..ChainConfig::default()
         },
         Network::Berlin => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(0.into()),
@@ -203,7 +201,7 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
             ..ChainConfig::default()
         },
         Network::London => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(0.into()),
@@ -218,20 +216,20 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
             ..ChainConfig::default()
         },
         Network::FrontierToHomesteadAt5 => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(5.into()),
             ..ChainConfig::default()
         },
         Network::HomesteadToEIP150At5 => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(5.into()),
             ..ChainConfig::default()
         },
         Network::HomesteadToDaoAt5 => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             dao_fork: Some(DaoConfig {
@@ -241,7 +239,7 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
             ..ChainConfig::default()
         },
         Network::EIP158ToByzantiumAt5 => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(0.into()),
@@ -250,7 +248,7 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
             ..ChainConfig::default()
         },
         Network::ByzantiumToConstantinopleFixAt5 => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(0.into()),
@@ -261,7 +259,7 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
             ..ChainConfig::default()
         },
         Network::BerlinToLondonAt5 => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(0.into()),
@@ -276,7 +274,7 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
             ..ChainConfig::default()
         },
         Network::EIP2384 => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(0.into()),

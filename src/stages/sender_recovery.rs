@@ -4,10 +4,7 @@ use crate::{
         traits::{Cursor, MutableCursor, TableEncode},
     },
     models::*,
-    stagedsync::{
-        format_duration,
-        stage::{ExecOutput, Stage, StageInput, UnwindInput},
-    },
+    stagedsync::stage::{ExecOutput, Stage, StageInput, UnwindInput},
     MutableTransaction, StageId,
 };
 use async_trait::async_trait;
@@ -46,13 +43,6 @@ where
         let mut walker = body_cur.walk(Some(BlockNumber(highest_block.0 + 1)));
         let mut batch = Vec::with_capacity(BUFFERING_FACTOR);
         let started_at = Instant::now();
-        let started_at_txnum = tx
-            .get(
-                &tables::CumulativeIndex,
-                input.first_started_at.1.unwrap_or(BlockNumber(0)),
-            )
-            .await?
-            .map(|v| v.tx_num);
         let done = loop {
             while let Some(((block_number, hash), body)) = walker.try_next().await? {
                 let txs = tx_cur
@@ -109,43 +99,7 @@ where
             let now = Instant::now();
             let elapsed = now - started_at;
             if elapsed > Duration::from_secs(30) {
-                let mut format_string = format!("Extracted senders from block {}", highest_block);
-
-                if let Some(started_at_txnum) = started_at_txnum {
-                    let current_txnum = tx
-                        .get(&tables::CumulativeIndex, highest_block)
-                        .await?
-                        .map(|v| v.tx_num);
-                    let total_txnum = tx
-                        .cursor(&tables::CumulativeIndex)
-                        .await?
-                        .last()
-                        .await?
-                        .map(|(_, v)| v.tx_num);
-
-                    if let Some(current_txnum) = current_txnum {
-                        if let Some(total_txnum) = total_txnum {
-                            let elapsed_since_start = now - input.first_started_at.0;
-
-                            format_string = format!(
-                                "{}, progress: {:.2}%, {} remaining",
-                                format_string,
-                                (current_txnum as f64 / total_txnum as f64) * 100_f64,
-                                format_duration(
-                                    Duration::from_secs(
-                                        (elapsed_since_start.as_secs() as f64
-                                            * ((total_txnum - current_txnum) as f64
-                                                / (current_txnum - started_at_txnum) as f64))
-                                            as u64
-                                    ),
-                                    false
-                                )
-                            );
-                        }
-                    }
-                }
-
-                info!("{}", format_string);
+                info!("Extracted senders from block {}", highest_block);
                 break false;
             }
         };
@@ -173,8 +127,6 @@ mod tests {
     use ethereum_types::*;
     use hex_literal::hex;
 
-    const CHAIN_ID: Option<ChainId> = Some(ChainId(1));
-
     #[tokio::test]
     async fn recover_senders() {
         let db = new_mem_database().unwrap();
@@ -194,7 +146,7 @@ mod tests {
 
         let tx1_1 = Transaction {
             message: TransactionMessage::Legacy {
-                chain_id: CHAIN_ID,
+                chain_id: Some(1),
                 nonce: 1,
                 gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
@@ -216,7 +168,7 @@ mod tests {
 
         let tx1_2 = Transaction {
             message: TransactionMessage::Legacy {
-                chain_id: CHAIN_ID,
+                chain_id: Some(1),
                 nonce: 2,
                 gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
@@ -244,7 +196,7 @@ mod tests {
 
         let tx2_1 = Transaction {
             message: TransactionMessage::Legacy {
-                chain_id: CHAIN_ID,
+                chain_id: Some(1),
                 nonce: 3,
                 gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
@@ -266,7 +218,7 @@ mod tests {
 
         let tx2_2 = Transaction {
             message: TransactionMessage::Legacy {
-                chain_id: CHAIN_ID,
+                chain_id: Some(1),
                 nonce: 6,
                 gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
@@ -288,7 +240,7 @@ mod tests {
 
         let tx2_3 = Transaction {
             message: TransactionMessage::Legacy {
-                chain_id: CHAIN_ID,
+                chain_id: Some(1),
                 nonce: 2,
                 gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
@@ -343,7 +295,6 @@ mod tests {
 
         let stage_input = StageInput {
             restarted: false,
-            first_started_at: (Instant::now(), Some(BlockNumber(0))),
             previous_stage: Some((StageId("BodyDownload"), 3.into())),
             stage_progress: Some(0.into()),
         };

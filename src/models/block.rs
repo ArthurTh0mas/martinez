@@ -108,8 +108,6 @@ pub struct WithHash<T> {
 mod tests {
     use super::*;
 
-    const CHAIN_ID: ChainId = ChainId(1);
-
     #[test]
     fn compose_block() {
         // https://etherscan.io/block/13143465
@@ -139,7 +137,7 @@ mod tests {
         let transactions = vec![
             Transaction {
                 message: TransactionMessage::EIP1559 {
-                    chain_id: CHAIN_ID,
+                    chain_id: 1,
                     nonce: 20369,
                     max_priority_fee_per_gas: 0x50a3d0b5d_u64.into(),
                     max_fee_per_gas: 0x23a9e38cf8_u64.into(),
@@ -153,7 +151,7 @@ mod tests {
             },
             Transaction {
                 message: TransactionMessage::EIP1559 {
-                    chain_id: CHAIN_ID,
+                    chain_id: 1,
                     nonce: 318_955,
                     max_priority_fee_per_gas: 0x156ba0980_u64.into(),
                     max_fee_per_gas: 0x29f7bcba80_u64.into(),
@@ -167,7 +165,7 @@ mod tests {
             },
             Transaction {
                 message: TransactionMessage::EIP1559 {
-                    chain_id: CHAIN_ID,
+                    chain_id: 1,
                     nonce: 0x4ddec,
                     max_priority_fee_per_gas: 0x156ba0980_u64.into(),
                     max_fee_per_gas: 0x29f7bcba80_u64.into(),
@@ -181,7 +179,7 @@ mod tests {
             },
             Transaction {
                 message: TransactionMessage::EIP1559 {
-                    chain_id: CHAIN_ID,
+                    chain_id: 1,
                     nonce: 0x3f8,
                     max_priority_fee_per_gas: 0x77359400_u64.into(),
                     max_fee_per_gas: 0x20f823e84c_u64.into(),
@@ -195,7 +193,7 @@ mod tests {
             },
             Transaction {
                 message: TransactionMessage::EIP1559 {
-                    chain_id: CHAIN_ID,
+                    chain_id: 1,
                     nonce: 0x5a9f9,
                     max_priority_fee_per_gas: 0x77359400_u64.into(),
                     max_fee_per_gas: 0x293605aa00_u64.into(),
@@ -209,7 +207,7 @@ mod tests {
             },
             Transaction {
                 message: TransactionMessage::EIP1559 {
-                    chain_id: CHAIN_ID,
+                    chain_id: 1,
                     nonce: 0x36d,
                     max_priority_fee_per_gas: 0x73a20d00_u64.into(),
                     max_fee_per_gas: 0x226f4988d9_u64.into(),
@@ -223,7 +221,7 @@ mod tests {
             },
             Transaction {
                 message: TransactionMessage::EIP1559 {
-                    chain_id: CHAIN_ID,
+                    chain_id: 1,
                     nonce: 0x23,
                     max_priority_fee_per_gas: 0x3b9aca00_u64.into(),
                     max_fee_per_gas: 0x28dcc4b35e_u64.into(),
@@ -353,7 +351,7 @@ mod tests {
                 },
                 Transaction {
                     message: TransactionMessage::EIP1559 {
-                        chain_id: CHAIN_ID,
+                        chain_id: 1,
                         nonce: 1,
                         max_priority_fee_per_gas: U256::from(5 * GIGA),
                         max_fee_per_gas: U256::from(30 * GIGA),
