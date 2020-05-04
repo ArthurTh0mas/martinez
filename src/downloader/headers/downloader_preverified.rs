@@ -2,7 +2,7 @@ use super::{
     fetch_receive_stage::FetchReceiveStage, fetch_request_stage::FetchRequestStage, header_slices,
     header_slices::HeaderSlices, preverified_hashes_config::PreverifiedHashesConfig,
     refill_stage::RefillStage, retry_stage::RetryStage, save_stage::SaveStage,
-    verify_stage::VerifyStage, HeaderSlicesView,
+    verify_stage_preverified::VerifyStagePreverified, HeaderSlicesView,
 };
 use crate::{
     downloader::{
@@ -44,18 +44,19 @@ impl<DB: kv::traits::MutableKV + Sync> DownloaderPreverified<DB> {
         }
     }
 
-    pub async fn run(&self) -> anyhow::Result<BlockNumber> {
+    pub async fn run(&self) -> anyhow::Result<(BlockNumber, ethereum_types::H256)> {
         let preverified_hashes_config = PreverifiedHashesConfig::new(&self.chain_name)?;
 
-        let header_slices_mem_limit = self.mem_limit;
-        let header_slices_final_block_num = BlockNumber(
+        let final_block_num = BlockNumber(
             ((preverified_hashes_config.hashes.len() - 1) * header_slices::HEADER_SLICE_SIZE)
                 as u64,
         );
+        let final_block_hash = *preverified_hashes_config.hashes.last().unwrap();
+
         let header_slices = Arc::new(HeaderSlices::new(
-            header_slices_mem_limit,
+            self.mem_limit,
             BlockNumber(0),
-            header_slices_final_block_num,
+            final_block_num,
         ));
         let sentry = self.sentry.clone();
 
@@ -71,10 +72,15 @@ impl<DB: kv::traits::MutableKV + Sync> DownloaderPreverified<DB> {
         // although most of the time only one of the stages is actively running,
         // while the others are waiting for the status updates or timeouts.
 
-        let fetch_request_stage = FetchRequestStage::new(header_slices.clone(), sentry.clone());
+        let fetch_request_stage = FetchRequestStage::new(
+            header_slices.clone(),
+            sentry.clone(),
+            header_slices::HEADER_SLICE_SIZE + 1,
+        );
         let fetch_receive_stage = FetchReceiveStage::new(header_slices.clone(), sentry.clone());
         let retry_stage = RetryStage::new(header_slices.clone());
-        let verify_stage = VerifyStage::new(header_slices.clone(), preverified_hashes_config);
+        let verify_stage =
+            VerifyStagePreverified::new(header_slices.clone(), preverified_hashes_config);
         let save_stage = SaveStage::new(header_slices.clone(), self.db.clone());
         let refill_stage = RefillStage::new(header_slices.clone());
 
@@ -110,6 +116,6 @@ impl<DB: kv::traits::MutableKV + Sync> DownloaderPreverified<DB> {
             header_slices.notify_status_watchers();
         }
 
-        Ok(header_slices_final_block_num)
+        Ok((final_block_num, final_block_hash))
     }
 }
