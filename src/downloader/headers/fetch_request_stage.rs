@@ -1,64 +1,66 @@
 use crate::{
-    downloader::headers::{
-        header_slice_status_watch::HeaderSliceStatusWatch,
-        header_slices::{HeaderSliceStatus, HeaderSlices},
-    },
-    models::BlockNumber,
-    sentry::{
+    downloader::{
         block_id,
+        headers::{
+            header_slices,
+            header_slices::{HeaderSliceStatus, HeaderSlices},
+        },
         messages::{GetBlockHeadersMessage, GetBlockHeadersMessageParams, Message},
         sentry_client::PeerFilter,
         sentry_client_reactor::{SendMessageError, SentryClientReactor},
     },
+    models::BlockNumber,
 };
-use parking_lot::{RwLock, RwLockUpgradableReadGuard};
+use parking_lot::{lock_api::RwLockUpgradableReadGuard, RwLock};
 use std::{
     ops::DerefMut,
     sync::{atomic::*, Arc},
     time,
 };
+use tokio::sync::watch;
 use tracing::*;
 
 /// Sends requests to P2P via sentry to get the slices. Slices become Waiting.
 pub struct FetchRequestStage {
     header_slices: Arc<HeaderSlices>,
     sentry: Arc<RwLock<SentryClientReactor>>,
-    slice_size: usize,
-    pending_watch: HeaderSliceStatusWatch,
     last_request_id: AtomicU64,
+    pending_watch: watch::Receiver<usize>,
 }
 
 impl FetchRequestStage {
-    pub fn new(
-        header_slices: Arc<HeaderSlices>,
-        sentry: Arc<RwLock<SentryClientReactor>>,
-        slice_size: usize,
-    ) -> Self {
+    pub fn new(header_slices: Arc<HeaderSlices>, sentry: Arc<RwLock<SentryClientReactor>>) -> Self {
         Self {
-            header_slices: header_slices.clone(),
-            sentry,
-            slice_size,
-            pending_watch: HeaderSliceStatusWatch::new(
-                HeaderSliceStatus::Empty,
-                header_slices,
-                "FetchRequestStage",
-            ),
+            pending_watch: header_slices.watch_status_changes(HeaderSliceStatus::Empty),
             last_request_id: 0.into(),
+            header_slices,
+            sentry,
         }
+    }
+
+    fn pending_count(&self) -> usize {
+        self.header_slices
+            .count_slices_in_status(HeaderSliceStatus::Empty)
     }
 
     pub async fn execute(&mut self) -> anyhow::Result<()> {
         debug!("FetchRequestStage: start");
-        self.pending_watch.wait().await?;
+        if self.pending_count() == 0 {
+            debug!("FetchRequestStage: waiting pending");
+            while *self.pending_watch.borrow_and_update() == 0 {
+                self.pending_watch.changed().await?;
+            }
+            debug!("FetchRequestStage: waiting pending done");
+        }
 
-        debug!(
+        info!(
             "FetchRequestStage: requesting {} slices",
-            self.pending_watch.pending_count()
+            self.pending_count()
         );
         self.request_pending()?;
 
         // in case of SendQueueFull, await for extra capacity
-        if self.pending_watch.pending_count() > 0 {
+        if self.pending_count() > 0 {
             // obtain the sentry lock, and release it before awaiting
             let capacity_future = {
                 let sentry = self.sentry.read();
@@ -78,7 +80,7 @@ impl FetchRequestStage {
                 let request_id = self.last_request_id.fetch_add(1, Ordering::SeqCst);
 
                 let block_num = slice.start_block_num;
-                let limit = self.slice_size as u64;
+                let limit = header_slices::HEADER_SLICE_SIZE as u64 + 1;
 
                 let result = self.request(request_id, block_num, limit);
                 match result {
@@ -115,12 +117,5 @@ impl FetchRequestStage {
         self.sentry
             .read()
             .try_send_message(Message::GetBlockHeaders(message), PeerFilter::Random(1))
-    }
-}
-
-#[async_trait::async_trait]
-impl super::stage::Stage for FetchRequestStage {
-    async fn execute(&mut self) -> anyhow::Result<()> {
-        FetchRequestStage::execute(self).await
     }
 }

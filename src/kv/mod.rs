@@ -9,7 +9,7 @@ pub use traits::{DupSort, Table, TableDecode, TableEncode, TableObject};
 use crate::kv::tables::CHAINDATA_TABLES;
 use ::mdbx::{Geometry, WriteMap};
 use async_trait::async_trait;
-use byte_unit::*;
+use byte_unit::{n_mib_bytes, n_tib_bytes};
 use bytes::Bytes as StaticBytes;
 use std::{fmt::Debug, ops::Deref};
 
@@ -46,13 +46,13 @@ impl DupSort for CustomTable {
 }
 
 #[derive(Debug)]
-pub struct MdbxWithDirHandle {
+pub struct MemoryKv {
     inner: mdbx::Environment<WriteMap>,
     _tmpdir: Option<tempfile::TempDir>,
 }
 
 #[async_trait]
-impl traits::KV for MdbxWithDirHandle {
+impl traits::KV for MemoryKv {
     type Tx<'tx> = <mdbx::Environment<WriteMap> as traits::KV>::Tx<'tx>;
 
     async fn begin(&self) -> anyhow::Result<Self::Tx<'_>> {
@@ -61,7 +61,7 @@ impl traits::KV for MdbxWithDirHandle {
 }
 
 #[async_trait]
-impl traits::MutableKV for MdbxWithDirHandle {
+impl traits::MutableKV for MemoryKv {
     type MutableTx<'tx> = <mdbx::Environment<WriteMap> as traits::MutableKV>::MutableTx<'tx>;
 
     async fn begin_mutable(&self) -> anyhow::Result<Self::MutableTx<'_>> {
@@ -71,15 +71,15 @@ impl traits::MutableKV for MdbxWithDirHandle {
 
 pub fn new_mem_database() -> anyhow::Result<impl traits::MutableKV> {
     let tmpdir = tempfile::tempdir()?;
-    Ok(MdbxWithDirHandle {
+    Ok(MemoryKv {
         inner: new_environment(tmpdir.path(), n_mib_bytes!(64), None)?,
         _tmpdir: Some(tmpdir),
     })
 }
 
 pub fn new_database(path: &std::path::Path) -> anyhow::Result<impl traits::MutableKV> {
-    Ok(MdbxWithDirHandle {
-        inner: new_environment(path, n_tib_bytes!(4), Some(n_gib_bytes!(4) as usize))?,
+    Ok(MemoryKv {
+        inner: new_environment(path, n_tib_bytes!(4), Some(n_mib_bytes!(8) as usize))?,
         _tmpdir: None,
     })
 }
@@ -97,6 +97,5 @@ fn new_environment(
         shrink_threshold: None,
         page_size: None,
     });
-    builder.set_rp_augment_limit(16 * 256 * 1024);
     mdbx::Environment::open_rw(builder, path, CHAINDATA_TABLES.deref().clone())
 }

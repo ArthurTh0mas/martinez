@@ -1,37 +1,39 @@
-use crate::downloader::headers::{
-    header_slice_status_watch::HeaderSliceStatusWatch,
-    header_slices::{HeaderSliceStatus, HeaderSlices},
-};
+use crate::downloader::headers::header_slices::{HeaderSliceStatus, HeaderSlices};
 use std::sync::Arc;
+use tokio::sync::watch;
 use tracing::*;
 
 /// Forgets the Saved slices from memory, and creates more Empty slices
 /// until we reach the end of pre-verified chain.
 pub struct RefillStage {
     header_slices: Arc<HeaderSlices>,
-    pending_watch: HeaderSliceStatusWatch,
+    pending_watch: watch::Receiver<usize>,
 }
 
 impl RefillStage {
     pub fn new(header_slices: Arc<HeaderSlices>) -> Self {
         Self {
-            header_slices: header_slices.clone(),
-            pending_watch: HeaderSliceStatusWatch::new(
-                HeaderSliceStatus::Saved,
-                header_slices,
-                "RefillStage",
-            ),
+            pending_watch: header_slices.watch_status_changes(HeaderSliceStatus::Saved),
+            header_slices,
         }
+    }
+
+    fn pending_count(&self) -> usize {
+        self.header_slices
+            .count_slices_in_status(HeaderSliceStatus::Saved)
     }
 
     pub async fn execute(&mut self) -> anyhow::Result<()> {
         debug!("RefillStage: start");
-        self.pending_watch.wait().await?;
+        if self.pending_count() == 0 {
+            debug!("RefillStage: waiting pending");
+            while *self.pending_watch.borrow_and_update() == 0 {
+                self.pending_watch.changed().await?;
+            }
+            debug!("RefillStage: waiting pending done");
+        }
 
-        debug!(
-            "RefillStage: refilling {} slices",
-            self.pending_watch.pending_count()
-        );
+        info!("RefillStage: refilling {} slices", self.pending_count());
         self.refill_pending();
         debug!("RefillStage: done");
         Ok(())
@@ -40,12 +42,5 @@ impl RefillStage {
     fn refill_pending(&self) {
         self.header_slices.remove(HeaderSliceStatus::Saved);
         self.header_slices.refill();
-    }
-}
-
-#[async_trait::async_trait]
-impl super::stage::Stage for RefillStage {
-    async fn execute(&mut self) -> anyhow::Result<()> {
-        RefillStage::execute(self).await
     }
 }

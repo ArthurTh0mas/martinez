@@ -1,4 +1,4 @@
-use super::{BlockNumber, ChainId};
+use super::BlockNumber;
 use educe::Educe;
 use ethereum_types::*;
 use evmodin::Revision;
@@ -27,7 +27,7 @@ pub struct DaoConfig {
 #[serde(rename_all = "camelCase")]
 pub struct ChainConfig {
     pub seal_engine: SealEngineType,
-    pub chain_id: ChainId,
+    pub chain_id: u64,
     pub homestead_block: Option<BlockNumber>,
     pub dao_fork: Option<DaoConfig>,
     pub tangerine_block: Option<BlockNumber>,
@@ -39,7 +39,6 @@ pub struct ChainConfig {
     pub muir_glacier_block: Option<BlockNumber>,
     pub berlin_block: Option<BlockNumber>,
     pub london_block: Option<BlockNumber>,
-    pub arrow_glacier_block: Option<BlockNumber>,
 }
 
 impl ChainConfig {
@@ -56,7 +55,6 @@ impl ChainConfig {
             self.muir_glacier_block,
             self.berlin_block,
             self.london_block,
-            self.arrow_glacier_block,
         ]
         .iter()
         .filter_map(|b| {
@@ -99,24 +97,5 @@ impl ChainConfig {
             .as_ref()
             .map(|c| c.block_number == block_number.into())
             .unwrap_or(false)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn distinct_block_numbers() {
-        assert_eq!(
-            crate::res::genesis::MAINNET.config.gather_forks(),
-            vec![
-                1_150_000, 1_920_000, 2_463_000, 2_675_000, 4_370_000, 7_280_000, 9_069_000,
-                9_200_000, 12_244_000, 12_965_000, 13_773_000
-            ]
-            .into_iter()
-            .map(BlockNumber)
-            .collect()
-        );
     }
 }

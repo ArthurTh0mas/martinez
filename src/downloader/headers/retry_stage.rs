@@ -1,40 +1,45 @@
-use crate::downloader::headers::{
-    header_slice_status_watch::HeaderSliceStatusWatch,
-    header_slices::{HeaderSlice, HeaderSliceStatus, HeaderSlices},
-};
-use parking_lot::RwLockUpgradableReadGuard;
+use crate::downloader::headers::header_slices::{HeaderSlice, HeaderSliceStatus, HeaderSlices};
+use parking_lot::lock_api::RwLockUpgradableReadGuard;
 use std::{ops::DerefMut, sync::Arc, time, time::Duration};
+use tokio::sync::watch;
 use tracing::*;
 
 /// Handles timeouts. If a slice is Waiting for too long, we need to request it again.
 /// Status is updated to Empty (the slice will be processed by the FetchRequestStage again).
 pub struct RetryStage {
     header_slices: Arc<HeaderSlices>,
-    pending_watch: HeaderSliceStatusWatch,
+    pending_watch: watch::Receiver<usize>,
 }
 
 impl RetryStage {
     pub fn new(header_slices: Arc<HeaderSlices>) -> Self {
         Self {
-            header_slices: header_slices.clone(),
-            pending_watch: HeaderSliceStatusWatch::new(
-                HeaderSliceStatus::Waiting,
-                header_slices,
-                "RetryStage",
-            ),
+            pending_watch: header_slices.watch_status_changes(HeaderSliceStatus::Waiting),
+            header_slices,
         }
+    }
+
+    fn pending_count(&self) -> usize {
+        self.header_slices
+            .count_slices_in_status(HeaderSliceStatus::Waiting)
     }
 
     pub async fn execute(&mut self) -> anyhow::Result<()> {
         debug!("RetryStage: start");
-        self.pending_watch.wait().await?;
+        if self.pending_count() == 0 {
+            debug!("RetryStage: waiting pending");
+            while *self.pending_watch.borrow_and_update() == 0 {
+                self.pending_watch.changed().await?;
+            }
+            debug!("RetryStage: waiting pending done");
+        }
 
         // don't retry more often than once per 1 sec
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         let count = self.reset_pending()?;
         if count > 0 {
-            debug!("RetryStage: did reset {} slices for retry", count);
+            info!("RetryStage: did reset {} slices for retry", count);
         }
         debug!("RetryStage: done");
         Ok(())
@@ -77,12 +82,5 @@ impl RetryStage {
             2 => Duration::from_secs(15),
             _ => Duration::from_secs(30),
         }
-    }
-}
-
-#[async_trait::async_trait]
-impl super::stage::Stage for RetryStage {
-    async fn execute(&mut self) -> anyhow::Result<()> {
-        RetryStage::execute(self).await
     }
 }

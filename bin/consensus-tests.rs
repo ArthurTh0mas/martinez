@@ -1,7 +1,10 @@
 #![allow(clippy::suspicious_else_formatting)]
 use martinez::{
-    chain::difficulty::canonical_difficulty, consensus::*, crypto::keccak256, models::*,
-    res::genesis, *,
+    chain::{config::*, difficulty::canonical_difficulty},
+    consensus::*,
+    crypto::keccak256,
+    models::*,
+    *,
 };
 use anyhow::*;
 use bytes::Bytes;
@@ -116,30 +119,28 @@ impl FromStr for Network {
     }
 }
 
-const CHAIN_ID: ChainId = ChainId(1);
-
 static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
     hashmap! {
         Network::Frontier => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             ..ChainConfig::default()
         },
         Network::Homestead => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             ..ChainConfig::default()
         },
         Network::EIP150 => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(0.into()),
             ..ChainConfig::default()
         },
         Network::EIP158 => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(0.into()),
@@ -147,7 +148,7 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
             ..ChainConfig::default()
         },
         Network::Byzantium => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(0.into()),
@@ -156,7 +157,7 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
             ..ChainConfig::default()
         },
         Network::Constantinople => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(0.into()),
@@ -166,7 +167,7 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
             ..ChainConfig::default()
         },
         Network::ConstantinopleFix => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(0.into()),
@@ -177,7 +178,7 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
             ..ChainConfig::default()
         },
         Network::Istanbul => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(0.into()),
@@ -189,7 +190,7 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
             ..ChainConfig::default()
         },
         Network::Berlin => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(0.into()),
@@ -203,7 +204,7 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
             ..ChainConfig::default()
         },
         Network::London => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(0.into()),
@@ -218,30 +219,30 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
             ..ChainConfig::default()
         },
         Network::FrontierToHomesteadAt5 => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(5.into()),
             ..ChainConfig::default()
         },
         Network::HomesteadToEIP150At5 => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(5.into()),
             ..ChainConfig::default()
         },
         Network::HomesteadToDaoAt5 => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             dao_fork: Some(DaoConfig {
                 block_number: 5.into(),
-                ..genesis::MAINNET.config.dao_fork.clone().unwrap()
+                ..MAINNET_CONFIG.dao_fork.clone().unwrap()
             }),
             ..ChainConfig::default()
         },
         Network::EIP158ToByzantiumAt5 => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(0.into()),
@@ -250,7 +251,7 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
             ..ChainConfig::default()
         },
         Network::ByzantiumToConstantinopleFixAt5 => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(0.into()),
@@ -261,7 +262,7 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
             ..ChainConfig::default()
         },
         Network::BerlinToLondonAt5 => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(0.into()),
@@ -276,7 +277,7 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
             ..ChainConfig::default()
         },
         Network::EIP2384 => ChainConfig {
-            chain_id: CHAIN_ID,
+            chain_id: 1,
             seal_engine: SealEngineType::NoProof,
             homestead_block: Some(0.into()),
             tangerine_block: Some(0.into()),
@@ -293,17 +294,17 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
 
 pub static DIFFICULTY_CONFIG: Lazy<HashMap<String, ChainConfig>> = Lazy::new(|| {
     hashmap! {
-        "difficulty.json".to_string() => genesis::MAINNET.config.clone(),
+        "difficulty.json".to_string() => MAINNET_CONFIG.clone(),
         "difficultyByzantium.json".to_string() => NETWORK_CONFIG[&Network::Byzantium].clone(),
         "difficultyConstantinople.json".to_string() => NETWORK_CONFIG[&Network::Constantinople].clone(),
-        "difficultyCustomMainNetwork.json".to_string() => genesis::MAINNET.config.clone(),
+        "difficultyCustomMainNetwork.json".to_string() => MAINNET_CONFIG.clone(),
         "difficultyEIP2384_random_to20M.json".to_string() => NETWORK_CONFIG[&Network::EIP2384].clone(),
         "difficultyEIP2384_random.json".to_string() => NETWORK_CONFIG[&Network::EIP2384].clone(),
         "difficultyEIP2384.json".to_string() => NETWORK_CONFIG[&Network::EIP2384].clone(),
         "difficultyFrontier.json".to_string() => NETWORK_CONFIG[&Network::Frontier].clone(),
         "difficultyHomestead.json".to_string() => NETWORK_CONFIG[&Network::Homestead].clone(),
-        "difficultyMainNetwork.json".to_string() => genesis::MAINNET.config.clone(),
-        "difficultyRopsten.json".to_string() => genesis::ROPSTEN.config.clone(),
+        "difficultyMainNetwork.json".to_string() => MAINNET_CONFIG.clone(),
+        "difficultyRopsten.json".to_string() => ROPSTEN_CONFIG.clone(),
     }
 });
 
@@ -617,64 +618,77 @@ async fn blockchain_test(testdata: BlockchainTest, _: Option<ChainConfig>) -> an
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum TransactionTestResult {
-    Correct { hash: H256, sender: Address },
-    Incorrect { exception: String },
-}
-
-#[derive(Debug, Deserialize)]
 pub struct TransactionTest {
-    pub result: HashMap<String, TransactionTestResult>,
-    #[serde(deserialize_with = "deserialize_hexstr_as_bytes")]
-    pub txbytes: Bytes,
+    #[serde(default)]
+    pub hash: Option<String>,
+    #[serde(default)]
+    pub sender: Option<String>,
 }
 
 // https://ethereum-tests.readthedocs.io/en/latest/test_types/transaction_tests.html
 #[instrument(skip(testdata))]
-async fn transaction_test(testdata: TransactionTest, _: Option<ChainConfig>) -> anyhow::Result<()> {
-    let txn = rlp::decode::<martinez::models::Transaction>(&testdata.txbytes);
+async fn transaction_test(
+    testdata: HashMap<String, Value>,
+    _: Option<ChainConfig>,
+) -> anyhow::Result<()> {
+    let txn = &hex::decode(
+        testdata["rlp"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("0x")
+            .unwrap(),
+    )
+    .map_err(anyhow::Error::new)
+    .and_then(|v| Ok(rlp::decode::<martinez::models::Transaction>(&v)?));
 
-    for (key, t) in testdata.result {
-        match (&txn, t) {
-            (Err(e), TransactionTestResult::Correct { .. }) => {
-                return Err(anyhow::Error::msg(format!("{:?}", e))
-                    .context("Failed to decode valid transaction"));
+    for (key, tdvalue) in testdata {
+        if key == "rlp" || key == "_info" {
+            continue;
+        }
+
+        let t = serde_json::from_value::<TransactionTest>(tdvalue).unwrap();
+
+        let valid = t.sender.is_some();
+
+        match &txn {
+            Err(e) => {
+                if valid {
+                    return Err(anyhow::Error::msg(format!("{:?}", e))
+                        .context("Failed to decode valid transaction"));
+                }
             }
-            (Ok(txn), t) => {
+            Ok(txn) => {
                 let config = &NETWORK_CONFIG[&key.parse().unwrap()];
 
                 if let Err(e) = pre_validate_transaction(txn, 0, config, None) {
-                    match t {
-                        TransactionTestResult::Correct { .. } => {
-                            return Err(anyhow::Error::new(e).context("Validation error"));
-                        }
-                        TransactionTestResult::Incorrect { .. } => {
-                            continue;
-                        }
+                    if valid {
+                        return Err(anyhow::Error::new(e).context("Validation error"));
+                    } else {
+                        continue;
                     }
                 }
 
-                match (txn.recover_sender(), t) {
-                    (Err(e), TransactionTestResult::Correct { .. }) => {
-                        return Err(e.context("Failed to recover sender"));
+                match txn.recover_sender() {
+                    Err(e) => {
+                        if valid {
+                            return Err(e.context("Failed to recover sender"));
+                        }
                     }
-                    (Ok(_), TransactionTestResult::Incorrect { .. }) => {
-                        bail!("Sender recovered for invalid transaction")
-                    }
-                    (Ok(recovered_sender), TransactionTestResult::Correct { sender, hash }) => {
+                    Ok(sender) => {
+                        if !valid {
+                            bail!("Sender recovered for invalid transaction")
+                        }
+
                         ensure!(
-                            recovered_sender == sender,
+                            hex::encode(sender.0) == *t.sender.as_ref().unwrap(),
                             "Sender mismatch for {:?}: {:?} != {:?}",
-                            hash,
-                            sender,
-                            recovered_sender
+                            t.hash.as_ref().unwrap(),
+                            t.sender.as_ref().unwrap(),
+                            sender
                         );
                     }
-                    (Err(_), TransactionTestResult::Incorrect { .. }) => {}
                 }
             }
-            _ => continue,
         }
     }
 
