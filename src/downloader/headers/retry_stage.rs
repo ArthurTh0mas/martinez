@@ -2,7 +2,7 @@ use crate::downloader::headers::{
     header_slice_status_watch::HeaderSliceStatusWatch,
     header_slices::{HeaderSlice, HeaderSliceStatus, HeaderSlices},
 };
-use parking_lot::RwLockUpgradableReadGuard;
+use parking_lot::lock_api::RwLockUpgradableReadGuard;
 use std::{ops::DerefMut, sync::Arc, time, time::Duration};
 use tracing::*;
 
@@ -34,7 +34,7 @@ impl RetryStage {
 
         let count = self.reset_pending()?;
         if count > 0 {
-            debug!("RetryStage: did reset {} slices for retry", count);
+            info!("RetryStage: did reset {} slices for retry", count);
         }
         debug!("RetryStage: done");
         Ok(())
@@ -77,12 +77,5 @@ impl RetryStage {
             2 => Duration::from_secs(15),
             _ => Duration::from_secs(30),
         }
-    }
-}
-
-#[async_trait::async_trait]
-impl super::stage::Stage for RetryStage {
-    async fn execute(&mut self) -> anyhow::Result<()> {
-        RetryStage::execute(self).await
     }
 }

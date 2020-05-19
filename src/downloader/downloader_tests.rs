@@ -1,7 +1,6 @@
 use crate::{
-    downloader::{opts::Opts, Downloader},
+    downloader::{chain_config, opts::Opts, sentry_client_mock::SentryClientMock, Downloader},
     kv, new_mem_database,
-    sentry::{chain_config, sentry_client_mock::SentryClientMock},
 };
 use std::sync::Arc;
 

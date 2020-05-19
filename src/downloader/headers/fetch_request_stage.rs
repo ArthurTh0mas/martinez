@@ -1,18 +1,18 @@
 use crate::{
-    downloader::headers::{
-        header_slice_status_watch::HeaderSliceStatusWatch,
-        header_slices,
-        header_slices::{HeaderSliceStatus, HeaderSlices},
-    },
-    models::BlockNumber,
-    sentry::{
+    downloader::{
         block_id,
+        headers::{
+            header_slice_status_watch::HeaderSliceStatusWatch,
+            header_slices,
+            header_slices::{HeaderSliceStatus, HeaderSlices},
+        },
         messages::{GetBlockHeadersMessage, GetBlockHeadersMessageParams, Message},
         sentry_client::PeerFilter,
         sentry_client_reactor::{SendMessageError, SentryClientReactor},
     },
+    models::BlockNumber,
 };
-use parking_lot::{RwLock, RwLockUpgradableReadGuard};
+use parking_lot::{lock_api::RwLockUpgradableReadGuard, RwLock};
 use std::{
     ops::DerefMut,
     sync::{atomic::*, Arc},
@@ -46,7 +46,7 @@ impl FetchRequestStage {
         debug!("FetchRequestStage: start");
         self.pending_watch.wait().await?;
 
-        debug!(
+        info!(
             "FetchRequestStage: requesting {} slices",
             self.pending_watch.pending_count()
         );
@@ -110,12 +110,5 @@ impl FetchRequestStage {
         self.sentry
             .read()
             .try_send_message(Message::GetBlockHeaders(message), PeerFilter::Random(1))
-    }
-}
-
-#[async_trait::async_trait]
-impl super::stage::Stage for FetchRequestStage {
-    async fn execute(&mut self) -> anyhow::Result<()> {
-        FetchRequestStage::execute(self).await
     }
 }

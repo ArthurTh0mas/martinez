@@ -4,7 +4,7 @@ use crate::downloader::headers::{
     header_slices::{HeaderSlice, HeaderSliceStatus, HeaderSlices},
     preverified_hashes_config::PreverifiedHashesConfig,
 };
-use parking_lot::RwLockUpgradableReadGuard;
+use parking_lot::lock_api::RwLockUpgradableReadGuard;
 use std::{ops::DerefMut, sync::Arc};
 use tracing::*;
 
@@ -35,7 +35,7 @@ impl VerifyStage {
         debug!("VerifyStage: start");
         self.pending_watch.wait().await?;
 
-        debug!(
+        info!(
             "VerifyStage: verifying {} slices",
             self.pending_watch.pending_count()
         );
@@ -65,7 +65,7 @@ impl VerifyStage {
         })
     }
 
-    /// The algorithm verifies that the edges of the slice match to the preverified hashes,
+    /// The algorithm verifies that the top of the slice matches one of the preverified hashes,
     /// and that all blocks down to the root of the slice are connected by the parent_hash field.
     ///
     /// For example, if we have a HeaderSlice[192...384]
@@ -76,7 +76,6 @@ impl VerifyStage {
     /// hash(slice[382]) == slice[383].parent_hash
     /// ...
     /// hash(slice[192]) == slice[193].parent_hash
-    /// hash(slice[192]) == preverified hash(192)
     ///
     /// Thus verifying hashes of all the headers.
     fn verify_slice(&self, slice: &HeaderSlice) -> bool {
@@ -87,16 +86,6 @@ impl VerifyStage {
 
         if headers.is_empty() {
             return true;
-        }
-
-        let first = headers.first().unwrap();
-        let first_hash = first.hash();
-        let expected_first_hash = self.preverified_hash(slice.start_block_num.0);
-        if expected_first_hash.is_none() {
-            return false;
-        }
-        if first_hash != *expected_first_hash.unwrap() {
-            return false;
         }
 
         let last = headers.last().unwrap();
@@ -133,12 +122,5 @@ impl VerifyStage {
         }
         let index = block_num / preverified_step_size;
         self.preverified_hashes.hashes.get(index as usize)
-    }
-}
-
-#[async_trait::async_trait]
-impl super::stage::Stage for VerifyStage {
-    async fn execute(&mut self) -> anyhow::Result<()> {
-        VerifyStage::execute(self).await
     }
 }

@@ -28,7 +28,7 @@ impl RefillStage {
         debug!("RefillStage: start");
         self.pending_watch.wait().await?;
 
-        debug!(
+        info!(
             "RefillStage: refilling {} slices",
             self.pending_watch.pending_count()
         );
@@ -40,12 +40,5 @@ impl RefillStage {
     fn refill_pending(&self) {
         self.header_slices.remove(HeaderSliceStatus::Saved);
         self.header_slices.refill();
-    }
-}
-
-#[async_trait::async_trait]
-impl super::stage::Stage for RefillStage {
-    async fn execute(&mut self) -> anyhow::Result<()> {
-        RefillStage::execute(self).await
     }
 }
