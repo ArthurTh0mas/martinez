@@ -1,10 +1,7 @@
 #![allow(clippy::suspicious_else_formatting)]
 use martinez::{
-    chain::{config::*, difficulty::canonical_difficulty},
-    consensus::*,
-    crypto::keccak256,
-    models::*,
-    *,
+    chain::difficulty::canonical_difficulty, consensus::*, crypto::keccak256, models::*,
+    res::genesis, *,
 };
 use anyhow::*;
 use bytes::Bytes;
@@ -237,7 +234,7 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
             homestead_block: Some(0.into()),
             dao_fork: Some(DaoConfig {
                 block_number: 5.into(),
-                ..MAINNET_CONFIG.dao_fork.clone().unwrap()
+                ..genesis::MAINNET.config.dao_fork.clone().unwrap()
             }),
             ..ChainConfig::default()
         },
@@ -294,17 +291,17 @@ static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
 
 pub static DIFFICULTY_CONFIG: Lazy<HashMap<String, ChainConfig>> = Lazy::new(|| {
     hashmap! {
-        "difficulty.json".to_string() => MAINNET_CONFIG.clone(),
+        "difficulty.json".to_string() => genesis::MAINNET.config.clone(),
         "difficultyByzantium.json".to_string() => NETWORK_CONFIG[&Network::Byzantium].clone(),
         "difficultyConstantinople.json".to_string() => NETWORK_CONFIG[&Network::Constantinople].clone(),
-        "difficultyCustomMainNetwork.json".to_string() => MAINNET_CONFIG.clone(),
+        "difficultyCustomMainNetwork.json".to_string() => genesis::MAINNET.config.clone(),
         "difficultyEIP2384_random_to20M.json".to_string() => NETWORK_CONFIG[&Network::EIP2384].clone(),
         "difficultyEIP2384_random.json".to_string() => NETWORK_CONFIG[&Network::EIP2384].clone(),
         "difficultyEIP2384.json".to_string() => NETWORK_CONFIG[&Network::EIP2384].clone(),
         "difficultyFrontier.json".to_string() => NETWORK_CONFIG[&Network::Frontier].clone(),
         "difficultyHomestead.json".to_string() => NETWORK_CONFIG[&Network::Homestead].clone(),
-        "difficultyMainNetwork.json".to_string() => MAINNET_CONFIG.clone(),
-        "difficultyRopsten.json".to_string() => ROPSTEN_CONFIG.clone(),
+        "difficultyMainNetwork.json".to_string() => genesis::MAINNET.config.clone(),
+        "difficultyRopsten.json".to_string() => genesis::ROPSTEN.config.clone(),
     }
 });
 
@@ -618,77 +615,64 @@ async fn blockchain_test(testdata: BlockchainTest, _: Option<ChainConfig>) -> an
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum TransactionTestResult {
+    Correct { hash: H256, sender: Address },
+    Incorrect { exception: String },
+}
+
+#[derive(Debug, Deserialize)]
 pub struct TransactionTest {
-    #[serde(default)]
-    pub hash: Option<String>,
-    #[serde(default)]
-    pub sender: Option<String>,
+    pub result: HashMap<String, TransactionTestResult>,
+    #[serde(deserialize_with = "deserialize_hexstr_as_bytes")]
+    pub txbytes: Bytes,
 }
 
 // https://ethereum-tests.readthedocs.io/en/latest/test_types/transaction_tests.html
 #[instrument(skip(testdata))]
-async fn transaction_test(
-    testdata: HashMap<String, Value>,
-    _: Option<ChainConfig>,
-) -> anyhow::Result<()> {
-    let txn = &hex::decode(
-        testdata["rlp"]
-            .as_str()
-            .unwrap()
-            .strip_prefix("0x")
-            .unwrap(),
-    )
-    .map_err(anyhow::Error::new)
-    .and_then(|v| Ok(rlp::decode::<martinez::models::Transaction>(&v)?));
+async fn transaction_test(testdata: TransactionTest, _: Option<ChainConfig>) -> anyhow::Result<()> {
+    let txn = rlp::decode::<martinez::models::Transaction>(&testdata.txbytes);
 
-    for (key, tdvalue) in testdata {
-        if key == "rlp" || key == "_info" {
-            continue;
-        }
-
-        let t = serde_json::from_value::<TransactionTest>(tdvalue).unwrap();
-
-        let valid = t.sender.is_some();
-
-        match &txn {
-            Err(e) => {
-                if valid {
-                    return Err(anyhow::Error::msg(format!("{:?}", e))
-                        .context("Failed to decode valid transaction"));
-                }
+    for (key, t) in testdata.result {
+        match (&txn, t) {
+            (Err(e), TransactionTestResult::Correct { .. }) => {
+                return Err(anyhow::Error::msg(format!("{:?}", e))
+                    .context("Failed to decode valid transaction"));
             }
-            Ok(txn) => {
+            (Ok(txn), t) => {
                 let config = &NETWORK_CONFIG[&key.parse().unwrap()];
 
                 if let Err(e) = pre_validate_transaction(txn, 0, config, None) {
-                    if valid {
-                        return Err(anyhow::Error::new(e).context("Validation error"));
-                    } else {
-                        continue;
+                    match t {
+                        TransactionTestResult::Correct { .. } => {
+                            return Err(anyhow::Error::new(e).context("Validation error"));
+                        }
+                        TransactionTestResult::Incorrect { .. } => {
+                            continue;
+                        }
                     }
                 }
 
-                match txn.recover_sender() {
-                    Err(e) => {
-                        if valid {
-                            return Err(e.context("Failed to recover sender"));
-                        }
+                match (txn.recover_sender(), t) {
+                    (Err(e), TransactionTestResult::Correct { .. }) => {
+                        return Err(e.context("Failed to recover sender"));
                     }
-                    Ok(sender) => {
-                        if !valid {
-                            bail!("Sender recovered for invalid transaction")
-                        }
-
+                    (Ok(_), TransactionTestResult::Incorrect { .. }) => {
+                        bail!("Sender recovered for invalid transaction")
+                    }
+                    (Ok(recovered_sender), TransactionTestResult::Correct { sender, hash }) => {
                         ensure!(
-                            hex::encode(sender.0) == *t.sender.as_ref().unwrap(),
+                            recovered_sender == sender,
                             "Sender mismatch for {:?}: {:?} != {:?}",
-                            t.hash.as_ref().unwrap(),
-                            t.sender.as_ref().unwrap(),
-                            sender
+                            hash,
+                            sender,
+                            recovered_sender
                         );
                     }
+                    (Err(_), TransactionTestResult::Incorrect { .. }) => {}
                 }
             }
+            _ => continue,
         }
     }
 

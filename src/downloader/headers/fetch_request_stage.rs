@@ -1,16 +1,16 @@
 use crate::{
-    downloader::{
+    downloader::headers::{
+        header_slice_status_watch::HeaderSliceStatusWatch,
+        header_slices,
+        header_slices::{HeaderSliceStatus, HeaderSlices},
+    },
+    models::BlockNumber,
+    sentry::{
         block_id,
-        headers::{
-            header_slice_status_watch::HeaderSliceStatusWatch,
-            header_slices,
-            header_slices::{HeaderSliceStatus, HeaderSlices},
-        },
         messages::{GetBlockHeadersMessage, GetBlockHeadersMessageParams, Message},
         sentry_client::PeerFilter,
         sentry_client_reactor::{SendMessageError, SentryClientReactor},
     },
-    models::BlockNumber,
 };
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use std::{
@@ -46,7 +46,7 @@ impl FetchRequestStage {
         debug!("FetchRequestStage: start");
         self.pending_watch.wait().await?;
 
-        info!(
+        debug!(
             "FetchRequestStage: requesting {} slices",
             self.pending_watch.pending_count()
         );

@@ -1,4 +1,7 @@
-use martinez::downloader::{chain_config, opts::Opts, Downloader};
+use martinez::{
+    downloader::{opts::Opts, Downloader},
+    sentry::chain_config,
+};
 
 use martinez::kv;
 use std::sync::Arc;
