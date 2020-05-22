@@ -28,7 +28,7 @@ impl RefillStage {
         debug!("RefillStage: start");
         self.pending_watch.wait().await?;
 
-        debug!(
+        info!(
             "RefillStage: refilling {} slices",
             self.pending_watch.pending_count()
         );

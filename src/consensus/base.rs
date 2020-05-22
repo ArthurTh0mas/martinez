@@ -297,8 +297,9 @@ impl ConsensusEngineBase {
 
 #[cfg(test)]
 mod tests {
+    use crate::chain::config::MAINNET_CONFIG;
+
     use super::*;
-    use crate::res::genesis::MAINNET;
 
     #[test]
     fn validate_max_fee_per_gas() {
@@ -345,7 +346,7 @@ mod tests {
             let res = pre_validate_transaction(
                 &txn,
                 13_500_001,
-                &MAINNET.config,
+                &*MAINNET_CONFIG,
                 Some(base_fee_per_gas.into()),
             );
 
