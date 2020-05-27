@@ -1,4 +1,4 @@
-use super::{address::*, analysis_cache::AnalysisCache, precompiled};
+use super::{address::*, precompiled};
 use crate::{
     chain::protocol_param::{fee, param},
     models::*,
@@ -25,12 +25,11 @@ pub struct CallResult {
     pub output_data: Bytes,
 }
 
-struct Evm<'r, 'state, 'analysis, 'h, 'c, 't, B>
+struct Evm<'r, 'state, 'h, 'c, 't, B>
 where
     B: State,
 {
     state: &'state mut IntraBlockState<'r, B>,
-    analysis_cache: &'analysis mut AnalysisCache,
     header: &'h PartialHeader,
     revision: Revision,
     chain_config: &'c ChainConfig,
@@ -40,7 +39,6 @@ where
 
 pub async fn execute<B: State>(
     state: &mut IntraBlockState<'_, B>,
-    analysis_cache: &mut AnalysisCache,
     header: &PartialHeader,
     chain_config: &ChainConfig,
     txn: &TransactionWithSender,
@@ -49,7 +47,6 @@ pub async fn execute<B: State>(
     let revision = chain_config.revision(header.number);
     let mut evm = Evm {
         header,
-        analysis_cache,
         state,
         revision,
         chain_config,
@@ -89,7 +86,7 @@ pub async fn execute<B: State>(
     })
 }
 
-impl<'r, 'state, 'analysis, 'h, 'c, 't, B> Evm<'r, 'state, 'analysis, 'h, 'c, 't, B>
+impl<'r, 'state, 'h, 'c, 't, B> Evm<'r, 'state, 'h, 'c, 't, B>
 where
     B: State,
 {
@@ -160,7 +157,7 @@ where
         };
 
         res = self
-            .execute(deploy_message, message.initcode.as_ref().to_vec(), None)
+            .execute(deploy_message, message.initcode.as_ref().to_vec())
             .await?;
 
         if res.status_code == StatusCode::Success {
@@ -267,11 +264,7 @@ where
                 return Ok(res);
             }
 
-            let code_hash = self.state.get_code_hash(message.code_address).await?;
-
-            res = self
-                .execute(message, code.as_ref().to_vec(), Some(code_hash))
-                .await?;
+            res = self.execute(message, code.as_ref().to_vec()).await?;
         }
 
         if res.status_code != StatusCode::Success {
@@ -284,27 +277,8 @@ where
         Ok(res)
     }
 
-    async fn execute(
-        &mut self,
-        msg: Message,
-        code: Vec<u8>,
-        code_hash: Option<H256>,
-    ) -> anyhow::Result<Output> {
-        let a;
-        let analysis = if let Some(code_hash) = code_hash {
-            if let Some(cache) = self.analysis_cache.get(code_hash) {
-                cache
-            } else {
-                let analysis = evmodin::AnalyzedCode::analyze(code);
-                self.analysis_cache.put(code_hash, analysis);
-                self.analysis_cache.get(code_hash).unwrap()
-            }
-        } else {
-            a = evmodin::AnalyzedCode::analyze(code);
-            &a
-        };
-
-        let mut interrupt = analysis
+    async fn execute(&mut self, msg: Message, code: Vec<u8>) -> anyhow::Result<Output> {
+        let mut interrupt = evmodin::AnalyzedCode::analyze(code)
             .execute_resumable(false, msg, self.revision)
             .resume(());
 
@@ -611,7 +585,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{res::genesis::MAINNET, util::test_util::run_test, InMemoryState};
+    use crate::{chain::config::MAINNET_CONFIG, util::test_util::run_test, InMemoryState};
     use bytes_literal::bytes;
     use hex_literal::hex;
 
@@ -621,16 +595,9 @@ mod tests {
         txn: &TransactionWithSender,
         gas: u64,
     ) -> CallResult {
-        super::execute(
-            state,
-            &mut AnalysisCache::default(),
-            header,
-            &MAINNET.config,
-            txn,
-            gas,
-        )
-        .await
-        .unwrap()
+        super::execute(state, header, &MAINNET_CONFIG, txn, gas)
+            .await
+            .unwrap()
     }
 
     #[test]

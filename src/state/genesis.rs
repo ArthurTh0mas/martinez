@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    kv::tables::{self, CumulativeData, PlainStateFusedValue},
+    kv::tables::{self, PlainStateFusedValue},
     models::{ChainConfig, *},
     util::*,
     InMemoryState, MutableCursor, MutableTransaction,
@@ -123,14 +123,10 @@ where
     )
     .await?;
 
-    txn.set(
-        &tables::CumulativeIndex,
-        (0.into(), CumulativeData { gas: 0, tx_num: 0 }),
-    )
-    .await?;
-
     txn.set(&tables::LastHeader, (Default::default(), block_hash))
         .await?;
+
+    txn.set(&tables::Receipt, (0.into(), vec![])).await?;
 
     txn.set(&tables::Config, (block_hash, genesis.config))
         .await?;
