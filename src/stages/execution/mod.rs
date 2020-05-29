@@ -1,15 +1,15 @@
 use crate::{
     accessors,
     consensus::engine_factory,
-    execution::processor::ExecutionProcessor,
+    execution::{analysis_cache::AnalysisCache, processor::ExecutionProcessor},
     kv::tables,
     models::*,
     stagedsync::{
+        format_duration,
         stage::{ExecOutput, Stage, StageInput},
         stages::EXECUTION,
     },
-    state::State,
-    Buffer, MutableTransaction,
+    Buffer, Cursor, MutableTransaction,
 };
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
@@ -18,25 +18,40 @@ use tracing::*;
 
 #[derive(Debug)]
 pub struct Execution {
-    pub batch_size: u128,
+    pub batch_size: u64,
+    pub commit_every: Option<Duration>,
     pub prune_from: BlockNumber,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_batch_of_blocks<'db, Tx: MutableTransaction<'db>>(
     tx: &Tx,
     chain_config: ChainConfig,
     max_block: BlockNumber,
-    batch_size: u128,
+    batch_size: u64,
+    commit_every: Option<Duration>,
     starting_block: BlockNumber,
+    first_started_at: (Instant, Option<BlockNumber>),
     prune_from: BlockNumber,
 ) -> anyhow::Result<BlockNumber> {
     let mut buffer = Buffer::new(tx, prune_from, None);
     let mut consensus_engine = engine_factory(chain_config.clone())?;
+    let mut analysis_cache = AnalysisCache::default();
 
     let mut block_number = starting_block;
-    let mut gas_since_start = 0_u128;
+    let mut gas_since_start = 0;
     let mut gas_since_last_message = 0;
+    let batch_started_at = Instant::now();
+    let first_started_at_gas = tx
+        .get(
+            &tables::CumulativeIndex,
+            first_started_at.1.unwrap_or(BlockNumber(0)),
+        )
+        .await?
+        .unwrap()
+        .gas;
     let mut last_message = Instant::now();
+    let mut printed_at_least_once = false;
     loop {
         let block_hash = accessors::chain::canonical_hash::read(tx, block_number)
             .await?
@@ -49,8 +64,9 @@ async fn execute_batch_of_blocks<'db, Tx: MutableTransaction<'db>>(
             .await?
             .ok_or_else(|| anyhow!("Block body not found: {}/{:?}", block_number, block_hash))?;
 
-        let receipts = ExecutionProcessor::new(
+        ExecutionProcessor::new(
             &mut buffer,
+            &mut analysis_cache,
             &mut *consensus_engine,
             &header,
             &block,
@@ -65,24 +81,63 @@ async fn execute_batch_of_blocks<'db, Tx: MutableTransaction<'db>>(
             )
         })?;
 
-        gas_since_start += u128::from(header.gas_used);
+        gas_since_start += header.gas_used;
         gas_since_last_message += header.gas_used;
 
         let now = Instant::now();
+
+        let stage_complete = block_number == max_block;
+
+        let end_of_batch = stage_complete
+            || gas_since_start > batch_size
+            || commit_every
+                .map(|commit_every| now - batch_started_at > commit_every)
+                .unwrap_or(false);
+
         let elapsed = now - last_message;
-        if elapsed > Duration::from_secs(5) {
+        if elapsed > Duration::from_secs(30) || (end_of_batch && !printed_at_least_once) {
+            let current_total_gas = tx
+                .get(&tables::CumulativeIndex, block_number)
+                .await?
+                .unwrap()
+                .gas;
+
+            let total_gas = tx
+                .cursor(&tables::CumulativeIndex)
+                .await?
+                .last()
+                .await?
+                .unwrap()
+                .1
+                .gas;
             let mgas_sec = gas_since_last_message as f64
                 / (elapsed.as_secs() as f64 + (elapsed.subsec_millis() as f64 / 1000_f64))
                 / 1_000_000f64;
-            info!("Executed block {}, Mgas/sec: {}", block_number, mgas_sec);
+            info!(
+                "Executed block {}, Mgas/sec: {:.2}{}",
+                block_number,
+                mgas_sec,
+                if stage_complete {
+                    String::new()
+                } else {
+                    format!(
+                        ", progress: {:.2}%, {} remaining",
+                        (current_total_gas as f64 / total_gas as f64) * 100_f64,
+                        format_duration(
+                            (now - first_started_at.0)
+                                * ((total_gas - current_total_gas) as f64
+                                    / (current_total_gas - first_started_at_gas) as f64)
+                                    as u32
+                        )
+                    )
+                }
+            );
+            printed_at_least_once = true;
             last_message = now;
             gas_since_last_message = 0;
         }
 
-        // TODO: implement pruning
-        buffer.insert_receipts(block_number, receipts).await?;
-
-        if block_number == max_block || gas_since_start > batch_size {
+        if end_of_batch {
             break;
         }
 
@@ -129,7 +184,9 @@ impl<'db, RwTx: MutableTransaction<'db>> Stage<'db, RwTx> for Execution {
                 chain_config,
                 max_block,
                 self.batch_size,
+                self.commit_every,
                 starting_block,
+                input.first_started_at,
                 self.prune_from,
             )
             .await?;
