@@ -115,6 +115,7 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                     let stage_id = stage.id();
 
                     let start_time = Instant::now();
+                    let start_progress = stage_id.get_progress(&tx).await?;
 
                     // Re-invoke the stage until it reports `StageOutput::done`.
                     let done_progress = loop {
@@ -135,6 +136,7 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                                     &mut tx,
                                     StageInput {
                                         restarted,
+                                        first_started_at: (start_time, start_progress),
                                         previous_stage,
                                         stage_progress,
                                     },
@@ -153,7 +155,7 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                                         info!(
                                             "DONE @ {} in {}",
                                             stage_progress,
-                                            format_duration(time)
+                                            format_duration(time, true)
                                         );
                                     }
                                 }
@@ -216,7 +218,7 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                 let t = timings
                     .into_iter()
                     .fold(String::new(), |acc, (stage_id, time)| {
-                        format!("{} {}={}", acc, stage_id, format_duration(time))
+                        format!("{} {}={}", acc, stage_id, format_duration(time, true))
                     });
                 info!("Staged sync complete.{}", t);
             }
@@ -224,7 +226,7 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
     }
 }
 
-fn format_duration(dur: Duration) -> String {
+pub fn format_duration(dur: Duration, subsec_millis: bool) -> String {
     let mut secs = dur.as_secs();
     let mut minutes = secs / 60;
     let hours = minutes / 60;
@@ -232,10 +234,14 @@ fn format_duration(dur: Duration) -> String {
     secs %= 60;
     minutes %= 60;
     format!(
-        "{:0>2}:{:0>2}:{:0>2}.{:0>3}",
+        "{:0>2}:{:0>2}:{:0>2}{}",
         hours,
         minutes,
         secs,
-        dur.subsec_millis()
+        if subsec_millis {
+            format!(".{:0>3}", dur.subsec_millis())
+        } else {
+            String::new()
+        }
     )
 }
