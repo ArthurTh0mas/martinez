@@ -4,5 +4,3 @@ use crate::genesis::GenesisData;
 
 pub static MAINNET: Lazy<GenesisData> =
     Lazy::new(|| serde_json::from_str(include_str!("mainnet.json")).unwrap());
-pub static ROPSTEN: Lazy<GenesisData> =
-    Lazy::new(|| serde_json::from_str(include_str!("ropsten.json")).unwrap());

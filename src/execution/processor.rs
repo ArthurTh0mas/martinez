@@ -1,4 +1,4 @@
-use super::{analysis_cache::AnalysisCache, root_hash};
+use super::root_hash;
 use crate::{
     chain::{
         dao,
@@ -17,12 +17,11 @@ use evmodin::{Revision, StatusCode};
 use std::cmp::min;
 use TransactionAction;
 
-pub struct ExecutionProcessor<'r, 'analysis, 'e, 'h, 'b, 'c, S>
+pub struct ExecutionProcessor<'r, 'e, 'h, 'b, 'c, S>
 where
     S: State,
 {
     state: IntraBlockState<'r, S>,
-    analysis_cache: &'analysis mut AnalysisCache,
     engine: &'e mut dyn Consensus,
     header: &'h PartialHeader,
     block: &'b BlockBodyWithSenders,
@@ -31,13 +30,12 @@ where
     cumulative_gas_used: u64,
 }
 
-impl<'r, 'analysis, 'e, 'h, 'b, 'c, S> ExecutionProcessor<'r, 'analysis, 'e, 'h, 'b, 'c, S>
+impl<'r, 'e, 'h, 'b, 'c, S> ExecutionProcessor<'r, 'e, 'h, 'b, 'c, S>
 where
     S: State,
 {
     pub fn new(
         state: &'r mut S,
-        analysis_cache: &'analysis mut AnalysisCache,
         engine: &'e mut dyn Consensus,
         header: &'h PartialHeader,
         block: &'b BlockBodyWithSenders,
@@ -46,7 +44,6 @@ where
         let revision = chain_config.revision(header.number);
         Self {
             state: IntraBlockState::new(state),
-            analysis_cache,
             engine,
             header,
             block,
@@ -157,7 +154,6 @@ where
 
         let vm_res = evm::execute(
             &mut self.state,
-            self.analysis_cache,
             self.header,
             self.chain_config,
             txn,
@@ -319,8 +315,8 @@ where
 mod tests {
     use super::*;
     use crate::{
-        execution::address::create_address, res::genesis::MAINNET, util::test_util::run_test,
-        InMemoryState,
+        chain::config::MAINNET_CONFIG, execution::address::create_address,
+        util::test_util::run_test, InMemoryState,
     };
     use bytes::Bytes;
     use bytes_literal::bytes;
@@ -354,16 +350,9 @@ mod tests {
             };
 
             let mut state = InMemoryState::default();
-            let mut analysis_cache = AnalysisCache::default();
-            let mut engine = engine_factory(MAINNET.config.clone()).unwrap();
-            let mut processor = ExecutionProcessor::new(
-                &mut state,
-                &mut analysis_cache,
-                &mut *engine,
-                &header,
-                &block,
-                &MAINNET.config,
-            );
+            let mut engine = engine_factory(MAINNET_CONFIG.clone()).unwrap();
+            let mut processor =
+                ExecutionProcessor::new(&mut state, &mut *engine, &header, &block, &MAINNET_CONFIG);
 
             let receipt = processor.execute_transaction(&txn).await.unwrap();
             assert!(receipt.success);
@@ -399,16 +388,9 @@ mod tests {
             let block = Default::default();
 
             let mut state = InMemoryState::default();
-            let mut analysis_cache = AnalysisCache::default();
-            let mut engine = engine_factory(MAINNET.config.clone()).unwrap();
-            let mut processor = ExecutionProcessor::new(
-                &mut state,
-                &mut analysis_cache,
-                &mut *engine,
-                &header,
-                &block,
-                &MAINNET.config,
-            );
+            let mut engine = engine_factory(MAINNET_CONFIG.clone()).unwrap();
+            let mut processor =
+                ExecutionProcessor::new(&mut state, &mut *engine, &header, &block, &MAINNET_CONFIG);
 
             processor
                 .state
@@ -461,20 +443,13 @@ mod tests {
             // 23     BALANCE
 
             let mut state = InMemoryState::default();
-            let mut analysis_cache = AnalysisCache::default();
-            let mut engine = engine_factory(MAINNET.config.clone()).unwrap();
-            let mut processor = ExecutionProcessor::new(
-                &mut state,
-                &mut analysis_cache,
-                &mut *engine,
-                &header,
-                &block,
-                &MAINNET.config,
-            );
+            let mut engine = engine_factory(MAINNET_CONFIG.clone()).unwrap();
+            let mut processor =
+                ExecutionProcessor::new(&mut state, &mut *engine, &header, &block, &MAINNET_CONFIG);
 
             let t = |action, input, nonce, gas_limit| TransactionWithSender {
                 message: TransactionMessage::EIP1559 {
-                    chain_id: MAINNET.config.chain_id,
+                    chain_id: MAINNET_CONFIG.chain_id,
                     nonce,
                     max_priority_fee_per_gas: U256::zero(),
                     max_fee_per_gas: U256::from(59 * GIGA),
@@ -584,16 +559,9 @@ mod tests {
             // 38     CALL
 
             let mut state = InMemoryState::default();
-            let mut analysis_cache = AnalysisCache::default();
-            let mut engine = engine_factory(MAINNET.config.clone()).unwrap();
-            let mut processor = ExecutionProcessor::new(
-                &mut state,
-                &mut analysis_cache,
-                &mut *engine,
-                &header,
-                &block,
-                &MAINNET.config,
-            );
+            let mut engine = engine_factory(MAINNET_CONFIG.clone()).unwrap();
+            let mut processor =
+                ExecutionProcessor::new(&mut state, &mut *engine, &header, &block, &MAINNET_CONFIG);
 
             processor
                 .state()
@@ -613,7 +581,7 @@ mod tests {
 
             let t = |action, input, nonce| TransactionWithSender {
                 message: TransactionMessage::EIP1559 {
-                    chain_id: MAINNET.config.chain_id,
+                    chain_id: MAINNET_CONFIG.chain_id,
                     nonce,
                     max_priority_fee_per_gas: U256::from(20 * GIGA),
                     max_fee_per_gas: U256::from(20 * GIGA),
@@ -691,7 +659,7 @@ mod tests {
 
             let txn = TransactionWithSender{
                 message: TransactionMessage::EIP1559 {
-                    chain_id: MAINNET.config.chain_id,
+                    chain_id: MAINNET_CONFIG.chain_id,
                     nonce,
                     max_priority_fee_per_gas: 0.into(),
                     max_fee_per_gas: U256::from(20 * GIGA),
@@ -706,16 +674,9 @@ mod tests {
                 sender: caller,
             };
 
-            let mut analysis_cache = AnalysisCache::default();
-            let mut engine = engine_factory(MAINNET.config.clone()).unwrap();
-            let mut processor = ExecutionProcessor::new(
-                &mut state,
-                &mut analysis_cache,
-                &mut *engine,
-                &header,
-                &block,
-                &MAINNET.config,
-            );
+            let mut engine = engine_factory(MAINNET_CONFIG.clone()).unwrap();
+            let mut processor =
+                ExecutionProcessor::new(&mut state, &mut *engine, &header, &block, &MAINNET_CONFIG);
             processor
                 .state()
                 .add_to_balance(caller, *ETHER)
@@ -753,7 +714,7 @@ mod tests {
 
             let txn = TransactionWithSender {
                 message: TransactionMessage::EIP1559 {
-                    chain_id: MAINNET.config.chain_id,
+                    chain_id: MAINNET_CONFIG.chain_id,
                     nonce: 0,
                     max_priority_fee_per_gas: U256::zero(),
                     max_fee_per_gas: U256::from(30 * GIGA),
@@ -769,16 +730,9 @@ mod tests {
             };
 
             let mut state = InMemoryState::default();
-            let mut analysis_cache = AnalysisCache::default();
-            let mut engine = engine_factory(MAINNET.config.clone()).unwrap();
-            let mut processor = ExecutionProcessor::new(
-                &mut state,
-                &mut analysis_cache,
-                &mut *engine,
-                &header,
-                &block,
-                &MAINNET.config,
-            );
+            let mut engine = engine_factory(MAINNET_CONFIG.clone()).unwrap();
+            let mut processor =
+                ExecutionProcessor::new(&mut state, &mut *engine, &header, &block, &MAINNET_CONFIG);
 
             processor
                 .state()

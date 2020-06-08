@@ -42,8 +42,6 @@ impl<E: EnvironmentKind> Environment<E> {
         if ro {
             b.set_flags(::mdbx::EnvironmentFlags {
                 mode: ::mdbx::Mode::ReadOnly,
-                no_rdahead: true,
-                coalesce: true,
                 ..Default::default()
             });
         }
