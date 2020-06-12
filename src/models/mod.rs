@@ -2,17 +2,16 @@ mod account;
 mod block;
 mod bloom;
 mod chainspec;
-mod config;
 mod header;
 mod log;
 mod receipt;
 mod transaction;
 
 pub use self::{
-    account::*, block::*, bloom::*, config::*, header::*, log::*, receipt::*, transaction::*,
+    account::*, block::*, bloom::*, chainspec::*, header::*, log::*, receipt::*, transaction::*,
 };
 
-use derive_more::{Deref, DerefMut, Display, From};
+use derive_more::*;
 use ethereum_types::{H256, U256};
 use hex_literal::hex;
 use once_cell::sync::Lazy;
@@ -40,6 +39,7 @@ macro_rules! u64_wrapper {
             PartialEq,
             Eq,
             From,
+            FromStr,
             PartialOrd,
             Ord,
             Hash,
@@ -86,6 +86,7 @@ macro_rules! u64_wrapper {
 }
 
 u64_wrapper!(BlockNumber);
+u64_wrapper!(ChainId);
 u64_wrapper!(Incarnation);
 u64_wrapper!(TxIndex);
 

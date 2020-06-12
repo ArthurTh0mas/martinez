@@ -19,7 +19,9 @@ pub enum HeaderSliceStatus {
     Waiting,
     // received from sentry
     Downloaded,
-    // block hashes are matching the expected ones
+    // headers inside the slice have a consistent structure, and linked in a proper way
+    VerifiedInternally,
+    // headers of the slice and linked in a proper way to a known verified header
     Verified,
     // saved in the database
     Saved,
@@ -164,6 +166,16 @@ impl HeaderSlices {
             .iter()
             .find(|slice| slice.read().status == status)
             .map(Arc::clone)
+    }
+
+    pub fn find_first(&self) -> Option<Arc<RwLock<HeaderSlice>>> {
+        let slices = self.slices.read();
+        slices.front().map(Arc::clone)
+    }
+
+    pub fn find_by_index(&self, index: usize) -> Option<Arc<RwLock<HeaderSlice>>> {
+        let slices = self.slices.read();
+        slices.iter().nth(index).map(Arc::clone)
     }
 
     pub fn remove(&self, status: HeaderSliceStatus) {

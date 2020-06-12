@@ -1,3 +1,4 @@
+mod average_delta_counter;
 pub mod downloader;
 mod downloader_linear;
 mod downloader_preverified;
@@ -6,13 +7,16 @@ pub mod header_slices;
 pub mod stage;
 mod stage_stream;
 
-pub mod fetch_receive_stage;
-pub mod fetch_request_stage;
-pub mod preverified_hashes_config;
-pub mod refill_stage;
-pub mod retry_stage;
-pub mod save_stage;
-pub mod verify_stage;
+mod fetch_receive_stage;
+mod fetch_request_stage;
+mod header_slice_verifier;
+mod preverified_hashes_config;
+mod refill_stage;
+mod retry_stage;
+mod save_stage;
+mod verify_stage_linear;
+mod verify_stage_linear_link;
+mod verify_stage_preverified;
 
 #[cfg(feature = "crossterm")]
 pub mod ui_crossterm;

@@ -44,6 +44,10 @@ pub fn zeroless_view(v: &impl AsRef<[u8]>) -> &[u8] {
     &v[v.iter().take_while(|b| b.is_zero()).count()..]
 }
 
+pub fn hex_to_bytes(s: &str) -> Result<Bytes, hex::FromHexError> {
+    hex::decode(s).map(From::from)
+}
+
 pub fn write_hex_string<B: AsRef<[u8]>>(b: &B, f: &mut Formatter) -> fmt::Result {
     write!(f, "0x{}", hex::encode(b))
 }
@@ -64,15 +68,28 @@ where
     Ok(d)
 }
 
-pub fn deserialize_hexstr_as_bytes<'de, D>(deserializer: D) -> Result<Bytes, D::Error>
-where
-    D: de::Deserializer<'de>,
-{
-    let s = String::deserialize(deserializer)?;
+pub mod hexbytes {
+    use serde::Serializer;
 
-    Ok(hex::decode(s.strip_prefix("0x").unwrap_or(&s))
-        .map_err(D::Error::custom)?
-        .into())
+    use super::*;
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Bytes, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+
+        Ok(hex::decode(s.strip_prefix("0x").unwrap_or(&s))
+            .map_err(D::Error::custom)?
+            .into())
+    }
+
+    pub fn serialize<S>(b: &Bytes, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&format!("0x{}", hex::encode(b)))
+    }
 }
 
 #[cfg(test)]

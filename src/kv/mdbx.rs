@@ -42,6 +42,8 @@ impl<E: EnvironmentKind> Environment<E> {
         if ro {
             b.set_flags(::mdbx::EnvironmentFlags {
                 mode: ::mdbx::Mode::ReadOnly,
+                no_rdahead: true,
+                coalesce: true,
                 ..Default::default()
             });
         }
@@ -278,6 +280,16 @@ impl<'env, E: EnvironmentKind> traits::MutableTransaction<'env> for MdbxTransact
             key.encode(),
             vref,
         )?)
+    }
+
+    async fn clear_table<T>(&self, table: &T) -> anyhow::Result<()>
+    where
+        T: Table,
+    {
+        self.inner
+            .clear_db(&self.inner.open_db(Some(table.db_name().as_ref()))?)?;
+
+        Ok(())
     }
 
     async fn commit(self) -> anyhow::Result<()> {

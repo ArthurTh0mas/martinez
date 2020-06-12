@@ -1,1 +1,1 @@
-pub mod genesis;
+pub mod chainspec;
