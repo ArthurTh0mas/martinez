@@ -1,20 +1,13 @@
-#![feature(let_else)]
 #![allow(clippy::suspicious_else_formatting)]
 use martinez::{
-    consensus::{
-        difficulty::{canonical_difficulty, BlockDifficultyBombData},
-        *,
-    },
-    crypto::keccak256,
-    models::*,
-    res::chainspec::*,
-    *,
+    chain::difficulty::canonical_difficulty, consensus::*, crypto::keccak256, models::*,
+    res::genesis, *,
 };
 use anyhow::*;
 use bytes::Bytes;
 use educe::Educe;
 use ethereum_types::*;
-use maplit::*;
+use maplit::hashmap;
 use once_cell::sync::Lazy;
 use serde::{de, Deserialize};
 use serde_json::{Map, Value};
@@ -35,16 +28,6 @@ pub static DIFFICULTY_DIR: Lazy<PathBuf> = Lazy::new(|| Path::new("BasicTests").
 pub static BLOCKCHAIN_DIR: Lazy<PathBuf> = Lazy::new(|| Path::new("BlockchainTests").to_path_buf());
 pub static TRANSACTION_DIR: Lazy<PathBuf> =
     Lazy::new(|| Path::new("TransactionTests").to_path_buf());
-
-pub static IGNORED_TX_EXCEPTIONS: Lazy<HashSet<String>> = Lazy::new(|| {
-    hashset! {
-        // This is not checked for now.
-        "InvalidVRS".to_string(),
-
-        // Post-intrinsic gas calculation is part of execution, not pre-validation.
-        "TR_IntrinsicGas".to_string()
-    }
-});
 
 pub static EXCLUDED_TESTS: Lazy<Vec<PathBuf>> = Lazy::new(|| {
     vec![
@@ -133,262 +116,192 @@ impl FromStr for Network {
     }
 }
 
-fn testconfig(
-    name: Network,
-    upgrades: Upgrades,
-    dao_block: Option<BlockNumber>,
-    bomb_delay: BlockNumber,
-) -> ChainSpec {
-    let mut spec = MAINNET.clone();
-    spec.name = format!("{:?}", name);
-    spec.consensus.eip1559_block = upgrades.london;
-    let SealVerificationParams::Ethash { difficulty_bomb, skip_pow_verification, homestead_formula, byzantium_formula,.. } = &mut spec.consensus.seal_verification else { unreachable!() };
-    *difficulty_bomb = Some(DifficultyBomb {
-        delays: btreemap! { BlockNumber(0) => bomb_delay },
-    });
-    *skip_pow_verification = true;
-    *homestead_formula = upgrades.homestead;
-    *byzantium_formula = upgrades.byzantium;
-    spec.upgrades = upgrades;
-
-    let mainnet_dao_fork_block_num = BlockNumber(1_920_000);
-    let dao_data = spec.balances.remove(&mainnet_dao_fork_block_num).unwrap();
-    spec.balances.clear();
-    if let Some(dao_block) = dao_block {
-        spec.balances.insert(dao_block, dao_data);
+static NETWORK_CONFIG: Lazy<HashMap<Network, ChainConfig>> = Lazy::new(|| {
+    hashmap! {
+        Network::Frontier => ChainConfig {
+            chain_id: 1,
+            seal_engine: SealEngineType::NoProof,
+            ..ChainConfig::default()
+        },
+        Network::Homestead => ChainConfig {
+            chain_id: 1,
+            seal_engine: SealEngineType::NoProof,
+            homestead_block: Some(0.into()),
+            ..ChainConfig::default()
+        },
+        Network::EIP150 => ChainConfig {
+            chain_id: 1,
+            seal_engine: SealEngineType::NoProof,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(0.into()),
+            ..ChainConfig::default()
+        },
+        Network::EIP158 => ChainConfig {
+            chain_id: 1,
+            seal_engine: SealEngineType::NoProof,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(0.into()),
+            spurious_block: Some(0.into()),
+            ..ChainConfig::default()
+        },
+        Network::Byzantium => ChainConfig {
+            chain_id: 1,
+            seal_engine: SealEngineType::NoProof,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(0.into()),
+            spurious_block: Some(0.into()),
+            byzantium_block: Some(0.into()),
+            ..ChainConfig::default()
+        },
+        Network::Constantinople => ChainConfig {
+            chain_id: 1,
+            seal_engine: SealEngineType::NoProof,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(0.into()),
+            spurious_block: Some(0.into()),
+            byzantium_block: Some(0.into()),
+            constantinople_block: Some(0.into()),
+            ..ChainConfig::default()
+        },
+        Network::ConstantinopleFix => ChainConfig {
+            chain_id: 1,
+            seal_engine: SealEngineType::NoProof,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(0.into()),
+            spurious_block: Some(0.into()),
+            byzantium_block: Some(0.into()),
+            constantinople_block: Some(0.into()),
+            petersburg_block: Some(0.into()),
+            ..ChainConfig::default()
+        },
+        Network::Istanbul => ChainConfig {
+            chain_id: 1,
+            seal_engine: SealEngineType::NoProof,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(0.into()),
+            spurious_block: Some(0.into()),
+            byzantium_block: Some(0.into()),
+            constantinople_block: Some(0.into()),
+            petersburg_block: Some(0.into()),
+            istanbul_block: Some(0.into()),
+            ..ChainConfig::default()
+        },
+        Network::Berlin => ChainConfig {
+            chain_id: 1,
+            seal_engine: SealEngineType::NoProof,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(0.into()),
+            spurious_block: Some(0.into()),
+            byzantium_block: Some(0.into()),
+            constantinople_block: Some(0.into()),
+            petersburg_block: Some(0.into()),
+            istanbul_block: Some(0.into()),
+            muir_glacier_block: Some(0.into()),
+            berlin_block: Some(0.into()),
+            ..ChainConfig::default()
+        },
+        Network::London => ChainConfig {
+            chain_id: 1,
+            seal_engine: SealEngineType::NoProof,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(0.into()),
+            spurious_block: Some(0.into()),
+            byzantium_block: Some(0.into()),
+            constantinople_block: Some(0.into()),
+            petersburg_block: Some(0.into()),
+            istanbul_block: Some(0.into()),
+            muir_glacier_block: Some(0.into()),
+            berlin_block: Some(0.into()),
+            london_block: Some(0.into()),
+            ..ChainConfig::default()
+        },
+        Network::FrontierToHomesteadAt5 => ChainConfig {
+            chain_id: 1,
+            seal_engine: SealEngineType::NoProof,
+            homestead_block: Some(5.into()),
+            ..ChainConfig::default()
+        },
+        Network::HomesteadToEIP150At5 => ChainConfig {
+            chain_id: 1,
+            seal_engine: SealEngineType::NoProof,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(5.into()),
+            ..ChainConfig::default()
+        },
+        Network::HomesteadToDaoAt5 => ChainConfig {
+            chain_id: 1,
+            seal_engine: SealEngineType::NoProof,
+            homestead_block: Some(0.into()),
+            dao_fork: Some(DaoConfig {
+                block_number: 5.into(),
+                ..genesis::MAINNET.config.dao_fork.clone().unwrap()
+            }),
+            ..ChainConfig::default()
+        },
+        Network::EIP158ToByzantiumAt5 => ChainConfig {
+            chain_id: 1,
+            seal_engine: SealEngineType::NoProof,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(0.into()),
+            spurious_block: Some(0.into()),
+            byzantium_block: Some(5.into()),
+            ..ChainConfig::default()
+        },
+        Network::ByzantiumToConstantinopleFixAt5 => ChainConfig {
+            chain_id: 1,
+            seal_engine: SealEngineType::NoProof,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(0.into()),
+            spurious_block: Some(0.into()),
+            byzantium_block: Some(0.into()),
+            constantinople_block: Some(5.into()),
+            petersburg_block: Some(5.into()),
+            ..ChainConfig::default()
+        },
+        Network::BerlinToLondonAt5 => ChainConfig {
+            chain_id: 1,
+            seal_engine: SealEngineType::NoProof,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(0.into()),
+            spurious_block: Some(0.into()),
+            byzantium_block: Some(0.into()),
+            constantinople_block: Some(0.into()),
+            petersburg_block: Some(0.into()),
+            istanbul_block: Some(0.into()),
+            muir_glacier_block: Some(0.into()),
+            berlin_block: Some(0.into()),
+            london_block: Some(5.into()),
+            ..ChainConfig::default()
+        },
+        Network::EIP2384 => ChainConfig {
+            chain_id: 1,
+            seal_engine: SealEngineType::NoProof,
+            homestead_block: Some(0.into()),
+            tangerine_block: Some(0.into()),
+            spurious_block: Some(0.into()),
+            byzantium_block: Some(0.into()),
+            constantinople_block: Some(0.into()),
+            petersburg_block: Some(0.into()),
+            istanbul_block: Some(0.into()),
+            muir_glacier_block: Some(0.into()),
+            ..ChainConfig::default()
+        },
     }
-
-    spec
-}
-
-static NETWORK_CONFIG: Lazy<HashMap<Network, ChainSpec>> = Lazy::new(|| {
-    vec![
-        (Network::Frontier, Upgrades::default(), None, 0),
-        (
-            Network::Homestead,
-            Upgrades {
-                homestead: Some(0.into()),
-                ..Default::default()
-            },
-            None,
-            0,
-        ),
-        (
-            Network::EIP150,
-            Upgrades {
-                homestead: Some(0.into()),
-                tangerine: Some(0.into()),
-                ..Default::default()
-            },
-            None,
-            0,
-        ),
-        (
-            Network::EIP158,
-            Upgrades {
-                homestead: Some(0.into()),
-                tangerine: Some(0.into()),
-                spurious: Some(0.into()),
-                ..Default::default()
-            },
-            None,
-            0,
-        ),
-        (
-            Network::Byzantium,
-            Upgrades {
-                homestead: Some(0.into()),
-                tangerine: Some(0.into()),
-                spurious: Some(0.into()),
-                byzantium: Some(0.into()),
-                ..Default::default()
-            },
-            None,
-            3000000,
-        ),
-        (
-            Network::Constantinople,
-            Upgrades {
-                homestead: Some(0.into()),
-                tangerine: Some(0.into()),
-                spurious: Some(0.into()),
-                byzantium: Some(0.into()),
-                constantinople: Some(0.into()),
-                ..Default::default()
-            },
-            None,
-            5000000,
-        ),
-        (
-            Network::ConstantinopleFix,
-            Upgrades {
-                homestead: Some(0.into()),
-                tangerine: Some(0.into()),
-                spurious: Some(0.into()),
-                byzantium: Some(0.into()),
-                constantinople: Some(0.into()),
-                petersburg: Some(0.into()),
-                ..Default::default()
-            },
-            None,
-            5000000,
-        ),
-        (
-            Network::Istanbul,
-            Upgrades {
-                homestead: Some(0.into()),
-                tangerine: Some(0.into()),
-                spurious: Some(0.into()),
-                byzantium: Some(0.into()),
-                constantinople: Some(0.into()),
-                petersburg: Some(0.into()),
-                istanbul: Some(0.into()),
-                ..Default::default()
-            },
-            None,
-            9000000,
-        ),
-        (
-            Network::Berlin,
-            Upgrades {
-                homestead: Some(0.into()),
-                tangerine: Some(0.into()),
-                spurious: Some(0.into()),
-                byzantium: Some(0.into()),
-                constantinople: Some(0.into()),
-                petersburg: Some(0.into()),
-                istanbul: Some(0.into()),
-                berlin: Some(0.into()),
-                ..Default::default()
-            },
-            None,
-            9000000,
-        ),
-        (
-            Network::London,
-            Upgrades {
-                homestead: Some(0.into()),
-                tangerine: Some(0.into()),
-                spurious: Some(0.into()),
-                byzantium: Some(0.into()),
-                constantinople: Some(0.into()),
-                petersburg: Some(0.into()),
-                istanbul: Some(0.into()),
-                berlin: Some(0.into()),
-                london: Some(0.into()),
-            },
-            None,
-            9700000,
-        ),
-        (
-            Network::FrontierToHomesteadAt5,
-            Upgrades {
-                homestead: Some(5.into()),
-                ..Default::default()
-            },
-            None,
-            0,
-        ),
-        (
-            Network::HomesteadToEIP150At5,
-            Upgrades {
-                homestead: Some(0.into()),
-                tangerine: Some(5.into()),
-                ..Default::default()
-            },
-            None,
-            0,
-        ),
-        (
-            Network::HomesteadToDaoAt5,
-            Upgrades {
-                homestead: Some(0.into()),
-                ..Default::default()
-            },
-            Some(5.into()),
-            0,
-        ),
-        (
-            Network::EIP158ToByzantiumAt5,
-            Upgrades {
-                homestead: Some(0.into()),
-                tangerine: Some(0.into()),
-                spurious: Some(0.into()),
-                byzantium: Some(5.into()),
-                ..Default::default()
-            },
-            None,
-            3000000,
-        ),
-        (
-            Network::ByzantiumToConstantinopleFixAt5,
-            Upgrades {
-                homestead: Some(0.into()),
-                tangerine: Some(0.into()),
-                spurious: Some(0.into()),
-                byzantium: Some(0.into()),
-                constantinople: Some(5.into()),
-                petersburg: Some(5.into()),
-                ..Default::default()
-            },
-            None,
-            5000000,
-        ),
-        (
-            Network::BerlinToLondonAt5,
-            Upgrades {
-                homestead: Some(0.into()),
-                tangerine: Some(0.into()),
-                spurious: Some(0.into()),
-                byzantium: Some(0.into()),
-                constantinople: Some(0.into()),
-                petersburg: Some(0.into()),
-                istanbul: Some(0.into()),
-                berlin: Some(0.into()),
-                london: Some(5.into()),
-            },
-            None,
-            9700000,
-        ),
-        (
-            Network::EIP2384,
-            Upgrades {
-                homestead: Some(0.into()),
-                tangerine: Some(0.into()),
-                spurious: Some(0.into()),
-                byzantium: Some(0.into()),
-                constantinople: Some(0.into()),
-                petersburg: Some(0.into()),
-                istanbul: Some(0.into()),
-                ..Default::default()
-            },
-            None,
-            9000000,
-        ),
-    ]
-    .into_iter()
-    .map(|(network, upgrades, dao_block, bomb_delay)| {
-        (
-            network,
-            testconfig(network, upgrades, dao_block, bomb_delay.into()),
-        )
-    })
-    .collect()
 });
 
-pub static DIFFICULTY_CONFIG: Lazy<HashMap<String, ChainSpec>> = Lazy::new(|| {
+pub static DIFFICULTY_CONFIG: Lazy<HashMap<String, ChainConfig>> = Lazy::new(|| {
     hashmap! {
-        "difficulty.json".to_string() => MAINNET.clone(),
+        "difficulty.json".to_string() => genesis::MAINNET.config.clone(),
         "difficultyByzantium.json".to_string() => NETWORK_CONFIG[&Network::Byzantium].clone(),
         "difficultyConstantinople.json".to_string() => NETWORK_CONFIG[&Network::Constantinople].clone(),
-        "difficultyCustomMainNetwork.json".to_string() => MAINNET.clone(),
+        "difficultyCustomMainNetwork.json".to_string() => genesis::MAINNET.config.clone(),
         "difficultyEIP2384_random_to20M.json".to_string() => NETWORK_CONFIG[&Network::EIP2384].clone(),
         "difficultyEIP2384_random.json".to_string() => NETWORK_CONFIG[&Network::EIP2384].clone(),
         "difficultyEIP2384.json".to_string() => NETWORK_CONFIG[&Network::EIP2384].clone(),
         "difficultyFrontier.json".to_string() => NETWORK_CONFIG[&Network::Frontier].clone(),
         "difficultyHomestead.json".to_string() => NETWORK_CONFIG[&Network::Homestead].clone(),
-        "difficultyMainNetwork.json".to_string() => MAINNET.clone(),
-        "difficultyRopsten.json".to_string() => ROPSTEN.clone(),
+        "difficultyMainNetwork.json".to_string() => genesis::MAINNET.config.clone(),
+        "difficultyRopsten.json".to_string() => genesis::ROPSTEN.config.clone(),
     }
 });
 
@@ -396,7 +309,7 @@ pub static DIFFICULTY_CONFIG: Lazy<HashMap<String, ChainSpec>> = Lazy::new(|| {
 #[educe(Debug)]
 pub struct AccountState {
     pub balance: U256,
-    #[serde(with = "hexbytes")]
+    #[serde(deserialize_with = "deserialize_hexstr_as_bytes")]
     #[educe(Debug(method = "write_hex_string"))]
     pub code: Bytes,
     pub nonce: U64,
@@ -464,7 +377,10 @@ struct BlockchainTest {
     seal_engine: SealEngine,
     network: Network,
     pre: HashMap<Address, AccountState>,
-    #[serde(rename = "genesisRLP", with = "hexbytes")]
+    #[serde(
+        rename = "genesisRLP",
+        deserialize_with = "deserialize_hexstr_as_bytes"
+    )]
     #[educe(Debug(method = "write_hex_string"))]
     genesis_rlp: Bytes,
     blocks: Vec<Map<String, Value>>,
@@ -545,7 +461,7 @@ struct BlockCommon {
     #[serde(default)]
     expect_exception: Option<String>,
     #[educe(Debug(method = "write_hex_string"))]
-    #[serde(with = "hexbytes")]
+    #[serde(deserialize_with = "deserialize_hexstr_as_bytes")]
     rlp: Bytes,
 }
 
@@ -655,7 +571,7 @@ fn result_is_expected(
 
 /// https://ethereum-tests.readthedocs.io/en/latest/test_types/blockchain_tests.html
 #[instrument(skip(testdata))]
-async fn blockchain_test(testdata: BlockchainTest, _: Option<ChainSpec>) -> anyhow::Result<()> {
+async fn blockchain_test(testdata: BlockchainTest, _: Option<ChainConfig>) -> anyhow::Result<()> {
     let genesis_block = rlp::decode::<Block>(&*testdata.genesis_rlp).unwrap();
 
     let mut state = InMemoryState::default();
@@ -708,13 +624,13 @@ pub enum TransactionTestResult {
 #[derive(Debug, Deserialize)]
 pub struct TransactionTest {
     pub result: HashMap<String, TransactionTestResult>,
-    #[serde(with = "hexbytes")]
+    #[serde(deserialize_with = "deserialize_hexstr_as_bytes")]
     pub txbytes: Bytes,
 }
 
 // https://ethereum-tests.readthedocs.io/en/latest/test_types/transaction_tests.html
 #[instrument(skip(testdata))]
-async fn transaction_test(testdata: TransactionTest, _: Option<ChainSpec>) -> anyhow::Result<()> {
+async fn transaction_test(testdata: TransactionTest, _: Option<ChainConfig>) -> anyhow::Result<()> {
     let txn = rlp::decode::<martinez::models::Transaction>(&testdata.txbytes);
 
     for (key, t) in testdata.result {
@@ -726,13 +642,10 @@ async fn transaction_test(testdata: TransactionTest, _: Option<ChainSpec>) -> an
             (Ok(txn), t) => {
                 let config = &NETWORK_CONFIG[&key.parse().unwrap()];
 
-                if let Err(e) = pre_validate_transaction(txn, config.params.chain_id, None) {
+                if let Err(e) = pre_validate_transaction(txn, 0, config, None) {
                     match t {
-                        TransactionTestResult::Correct { hash, sender } => {
-                            return Err(anyhow::Error::new(e).context(format!(
-                                "Unexpected validation error (tx hash {:?}, sender {:?})",
-                                hash, sender
-                            )));
+                        TransactionTestResult::Correct { .. } => {
+                            return Err(anyhow::Error::new(e).context("Validation error"));
                         }
                         TransactionTestResult::Incorrect { .. } => {
                             continue;
@@ -741,19 +654,11 @@ async fn transaction_test(testdata: TransactionTest, _: Option<ChainSpec>) -> an
                 }
 
                 match (txn.recover_sender(), t) {
-                    (Err(e), TransactionTestResult::Correct { hash, sender }) => {
-                        return Err(e.context(format!(
-                            "Failed to recover sender (tx hash {:?}, sender {:?})",
-                            hash, sender
-                        )));
+                    (Err(e), TransactionTestResult::Correct { .. }) => {
+                        return Err(e.context("Failed to recover sender"));
                     }
-                    (Ok(_), TransactionTestResult::Incorrect { exception }) => {
-                        if !IGNORED_TX_EXCEPTIONS.contains(&exception) {
-                            bail!(
-                                "Sender recovered for invalid transaction (exception {})",
-                                exception
-                            )
-                        }
+                    (Ok(_), TransactionTestResult::Incorrect { .. }) => {
+                        bail!("Sender recovered for invalid transaction")
                     }
                     (Ok(recovered_sender), TransactionTestResult::Correct { sender, hash }) => {
                         ensure!(
@@ -777,15 +682,12 @@ async fn transaction_test(testdata: TransactionTest, _: Option<ChainSpec>) -> an
 #[instrument(skip(config))]
 async fn difficulty_test(
     testdata: DifficultyTest,
-    config: Option<ChainSpec>,
+    config: Option<ChainConfig>,
 ) -> anyhow::Result<()> {
     let parent_has_uncles = testdata
         .parent_uncles
         .map(|hash| hash != EMPTY_LIST_HASH)
         .unwrap_or(false);
-
-    let config = config.unwrap();
-    let SealVerificationParams::Ethash { homestead_formula, byzantium_formula, difficulty_bomb, .. } = config.consensus.seal_verification else {unreachable!()};
 
     let calculated_difficulty = canonical_difficulty(
         testdata.current_block_number,
@@ -793,11 +695,7 @@ async fn difficulty_test(
         testdata.parent_difficulty.into(),
         testdata.parent_timestamp,
         parent_has_uncles,
-        switch_is_active(byzantium_formula, testdata.current_block_number),
-        switch_is_active(homestead_formula, testdata.current_block_number),
-        difficulty_bomb.map(|b| BlockDifficultyBombData {
-            delay_to: b.get_delay_to(testdata.current_block_number),
-        }),
+        &config.unwrap(),
     );
 
     ensure!(
@@ -815,8 +713,8 @@ async fn difficulty_test(
 async fn run_test_file<Test, Fut>(
     path: &Path,
     test_names: &HashSet<String>,
-    f: fn(Test, Option<ChainSpec>) -> Fut,
-    config: Option<ChainSpec>,
+    f: fn(Test, Option<ChainConfig>) -> Fut,
+    config: Option<ChainConfig>,
 ) -> RunResults
 where
     Fut: Future<Output = anyhow::Result<()>>,
@@ -833,7 +731,7 @@ where
         debug!("Running test {}", test_name);
         out.push({
             if let Err(e) = (f)(test, config.clone()).await {
-                error!("{}: {}: {}", path.to_string_lossy(), test_name, e);
+                error!("{}: {}", test_name, e);
                 Status::Failed
             } else {
                 Status::Passed

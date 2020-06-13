@@ -122,40 +122,53 @@ pub mod tx_sender {
 
     pub async fn read<'db, Tx: ReadTransaction<'db>>(
         tx: &Tx,
-        hash: H256,
-        number: impl Into<BlockNumber>,
+        base_tx_id: impl Into<TxIndex>,
+        amount: usize,
     ) -> anyhow::Result<Vec<Address>> {
-        let number = number.into();
+        let base_tx_id = base_tx_id.into();
 
         trace!(
-            "Reading transaction senders for block {}/{:?}",
-            number,
-            hash
+            "Reading {} transaction senders starting from {}",
+            amount,
+            base_tx_id
         );
 
-        Ok(tx
-            .get(&tables::TxSender, (number, hash))
-            .await?
-            .unwrap_or_default())
+        Ok(if amount > 0 {
+            let mut cursor = tx.cursor(&tables::TxSender).await?;
+
+            let start_key = base_tx_id;
+            cursor
+                .walk(Some(start_key))
+                .take(amount)
+                .collect::<anyhow::Result<Vec<_>>>()
+                .await?
+                .into_iter()
+                .map(|(_, address)| address)
+                .collect()
+        } else {
+            vec![]
+        })
     }
 
     pub async fn write<'db, RwTx: MutableTransaction<'db>>(
         tx: &RwTx,
-        hash: H256,
-        number: impl Into<BlockNumber>,
-        senders: Vec<Address>,
+        base_tx_id: impl Into<TxIndex>,
+        senders: &[Address],
     ) -> anyhow::Result<()> {
-        let number = number.into();
+        let base_tx_id = base_tx_id.into();
         trace!(
-            "Writing {} transaction senders for block {}/{:?}",
+            "Writing {} transaction senders starting from {}",
             senders.len(),
-            number,
-            hash
+            base_tx_id
         );
 
-        tx.set(&tables::TxSender, ((number, hash), senders))
-            .await
-            .unwrap();
+        let mut cursor = tx.mutable_cursor(&tables::TxSender).await.unwrap();
+
+        for (i, &sender) in senders.iter().enumerate() {
+            cursor
+                .put((TxIndex(base_tx_id.0 + i as u64), sender))
+                .await?;
+        }
 
         Ok(())
     }
@@ -236,9 +249,8 @@ pub mod block_body {
         hash: H256,
         number: impl Into<BlockNumber>,
     ) -> anyhow::Result<Option<BlockBodyWithSenders>> {
-        let number = number.into();
-        if let Some((body, _)) = read_base(tx, hash, number).await? {
-            let senders = super::tx_sender::read(tx, hash, number).await?;
+        if let Some((body, base_tx_id)) = read_base(tx, hash, number).await? {
+            let senders = super::tx_sender::read(tx, base_tx_id, body.transactions.len()).await?;
 
             return Ok(Some(BlockBodyWithSenders {
                 transactions: body
@@ -365,9 +377,7 @@ mod tests {
             .unwrap();
         canonical_hash::write(rwtx, 1, block1_hash).await.unwrap();
         tx::write(rwtx, 1, &txs).await.unwrap();
-        tx_sender::write(rwtx, block1_hash, 1, senders.to_vec())
-            .await
-            .unwrap();
+        tx_sender::write(rwtx, 1, &senders).await.unwrap();
 
         let recovered_body = storage_body::read(rwtx, block1_hash, 1)
             .await
@@ -378,7 +388,7 @@ mod tests {
             .unwrap()
             .expect("Could not recover block hash");
         let recovered_txs = tx::read(rwtx, 1, 2).await.unwrap();
-        let recovered_senders = tx_sender::read(rwtx, block1_hash, 1).await.unwrap();
+        let recovered_senders = tx_sender::read(rwtx, 1, 2).await.unwrap();
 
         assert_eq!(body, recovered_body);
         assert_eq!(block1_hash, recovered_hash);

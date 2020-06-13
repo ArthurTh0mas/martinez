@@ -1,5 +1,9 @@
 use super::*;
-use crate::{chain::protocol_param::param, models::*, state::*};
+use crate::{
+    chain::{difficulty::*, protocol_param::param},
+    models::*,
+    state::*,
+};
 use anyhow::Context;
 use async_recursion::*;
 use ethereum_types::*;
@@ -7,22 +11,18 @@ use std::time::SystemTime;
 
 #[derive(Debug)]
 pub struct ConsensusEngineBase {
-    chain_id: ChainId,
-    eip1559_block: Option<BlockNumber>,
+    chain_config: ChainConfig,
 }
 
 impl ConsensusEngineBase {
-    pub fn new(chain_id: ChainId, eip1559_block: Option<BlockNumber>) -> Self {
-        Self {
-            chain_id,
-            eip1559_block,
-        }
+    pub fn new(chain_config: ChainConfig) -> Self {
+        Self { chain_config }
     }
 
     pub async fn validate_block_header(
         &self,
         header: &BlockHeader,
-        parent: &BlockHeader,
+        state: &mut dyn State,
         with_future_timestamp_check: bool,
     ) -> anyhow::Result<()> {
         if with_future_timestamp_check {
@@ -60,6 +60,11 @@ impl ConsensusEngineBase {
             return Err(ValidationError::ExtraDataTooLong.into());
         }
 
+        let parent = self
+            .get_parent_header(state, header)
+            .await?
+            .ok_or(ValidationError::UnknownParent)?;
+
         if header.timestamp <= parent.timestamp {
             return Err(ValidationError::InvalidTimestamp {
                 parent: parent.timestamp,
@@ -69,7 +74,7 @@ impl ConsensusEngineBase {
         }
 
         let mut parent_gas_limit = parent.gas_limit;
-        if let Some(fork_block) = self.eip1559_block {
+        if let Some(fork_block) = self.chain_config.london_block {
             if fork_block == header.number {
                 parent_gas_limit = parent.gas_limit * param::ELASTICITY_MULTIPLIER;
             }
@@ -84,7 +89,20 @@ impl ConsensusEngineBase {
             return Err(ValidationError::InvalidGasLimit.into());
         }
 
-        let expected_base_fee_per_gas = self.expected_base_fee_per_gas(header, parent);
+        let parent_has_uncles = parent.ommers_hash != EMPTY_LIST_HASH;
+        let difficulty = canonical_difficulty(
+            header.number,
+            header.timestamp,
+            parent.difficulty,
+            parent.timestamp,
+            parent_has_uncles,
+            &self.chain_config,
+        );
+        if difficulty != header.difficulty {
+            return Err(ValidationError::WrongDifficulty.into());
+        }
+
+        let expected_base_fee_per_gas = self.expected_base_fee_per_gas(header, &parent);
         if header.base_fee_per_gas != expected_base_fee_per_gas {
             return Err(ValidationError::WrongBaseFee {
                 expected: expected_base_fee_per_gas,
@@ -96,7 +114,7 @@ impl ConsensusEngineBase {
         Ok(())
     }
 
-    pub async fn get_parent_header(
+    async fn get_parent_header(
         &self,
         state: &mut dyn State,
         header: &BlockHeader,
@@ -165,7 +183,7 @@ impl ConsensusEngineBase {
         header: &BlockHeader,
         parent: &BlockHeader,
     ) -> Option<U256> {
-        if let Some(fork_block) = self.eip1559_block {
+        if let Some(fork_block) = self.chain_config.london_block {
             if header.number >= fork_block {
                 if header.number == fork_block {
                     return Some(param::INITIAL_BASE_FEE.into());
@@ -208,6 +226,9 @@ impl ConsensusEngineBase {
         block: &Block,
         state: &mut dyn State,
     ) -> anyhow::Result<()> {
+        self.validate_block_header(&block.header, state, true)
+            .await?;
+
         let expected_ommers_hash = Block::ommers_hash(&block.ommers);
         if block.header.ommers_hash != expected_ommers_hash {
             return Err(ValidationError::WrongOmmersHash {
@@ -234,18 +255,10 @@ impl ConsensusEngineBase {
             return Err(ValidationError::DuplicateOmmer.into());
         }
 
-        let parent = self
-            .get_parent_header(state, &block.header)
-            .await?
-            .ok_or(ValidationError::UnknownParent)?;
+        let parent = self.get_parent_header(state, &block.header).await?.unwrap();
 
         for ommer in &block.ommers {
-            let ommer_parent = self
-                .get_parent_header(state, ommer)
-                .await?
-                .ok_or(ValidationError::UnknownParent)?;
-
-            self.validate_block_header(ommer, &ommer_parent, false)
+            self.validate_block_header(ommer, state, false)
                 .await
                 .context(ValidationError::InvalidOmmerHeader)?;
             let mut old_ommers = vec![];
@@ -270,7 +283,12 @@ impl ConsensusEngineBase {
         }
 
         for txn in &block.transactions {
-            pre_validate_transaction(txn, self.chain_id, block.header.base_fee_per_gas)?;
+            pre_validate_transaction(
+                txn,
+                block.header.number,
+                &self.chain_config,
+                block.header.base_fee_per_gas,
+            )?;
         }
 
         Ok(())
@@ -280,7 +298,7 @@ impl ConsensusEngineBase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::res::chainspec::MAINNET;
+    use crate::res::genesis::MAINNET;
 
     #[test]
     fn validate_max_fee_per_gas() {
@@ -313,7 +331,7 @@ mod tests {
             ),
         ] {
             let txn = TransactionMessage::EIP1559 {
-                chain_id: ChainId(1),
+                chain_id: 1,
                 nonce: 0,
                 max_priority_fee_per_gas: max_priority_fee_per_gas.into(),
                 max_fee_per_gas: max_fee_per_gas.into(),
@@ -326,7 +344,8 @@ mod tests {
 
             let res = pre_validate_transaction(
                 &txn,
-                MAINNET.params.chain_id,
+                13_500_001,
+                &MAINNET.config,
                 Some(base_fee_per_gas.into()),
             );
 

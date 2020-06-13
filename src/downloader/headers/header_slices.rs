@@ -19,9 +19,7 @@ pub enum HeaderSliceStatus {
     Waiting,
     // received from sentry
     Downloaded,
-    // headers inside the slice have a consistent structure, and linked in a proper way
-    VerifiedInternally,
-    // headers of the slice and linked in a proper way to a known verified header
+    // block hashes are matching the expected ones
     Verified,
     // saved in the database
     Saved,

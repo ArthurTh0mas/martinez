@@ -494,7 +494,7 @@ where
         let mut storage = Vec::<(H256, H256)>::new();
         let mut found = self
             .storage_cursor
-            .seek_exact((address_hash, incarnation))
+            .seek((address_hash, incarnation))
             .await?;
         while let Some((_, storage_entry)) = found {
             storage.push((storage_entry.0, (storage_entry.1).0));
@@ -552,22 +552,15 @@ where
 }
 
 async fn update_interhashes<'db: 'tx, 'tx, RwTx>(
-    tx: &mut RwTx,
-    collector: &mut Collector<tables::TrieAccount>,
-    storage_collector: &mut Collector<tables::TrieStorage>,
-    from: BlockNumber,
-    to: BlockNumber,
+    _tx: &mut RwTx,
+    _collector: &mut Collector<tables::TrieAccount>,
+    _from: BlockNumber,
+    _to: BlockNumber,
 ) -> anyhow::Result<H256>
 where
     RwTx: MutableTransaction<'db>,
 {
-    let _ = from;
-    let _ = to;
-
-    tx.clear_table(&tables::TrieAccount).await?;
-    tx.clear_table(&tables::TrieStorage).await?;
-
-    generate_interhashes(tx, collector, storage_collector).await
+    todo!()
 }
 
 #[derive(Debug)]
@@ -605,34 +598,27 @@ where
                     .await
                     .with_context(|| "Failed to generate interhashes")?
             } else {
-                update_interhashes(
-                    tx,
-                    &mut collector,
-                    &mut storage_collector,
-                    past_progress,
-                    prev_progress,
-                )
-                .await
-                .with_context(|| "Failed to update interhashes")?
+                update_interhashes(tx, &mut collector, past_progress, prev_progress)
+                    .await
+                    .with_context(|| "Failed to update interhashes")?
             };
 
             let block_state_root = accessors::chain::header::read(
                 tx,
-                accessors::chain::canonical_hash::read(tx, prev_progress)
+                accessors::chain::canonical_hash::read(tx, past_progress)
                     .await?
-                    .ok_or_else(|| anyhow!("No canonical hash for block {}", prev_progress))?,
-                prev_progress,
+                    .ok_or_else(|| anyhow!("No canonical hash for block {}", past_progress))?,
+                past_progress,
             )
             .await?
-            .ok_or_else(|| anyhow!("No header for block {}", prev_progress))?
+            .ok_or_else(|| anyhow!("No header for block {}", past_progress))?
             .state_root;
 
             if block_state_root == trie_root {
-                info!("Block #{} state root OK: {:?}", prev_progress, trie_root)
+                info!("Block #{} state root OK: {:?}", past_progress, trie_root)
             } else {
                 bail!(
-                    "Block #{} state root mismatch: {:?} != {:?}",
-                    prev_progress,
+                    "State root mismatch: {:?} != {:?}",
                     trie_root,
                     block_state_root
                 )
@@ -644,9 +630,10 @@ where
             storage_collector.load(&mut storage_write_cursor).await?
         };
 
+        info!("Processed");
         Ok(ExecOutput::Progress {
             stage_progress: cmp::max(prev_progress, past_progress),
-            done: true,
+            done: false,
             must_commit: true,
         })
     }

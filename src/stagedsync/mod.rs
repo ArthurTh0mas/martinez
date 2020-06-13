@@ -20,7 +20,6 @@ use tracing::*;
 /// If the app is restarted in between stages, it restarts from the first stage. Absent new blocks, already completed stages are skipped.
 pub struct StagedSync<'db, DB: MutableKV> {
     stages: Vec<Box<dyn Stage<'db, DB::MutableTx<'db>>>>,
-    min_progress_to_commit_after_stage: u64,
 }
 
 impl<'db, DB: MutableKV> Default for StagedSync<'db, DB> {
@@ -31,10 +30,7 @@ impl<'db, DB: MutableKV> Default for StagedSync<'db, DB> {
 
 impl<'db, DB: MutableKV> StagedSync<'db, DB> {
     pub fn new() -> Self {
-        Self {
-            stages: Vec::new(),
-            min_progress_to_commit_after_stage: 0,
-        }
+        Self { stages: Vec::new() }
     }
 
     pub fn push<S>(&mut self, stage: S)
@@ -42,11 +38,6 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
         S: Stage<'db, DB::MutableTx<'db>> + 'static,
     {
         self.stages.push(Box::new(stage))
-    }
-
-    pub fn set_min_progress_to_commit_after_stage(&mut self, v: u64) -> &mut Self {
-        self.min_progress_to_commit_after_stage = v;
-        self
     }
 
     /// Run staged sync loop.
@@ -124,7 +115,6 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                     let stage_id = stage.id();
 
                     let start_time = Instant::now();
-                    let start_progress = stage_id.get_progress(&tx).await?;
 
                     // Re-invoke the stage until it reports `StageOutput::done`.
                     let done_progress = loop {
@@ -145,7 +135,6 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                                     &mut tx,
                                     StageInput {
                                         restarted,
-                                        first_started_at: (start_time, start_progress),
                                         previous_stage,
                                         stage_progress,
                                     },
@@ -164,7 +153,7 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                                         info!(
                                             "DONE @ {} in {}",
                                             stage_progress,
-                                            format_duration(time, true)
+                                            format_duration(time)
                                         );
                                     }
                                 }
@@ -195,11 +184,7 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                                 stage_id.save_progress(&tx, stage_progress).await?;
 
                                 // Stage requested that we commit into database now.
-                                if must_commit
-                                    && stage_progress
-                                        .saturating_sub(start_progress.map(|v| v.0).unwrap_or(0))
-                                        >= self.min_progress_to_commit_after_stage
-                                {
+                                if must_commit {
                                     // Commit and restart transaction.
                                     tx.commit().await?;
                                     tx = db.begin_mutable().await?;
@@ -231,7 +216,7 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                 let t = timings
                     .into_iter()
                     .fold(String::new(), |acc, (stage_id, time)| {
-                        format!("{} {}={}", acc, stage_id, format_duration(time, true))
+                        format!("{} {}={}", acc, stage_id, format_duration(time))
                     });
                 info!("Staged sync complete.{}", t);
             }
@@ -239,7 +224,7 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
     }
 }
 
-pub fn format_duration(dur: Duration, subsec_millis: bool) -> String {
+fn format_duration(dur: Duration) -> String {
     let mut secs = dur.as_secs();
     let mut minutes = secs / 60;
     let hours = minutes / 60;
@@ -247,14 +232,10 @@ pub fn format_duration(dur: Duration, subsec_millis: bool) -> String {
     secs %= 60;
     minutes %= 60;
     format!(
-        "{:0>2}:{:0>2}:{:0>2}{}",
+        "{:0>2}:{:0>2}:{:0>2}.{:0>3}",
         hours,
         minutes,
         secs,
-        if subsec_millis {
-            format!(".{:0>3}", dur.subsec_millis())
-        } else {
-            String::new()
-        }
+        dur.subsec_millis()
     )
 }

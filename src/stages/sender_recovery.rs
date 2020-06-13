@@ -4,10 +4,7 @@ use crate::{
         traits::{Cursor, MutableCursor, TableEncode},
     },
     models::*,
-    stagedsync::{
-        format_duration,
-        stage::{ExecOutput, Stage, StageInput, UnwindInput},
-    },
+    stagedsync::stage::{ExecOutput, Stage, StageInput, UnwindInput},
     MutableTransaction, StageId,
 };
 use async_trait::async_trait;
@@ -36,123 +33,69 @@ where
     where
         'db: 'tx,
     {
-        const BUFFERING_FACTOR: usize = 5000;
+        const BUFFERING_FACTOR: usize = 2_000_000;
         let mut body_cur = tx.cursor(&tables::BlockBody).await?;
         let mut tx_cur = tx.cursor(&tables::BlockTransaction.erased()).await?;
         let mut senders_cur = tx.mutable_cursor(&tables::TxSender.erased()).await?;
         senders_cur.last().await?;
 
-        let mut highest_block = input.stage_progress.unwrap_or(BlockNumber(0));
-        let mut walker = body_cur.walk(Some(BlockNumber(highest_block.0 + 1)));
+        let mut highest_block = input.stage_progress;
+        let mut walker = body_cur.walk(Some(BlockNumber(
+            input.stage_progress.unwrap_or(BlockNumber(0)).0 + 1,
+        )));
         let mut batch = Vec::with_capacity(BUFFERING_FACTOR);
-        let started_at = Instant::now();
-        let started_at_txnum = tx
-            .get(
-                &tables::CumulativeIndex,
-                input.first_started_at.1.unwrap_or(BlockNumber(0)),
-            )
-            .await?
-            .map(|v| v.tx_num);
-        let done = loop {
-            while let Some(((block_number, hash), body)) = walker.try_next().await? {
-                let txs = tx_cur
+        let mut recovered_senders = Vec::with_capacity(BUFFERING_FACTOR);
+        let mut last_message = Instant::now();
+        loop {
+            while let Some(((block_number, _), body)) = walker.try_next().await? {
+                let mut w = tx_cur
                     .walk(Some(body.base_tx_id.encode().to_vec()))
-                    .take(body.tx_amount)
-                    .map(|res| res.map(|(_, tx)| tx))
-                    .collect::<anyhow::Result<Vec<_>>>()
-                    .await?;
-                batch.push((block_number, hash, txs));
+                    .take(body.tx_amount);
+                while let Some(t) = w.try_next().await? {
+                    batch.push(t);
+                }
 
-                highest_block = block_number;
+                let now = Instant::now();
+                let elapsed = now - last_message;
+                if elapsed > Duration::from_secs(30) {
+                    info!("Extracted senders from block {}", block_number);
+                    last_message = now;
+                }
 
                 if batch.len() > BUFFERING_FACTOR {
                     break;
                 }
+
+                highest_block = Some(block_number);
             }
 
             if batch.is_empty() {
-                break true;
+                break;
             }
 
-            let mut recovered_senders = batch
+            batch
                 .par_drain(..)
-                .filter_map(move |(block_number, hash, txs)| {
-                    if !txs.is_empty() {
-                        let senders = txs
-                            .into_iter()
-                            .map(|encoded_tx| {
-                                let tx = ErasedTable::<tables::BlockTransaction>::decode_value(
-                                    &encoded_tx,
-                                )?;
-                                let sender = tx.recover_sender()?;
-                                Ok::<_, anyhow::Error>(sender)
-                            })
-                            .collect::<anyhow::Result<Vec<Address>>>();
-
-                        Some(senders.map(|senders| {
-                            (
-                                ErasedTable::<tables::TxSender>::encode_key((block_number, hash))
-                                    .to_vec(),
-                                senders.encode(),
-                            )
-                        }))
-                    } else {
-                        None
-                    }
+                .map(move |(encoded_index, encoded_tx)| {
+                    let tx = ErasedTable::<tables::BlockTransaction>::decode_value(&encoded_tx)?;
+                    let sender = tx.recover_sender()?;
+                    Ok::<_, anyhow::Error>((encoded_index, sender.encode().to_vec()))
                 })
-                .collect::<anyhow::Result<Vec<_>>>()?;
+                .collect_into_vec(&mut recovered_senders);
 
-            for (db_key, db_value) in recovered_senders.drain(..) {
-                senders_cur.append((db_key, db_value)).await?;
+            for res in recovered_senders.drain(..) {
+                let (index, tx) = res?;
+                senders_cur.append((index, tx)).await?;
             }
-
-            let now = Instant::now();
-            let elapsed = now - started_at;
-            if elapsed > Duration::from_secs(30) {
-                let mut format_string = format!("Extracted senders from block {}", highest_block);
-
-                if let Some(started_at_txnum) = started_at_txnum {
-                    let current_txnum = tx
-                        .get(&tables::CumulativeIndex, highest_block)
-                        .await?
-                        .map(|v| v.tx_num);
-                    let total_txnum = tx
-                        .cursor(&tables::CumulativeIndex)
-                        .await?
-                        .last()
-                        .await?
-                        .map(|(_, v)| v.tx_num);
-
-                    if let Some(current_txnum) = current_txnum {
-                        if let Some(total_txnum) = total_txnum {
-                            let elapsed_since_start = now - input.first_started_at.0;
-
-                            format_string = format!(
-                                "{}, progress: {:.2}%, {} remaining",
-                                format_string,
-                                (current_txnum as f64 / total_txnum as f64) * 100_f64,
-                                format_duration(
-                                    Duration::from_secs(
-                                        (elapsed_since_start.as_secs() as f64
-                                            * ((total_txnum - current_txnum) as f64
-                                                / (current_txnum - started_at_txnum) as f64))
-                                            as u64
-                                    ),
-                                    false
-                                )
-                            );
-                        }
-                    }
-                }
-
-                info!("{}", format_string);
-                break false;
-            }
-        };
+        }
 
         Ok(ExecOutput::Progress {
-            stage_progress: highest_block,
-            done,
+            stage_progress: highest_block.unwrap_or_else(|| {
+                input
+                    .previous_stage
+                    .map(|(_, v)| v)
+                    .unwrap_or(BlockNumber(0))
+            }),
+            done: true,
             must_commit: true,
         })
     }
@@ -173,8 +116,6 @@ mod tests {
     use ethereum_types::*;
     use hex_literal::hex;
 
-    const CHAIN_ID: Option<ChainId> = Some(ChainId(1));
-
     #[tokio::test]
     async fn recover_senders() {
         let db = new_mem_database().unwrap();
@@ -194,7 +135,7 @@ mod tests {
 
         let tx1_1 = Transaction {
             message: TransactionMessage::Legacy {
-                chain_id: CHAIN_ID,
+                chain_id: Some(1),
                 nonce: 1,
                 gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
@@ -216,7 +157,7 @@ mod tests {
 
         let tx1_2 = Transaction {
             message: TransactionMessage::Legacy {
-                chain_id: CHAIN_ID,
+                chain_id: Some(1),
                 nonce: 2,
                 gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
@@ -244,7 +185,7 @@ mod tests {
 
         let tx2_1 = Transaction {
             message: TransactionMessage::Legacy {
-                chain_id: CHAIN_ID,
+                chain_id: Some(1),
                 nonce: 3,
                 gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
@@ -266,7 +207,7 @@ mod tests {
 
         let tx2_2 = Transaction {
             message: TransactionMessage::Legacy {
-                chain_id: CHAIN_ID,
+                chain_id: Some(1),
                 nonce: 6,
                 gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
@@ -288,7 +229,7 @@ mod tests {
 
         let tx2_3 = Transaction {
             message: TransactionMessage::Legacy {
-                chain_id: CHAIN_ID,
+                chain_id: Some(1),
                 nonce: 2,
                 gas_price: 1_000_000.into(),
                 gas_limit: 21_000,
@@ -343,7 +284,6 @@ mod tests {
 
         let stage_input = StageInput {
             restarted: false,
-            first_started_at: (Instant::now(), Some(BlockNumber(0))),
             previous_stage: Some((StageId("BodyDownload"), 3.into())),
             stage_progress: Some(0.into()),
         };
@@ -359,13 +299,13 @@ mod tests {
             }
         );
 
-        let senders1 = chain::tx_sender::read(&tx, hash1, 1);
+        let senders1 = chain::tx_sender::read(&tx, block1.base_tx_id, block1.tx_amount);
         assert_eq!(senders1.await.unwrap(), [sender1, sender1]);
 
-        let senders2 = chain::tx_sender::read(&tx, hash2, 2);
+        let senders2 = chain::tx_sender::read(&tx, block2.base_tx_id, block2.tx_amount);
         assert_eq!(senders2.await.unwrap(), [sender1, sender2, sender2]);
 
-        let senders3 = chain::tx_sender::read(&tx, hash3, 3);
+        let senders3 = chain::tx_sender::read(&tx, block3.base_tx_id, block3.tx_amount);
         assert!(senders3.await.unwrap().is_empty());
     }
 }
