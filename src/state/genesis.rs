@@ -126,6 +126,8 @@ where
     txn.set(&tables::LastHeader, (Default::default(), block_hash))
         .await?;
 
+    txn.set(&tables::Receipt, (0.into(), vec![])).await?;
+
     txn.set(&tables::Config, (block_hash, genesis.config))
         .await?;
 
