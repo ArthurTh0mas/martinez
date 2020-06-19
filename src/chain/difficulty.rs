@@ -99,7 +99,10 @@ pub fn canonical_difficulty(
 
     if rev >= Revision::Byzantium {
         let bomb_delay = {
-            if rev >= Revision::London {
+            if block_number >= config.arrow_glacier_block.unwrap_or(BlockNumber(u64::MAX)) {
+                // https://eips.ethereum.org/EIPS/eip-4345
+                10_700_000
+            } else if rev >= Revision::London {
                 // https://eips.ethereum.org/EIPS/eip-3554
                 9_700_000
             } else if block_number >= config.muir_glacier_block.unwrap_or(BlockNumber(u64::MAX)) {
@@ -141,7 +144,7 @@ pub fn canonical_difficulty(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain::config::MAINNET_CONFIG;
+    use crate::res::genesis::MAINNET;
 
     #[test]
     fn difficulty_test_34() {
@@ -157,7 +160,7 @@ mod tests {
             parent_difficulty,
             parent_timestamp,
             parent_has_uncles,
-            &MAINNET_CONFIG,
+            &MAINNET.config,
         );
         assert_eq!(difficulty, U256::from(0x72772897b619876a_u64));
     }
