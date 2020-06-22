@@ -1,9 +1,4 @@
-use crate::{
-    consensus::*,
-    execution::{analysis_cache::AnalysisCache, processor::ExecutionProcessor},
-    models::*,
-    state::*,
-};
+use crate::{consensus::*, execution::processor::ExecutionProcessor, models::*, state::*};
 use anyhow::Context;
 use async_recursion::async_recursion;
 use ethereum_types::*;
@@ -154,10 +149,8 @@ impl<'state> Blockchain<'state> {
             ommers: block.ommers.clone(),
         };
 
-        let mut analysis_cache = AnalysisCache::default();
         let processor = ExecutionProcessor::new(
             self.state,
-            &mut analysis_cache,
             &mut *self.engine,
             &block.header,
             &body,
