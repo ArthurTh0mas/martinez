@@ -35,7 +35,7 @@ impl Block {
     }
 
     pub fn transactions_root<I: IntoIterator<Item = T>, T: Borrow<Transaction>>(iter: I) -> H256 {
-        ordered_trie_root(iter.into_iter().map(|r| r.borrow().encode()))
+        ordered_trie_root(iter.into_iter().map(|r| r.borrow().trie_encode()))
     }
 }
 
@@ -90,7 +90,7 @@ pub struct BlockBodyWithSenders {
     pub ommers: Vec<BlockHeader>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, RlpEncodable, RlpDecodable)]
 pub struct BodyForStorage {
     pub base_tx_id: TxIndex,
     pub tx_amount: usize,

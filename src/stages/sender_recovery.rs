@@ -4,7 +4,10 @@ use crate::{
         traits::{Cursor, MutableCursor, TableEncode},
     },
     models::*,
-    stagedsync::stage::{ExecOutput, Stage, StageInput, UnwindInput},
+    stagedsync::{
+        format_duration,
+        stage::{ExecOutput, Stage, StageInput, UnwindInput},
+    },
     MutableTransaction, StageId,
 };
 use async_trait::async_trait;
@@ -33,69 +36,116 @@ where
     where
         'db: 'tx,
     {
-        const BUFFERING_FACTOR: usize = 2_000_000;
+        const BUFFERING_FACTOR: usize = 5000;
         let mut body_cur = tx.cursor(&tables::BlockBody).await?;
         let mut tx_cur = tx.cursor(&tables::BlockTransaction.erased()).await?;
         let mut senders_cur = tx.mutable_cursor(&tables::TxSender.erased()).await?;
         senders_cur.last().await?;
 
-        let mut highest_block = input.stage_progress;
-        let mut walker = body_cur.walk(Some(BlockNumber(
-            input.stage_progress.unwrap_or(BlockNumber(0)).0 + 1,
-        )));
+        let mut highest_block = input.stage_progress.unwrap_or(BlockNumber(0));
+        let mut walker = body_cur.walk(Some(BlockNumber(highest_block.0 + 1)));
         let mut batch = Vec::with_capacity(BUFFERING_FACTOR);
-        let mut recovered_senders = Vec::with_capacity(BUFFERING_FACTOR);
-        let mut last_message = Instant::now();
-        loop {
-            while let Some(((block_number, _), body)) = walker.try_next().await? {
-                let mut w = tx_cur
+        let started_at = Instant::now();
+        let started_at_txnum = tx
+            .get(
+                &tables::CumulativeIndex,
+                input.first_started_at.1.unwrap_or(BlockNumber(0)),
+            )
+            .await?
+            .unwrap()
+            .tx_num;
+        let done = loop {
+            while let Some(((block_number, hash), body)) = walker.try_next().await? {
+                let txs = tx_cur
                     .walk(Some(body.base_tx_id.encode().to_vec()))
-                    .take(body.tx_amount);
-                while let Some(t) = w.try_next().await? {
-                    batch.push(t);
-                }
+                    .take(body.tx_amount)
+                    .map(|res| res.map(|(_, tx)| tx))
+                    .collect::<anyhow::Result<Vec<_>>>()
+                    .await?;
+                batch.push((block_number, hash, txs));
 
-                let now = Instant::now();
-                let elapsed = now - last_message;
-                if elapsed > Duration::from_secs(30) {
-                    info!("Extracted senders from block {}", block_number);
-                    last_message = now;
-                }
+                highest_block = block_number;
 
                 if batch.len() > BUFFERING_FACTOR {
                     break;
                 }
-
-                highest_block = Some(block_number);
             }
 
             if batch.is_empty() {
-                break;
+                break true;
             }
 
-            batch
+            let mut recovered_senders = batch
                 .par_drain(..)
-                .map(move |(encoded_index, encoded_tx)| {
-                    let tx = ErasedTable::<tables::BlockTransaction>::decode_value(&encoded_tx)?;
-                    let sender = tx.recover_sender()?;
-                    Ok::<_, anyhow::Error>((encoded_index, sender.encode().to_vec()))
-                })
-                .collect_into_vec(&mut recovered_senders);
+                .filter_map(move |(block_number, hash, txs)| {
+                    if !txs.is_empty() {
+                        let senders = txs
+                            .into_iter()
+                            .map(|encoded_tx| {
+                                let tx = ErasedTable::<tables::BlockTransaction>::decode_value(
+                                    &encoded_tx,
+                                )?;
+                                let sender = tx.recover_sender()?;
+                                Ok::<_, anyhow::Error>(sender)
+                            })
+                            .collect::<anyhow::Result<Vec<Address>>>();
 
-            for res in recovered_senders.drain(..) {
-                let (index, tx) = res?;
-                senders_cur.append((index, tx)).await?;
+                        Some(senders.map(|senders| {
+                            (
+                                ErasedTable::<tables::TxSender>::encode_key((block_number, hash))
+                                    .to_vec(),
+                                senders.encode(),
+                            )
+                        }))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+
+            for (db_key, db_value) in recovered_senders.drain(..) {
+                senders_cur.append((db_key, db_value)).await?;
             }
-        }
+
+            let now = Instant::now();
+            let elapsed = now - started_at;
+            if elapsed > Duration::from_secs(30) {
+                let current_txnum = tx
+                    .get(&tables::CumulativeIndex, highest_block)
+                    .await?
+                    .unwrap()
+                    .tx_num;
+                let total_txnum = tx
+                    .cursor(&tables::CumulativeIndex)
+                    .await?
+                    .last()
+                    .await?
+                    .unwrap()
+                    .1
+                    .tx_num;
+
+                let elapsed_since_start = now - input.first_started_at.0;
+                info!(
+                    "Extracted senders from block {}, progress: {:.2}%, {} remaining",
+                    highest_block,
+                    (current_txnum as f64 / total_txnum as f64) * 100_f64,
+                    format_duration(
+                        Duration::from_secs(
+                            (elapsed_since_start.as_secs() as f64
+                                * ((total_txnum - current_txnum) as f64
+                                    / (current_txnum - started_at_txnum) as f64))
+                                as u64
+                        ),
+                        false
+                    )
+                );
+                break false;
+            }
+        };
 
         Ok(ExecOutput::Progress {
-            stage_progress: highest_block.unwrap_or_else(|| {
-                input
-                    .previous_stage
-                    .map(|(_, v)| v)
-                    .unwrap_or(BlockNumber(0))
-            }),
-            done: true,
+            stage_progress: highest_block,
+            done,
             must_commit: true,
         })
     }
@@ -284,6 +334,7 @@ mod tests {
 
         let stage_input = StageInput {
             restarted: false,
+            first_started_at: (Instant::now(), Some(BlockNumber(0))),
             previous_stage: Some((StageId("BodyDownload"), 3.into())),
             stage_progress: Some(0.into()),
         };
@@ -299,13 +350,13 @@ mod tests {
             }
         );
 
-        let senders1 = chain::tx_sender::read(&tx, block1.base_tx_id, block1.tx_amount);
+        let senders1 = chain::tx_sender::read(&tx, hash1, 1);
         assert_eq!(senders1.await.unwrap(), [sender1, sender1]);
 
-        let senders2 = chain::tx_sender::read(&tx, block2.base_tx_id, block2.tx_amount);
+        let senders2 = chain::tx_sender::read(&tx, hash2, 2);
         assert_eq!(senders2.await.unwrap(), [sender1, sender2, sender2]);
 
-        let senders3 = chain::tx_sender::read(&tx, block3.base_tx_id, block3.tx_amount);
+        let senders3 = chain::tx_sender::read(&tx, hash3, 3);
         assert!(senders3.await.unwrap().is_empty());
     }
 }
