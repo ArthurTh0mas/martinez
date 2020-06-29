@@ -1,6 +1,6 @@
 use crate::downloader::headers::{
     header_slice_status_watch::HeaderSliceStatusWatch,
-    header_slice_verifier, header_slices,
+    header_slices,
     header_slices::{HeaderSlice, HeaderSliceStatus, HeaderSlices},
     preverified_hashes_config::PreverifiedHashesConfig,
 };
@@ -86,7 +86,7 @@ impl VerifyStagePreverified {
         let headers = slice.headers.as_ref().unwrap();
 
         if headers.is_empty() {
-            return false;
+            return true;
         }
 
         let first = headers.first().unwrap();
@@ -110,7 +110,20 @@ impl VerifyStagePreverified {
             return false;
         }
 
-        header_slice_verifier::verify_slice_is_linked_by_parent_hash(headers)
+        for child_index in (1..headers.len()).rev() {
+            let parent_index = child_index - 1;
+
+            let child = &headers[child_index];
+            let parent = &headers[parent_index];
+
+            let parent_hash = parent.hash();
+            let expected_parent_hash = child.parent_hash;
+            if parent_hash != expected_parent_hash {
+                return false;
+            }
+        }
+
+        true
     }
 
     fn preverified_hash(&self, block_num: u64) -> Option<&ethereum_types::H256> {
