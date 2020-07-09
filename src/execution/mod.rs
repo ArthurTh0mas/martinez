@@ -1,7 +1,7 @@
 use self::{analysis_cache::AnalysisCache, processor::ExecutionProcessor};
 use crate::{consensus, crypto::*, models::*, State};
 
-pub mod address;
+mod address;
 pub mod analysis_cache;
 pub mod evm;
 pub mod precompiled;
