@@ -4,7 +4,7 @@ use crate::{
         header_slices::{HeaderSlice, HeaderSliceStatus, HeaderSlices},
     },
     kv,
-    kv::traits::MutableTransaction,
+    kv::{tables::HeaderKey, traits::MutableTransaction},
     models::BlockHeader,
 };
 use anyhow::anyhow;
@@ -38,7 +38,7 @@ impl<DB: kv::traits::MutableKV + Sync> SaveStage<DB> {
         debug!("SaveStage: start");
 
         // initially remaining_count = 0, so we wait for any verified slices to try to save them
-        // since we want to save headers sequentially, there might be some remaining headers
+        // since we want to save headers sequentially, there might be some remaining slices
         // in this case we wait until some more slices become verified
         // hopefully its the slices at the front so that we can save them
         self.pending_watch.wait_while(self.remaining_count).await?;
@@ -111,13 +111,31 @@ impl<DB: kv::traits::MutableKV + Sync> SaveStage<DB> {
         for header_ref in headers {
             // this clone happens mostly on the stack (except extra_data)
             let header = header_ref.clone();
-            tx.set(
-                &kv::tables::Header,
-                ((header.number, header.hash()), header),
-            )
-            .await?;
+            self.save_header(header, &tx).await?;
         }
         tx.commit().await
+    }
+
+    async fn save_header(&self, header: BlockHeader, tx: &DB::MutableTx<'_>) -> anyhow::Result<()> {
+        let block_num = header.number;
+        let header_hash = header.hash();
+        let header_key: HeaderKey = (block_num, header_hash);
+        let total_difficulty = header.difficulty;
+
+        tx.set(&kv::tables::Header, (header_key, header)).await?;
+        tx.set(&kv::tables::HeaderNumber, (header_hash, block_num))
+            .await?;
+        tx.set(&kv::tables::CanonicalHeader, (block_num, header_hash))
+            .await?;
+        tx.set(
+            &kv::tables::HeadersTotalDifficulty,
+            (header_key, total_difficulty),
+        )
+        .await?;
+        tx.set(&kv::tables::LastHeader, (Default::default(), header_hash))
+            .await?;
+
+        Ok(())
     }
 }
 
