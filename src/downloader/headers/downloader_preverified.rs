@@ -44,19 +44,18 @@ impl<DB: kv::traits::MutableKV + Sync> DownloaderPreverified<DB> {
         }
     }
 
-    pub async fn run(&self) -> anyhow::Result<(BlockNumber, ethereum_types::H256)> {
+    pub async fn run(&self) -> anyhow::Result<BlockNumber> {
         let preverified_hashes_config = PreverifiedHashesConfig::new(&self.chain_name)?;
 
-        let final_block_num = BlockNumber(
+        let header_slices_mem_limit = self.mem_limit;
+        let header_slices_final_block_num = BlockNumber(
             ((preverified_hashes_config.hashes.len() - 1) * header_slices::HEADER_SLICE_SIZE)
                 as u64,
         );
-        let final_block_hash = *preverified_hashes_config.hashes.last().unwrap();
-
         let header_slices = Arc::new(HeaderSlices::new(
-            self.mem_limit,
+            header_slices_mem_limit,
             BlockNumber(0),
-            final_block_num,
+            header_slices_final_block_num,
         ));
         let sentry = self.sentry.clone();
 
@@ -72,11 +71,7 @@ impl<DB: kv::traits::MutableKV + Sync> DownloaderPreverified<DB> {
         // although most of the time only one of the stages is actively running,
         // while the others are waiting for the status updates or timeouts.
 
-        let fetch_request_stage = FetchRequestStage::new(
-            header_slices.clone(),
-            sentry.clone(),
-            header_slices::HEADER_SLICE_SIZE + 1,
-        );
+        let fetch_request_stage = FetchRequestStage::new(header_slices.clone(), sentry.clone());
         let fetch_receive_stage = FetchReceiveStage::new(header_slices.clone(), sentry.clone());
         let retry_stage = RetryStage::new(header_slices.clone());
         let verify_stage =
@@ -116,6 +111,6 @@ impl<DB: kv::traits::MutableKV + Sync> DownloaderPreverified<DB> {
             header_slices.notify_status_watchers();
         }
 
-        Ok((final_block_num, final_block_hash))
+        Ok(header_slices_final_block_num)
     }
 }

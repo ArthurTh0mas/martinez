@@ -181,12 +181,11 @@ impl<'db, RwTx: MutableTransaction<'db>> Stage<'db, RwTx> for Execution {
             .await?
             .ok_or_else(|| anyhow!("No chain config for genesis block {:?}", genesis_hash))?;
 
-        let prev_progress = input.stage_progress.unwrap_or_default();
-        let starting_block = prev_progress + 1;
+        let starting_block = input.stage_progress.unwrap_or_default() + 1;
         let max_block = input
             .previous_stage.ok_or_else(|| anyhow!("Execution stage cannot be executed first, but no previous stage progress specified"))?.1;
 
-        Ok(if max_block >= starting_block {
+        Ok(if max_block > starting_block {
             let executed_to = execute_batch_of_blocks(
                 tx,
                 chain_config,
@@ -209,7 +208,7 @@ impl<'db, RwTx: MutableTransaction<'db>> Stage<'db, RwTx> for Execution {
             }
         } else {
             ExecOutput::Progress {
-                stage_progress: prev_progress,
+                stage_progress: max_block,
                 done: true,
                 must_commit: false,
             }
