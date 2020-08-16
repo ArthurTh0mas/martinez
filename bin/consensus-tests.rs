@@ -10,7 +10,7 @@ use martinez::{
     res::chainspec::*,
     *,
 };
-use anyhow::*;
+use anyhow::{bail, ensure, format_err};
 use bytes::Bytes;
 use educe::Educe;
 use ethereum_types::*;
@@ -518,20 +518,11 @@ async fn init_pre_state<S: State>(pre: &HashMap<Address, AccountState>, state: &
                 .unwrap();
         }
 
-        state
-            .update_account(*address, None, Some(account.clone()))
-            .await
-            .unwrap();
+        state.update_account(*address, None, Some(account.clone()));
 
         for (&key, &value) in &j.storage {
             state
-                .update_storage(
-                    *address,
-                    account.incarnation,
-                    u256_to_h256(key),
-                    H256::zero(),
-                    u256_to_h256(value),
-                )
+                .update_storage(*address, account.incarnation, key, U256::zero(), value)
                 .await
                 .unwrap();
         }
@@ -585,7 +576,7 @@ async fn post_check(
             .read_account(address)
             .await
             .unwrap()
-            .ok_or_else(|| anyhow!("Missing account {}", address))?;
+            .ok_or_else(|| format_err!("Missing account {}", address))?;
 
         ensure!(
             account.balance == expected_account_state.balance,
@@ -625,11 +616,11 @@ async fn post_check(
 
         for (&key, &expected_value) in &expected_account_state.storage {
             let actual_value = state
-                .read_storage(address, account.incarnation, u256_to_h256(key))
+                .read_storage(address, account.incarnation, key)
                 .await
                 .unwrap();
             ensure!(
-                actual_value == u256_to_h256(expected_value),
+                actual_value == expected_value,
                 "Storage mismatch for {} at {}:\n{} != {}",
                 address,
                 key,

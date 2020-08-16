@@ -3,8 +3,8 @@ use martinez::{
     sentry::chain_config,
 };
 
-use martinez::kv;
-use std::sync::Arc;
+use crate::kv::traits::MutableTransaction;
+use martinez::{kv, kv::traits::MutableKV};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -15,7 +15,11 @@ async fn main() -> anyhow::Result<()> {
 
     let chains_config = chain_config::ChainsConfig::new()?;
     let opts = Opts::new(None, chains_config.chain_names().as_slice())?;
-    let db = Arc::new(kv::new_database(&opts.data_dir.0)?);
-    let downloader = Downloader::new(opts, chains_config, db);
-    downloader.run(None).await
+
+    let db = kv::new_database(&opts.data_dir.0)?;
+    let db_transaction = db.begin_mutable().await?;
+
+    let downloader = Downloader::new(opts, chains_config)?;
+    downloader.run(None, &db_transaction).await?;
+    db_transaction.commit().await
 }

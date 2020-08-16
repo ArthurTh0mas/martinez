@@ -8,7 +8,7 @@ use std::{collections::HashMap, convert::TryInto};
 type AccountChanges = HashMap<Address, Option<Account>>;
 
 // address -> incarnation -> location -> initial value
-type StorageChanges = HashMap<Address, HashMap<Incarnation, HashMap<H256, H256>>>;
+type StorageChanges = HashMap<Address, HashMap<Incarnation, HashMap<U256, U256>>>;
 
 /// Holds all state in memory.
 #[derive(Debug, Default)]
@@ -20,7 +20,7 @@ pub struct InMemoryState {
     prev_incarnations: HashMap<Address, Incarnation>,
 
     // address -> incarnation -> location -> value
-    storage: HashMap<Address, HashMap<Incarnation, HashMap<H256, H256>>>,
+    storage: HashMap<Address, HashMap<Incarnation, HashMap<U256, U256>>>,
 
     // block number -> hash -> header
     headers: Vec<HashMap<H256, BlockHeader>>,
@@ -58,9 +58,10 @@ impl InMemoryState {
         if let Some(address_storage) = self.storage.get(&address) {
             if let Some(storage) = address_storage.get(&incarnation) {
                 if !storage.is_empty() {
-                    return trie_root(storage.iter().map(|(location, value)| {
-                        let zv = zeroless_view(value);
-                        let encoded_location = keccak256(location);
+                    return trie_root(storage.iter().map(|(&location, &value)| {
+                        let value = u256_to_h256(value);
+                        let zv = zeroless_view(&value);
+                        let encoded_location = keccak256(u256_to_h256(location));
                         let encoded_value = rlp::encode(&zv);
                         (encoded_location, encoded_value)
                     }));
@@ -209,8 +210,8 @@ impl State for InMemoryState {
         &self,
         address: Address,
         incarnation: Incarnation,
-        location: H256,
-    ) -> anyhow::Result<H256> {
+        location: U256,
+    ) -> anyhow::Result<U256> {
         if let Some(storage) = self.storage.get(&address) {
             if let Some(historical_data) = storage.get(&incarnation) {
                 if let Some(value) = historical_data.get(&location) {
@@ -219,7 +220,7 @@ impl State for InMemoryState {
             }
         }
 
-        Ok(H256::zero())
+        Ok(U256::zero())
     }
 
     // Previous non-zero incarnation of an account; 0 if none exists.
@@ -308,12 +309,12 @@ impl State for InMemoryState {
         self.storage_changes.remove(&block_number);
     }
 
-    async fn update_account(
+    fn update_account(
         &mut self,
         address: Address,
         initial: Option<Account>,
         current: Option<Account>,
-    ) -> anyhow::Result<()> {
+    ) {
         self.account_changes
             .entry(self.block_number)
             .or_default()
@@ -327,8 +328,6 @@ impl State for InMemoryState {
                 self.prev_incarnations.insert(address, initial.incarnation);
             }
         }
-
-        Ok(())
     }
 
     async fn update_account_code(
@@ -347,9 +346,9 @@ impl State for InMemoryState {
         &mut self,
         address: Address,
         incarnation: Incarnation,
-        location: H256,
-        initial: H256,
-        current: H256,
+        location: U256,
+        initial: U256,
+        current: U256,
     ) -> anyhow::Result<()> {
         self.storage_changes
             .entry(self.block_number)
@@ -549,29 +548,20 @@ mod tests {
                 println!("{}", test_name);
                 for (address, account) in fixture {
                     let address = Address::from(address);
-                    state
-                        .update_account(
-                            address,
-                            None,
-                            Some(Account {
-                                nonce: account.nonce.as_u64(),
-                                balance: account.balance,
-                                code_hash: keccak256(account.code),
-                                incarnation: 0.into(),
-                            }),
-                        )
-                        .await
-                        .unwrap();
+                    state.update_account(
+                        address,
+                        None,
+                        Some(Account {
+                            nonce: account.nonce.as_u64(),
+                            balance: account.balance,
+                            code_hash: keccak256(account.code),
+                            incarnation: 0.into(),
+                        }),
+                    );
 
                     for (location, value) in account.storage {
                         state
-                            .update_storage(
-                                address,
-                                0.into(),
-                                u256_to_h256(location),
-                                H256::zero(),
-                                u256_to_h256(value),
-                            )
+                            .update_storage(address, 0.into(), location, U256::zero(), value)
                             .await
                             .unwrap();
                     }
