@@ -1,5 +1,5 @@
 use super::block_id::BlockId;
-use crate::models::{Block as BlockType, BlockHeader as HeaderType, BlockNumber};
+use crate::models::{Block as BlockType, BlockHeader as HeaderType};
 use ethereum_types::H256;
 use rlp_derive::*;
 
@@ -25,7 +25,7 @@ pub enum EthMessageId {
 #[derive(RlpEncodable, RlpDecodable, Clone, Copy, PartialEq, Debug)]
 pub struct BlockHashAndNumber {
     pub hash: H256,
-    pub number: BlockNumber,
+    pub number: u64,
 }
 
 #[derive(RlpEncodableWrapper, RlpDecodableWrapper, Clone, PartialEq, Debug)]

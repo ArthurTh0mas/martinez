@@ -36,7 +36,7 @@ where
     pub(crate) refund: u64,
     // EIP-2929 substate
     pub(crate) accessed_addresses: HashSet<Address>,
-    pub(crate) accessed_storage_keys: HashMap<Address, HashSet<U256>>,
+    pub(crate) accessed_storage_keys: HashMap<Address, HashSet<H256>>,
 }
 
 async fn get_object<'m, 'db, S: State>(
@@ -390,7 +390,7 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
         }
     }
 
-    pub fn access_storage(&mut self, address: Address, key: U256) -> AccessStatus {
+    pub fn access_storage(&mut self, address: Address, key: H256) -> AccessStatus {
         if self
             .accessed_storage_keys
             .entry(address)
@@ -408,9 +408,9 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
     async fn get_storage(
         &mut self,
         address: Address,
-        key: U256,
+        key: H256,
         original: bool,
-    ) -> anyhow::Result<U256> {
+    ) -> anyhow::Result<H256> {
         if let Some(obj) = get_object(self.db, &mut self.objects, address).await? {
             if let Some(current) = &obj.current {
                 let storage = self.storage.entry(address).or_default();
@@ -428,7 +428,7 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
                 let incarnation = current.incarnation;
                 if obj.initial.is_none() || obj.initial.as_ref().unwrap().incarnation != incarnation
                 {
-                    return Ok(U256::zero());
+                    return Ok(H256::zero());
                 }
 
                 let val = self.db.read_storage(address, incarnation, key).await?;
@@ -445,14 +445,14 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
             }
         }
 
-        Ok(U256::zero())
+        Ok(H256::zero())
     }
 
     pub async fn get_current_storage(
         &mut self,
         address: Address,
-        key: U256,
-    ) -> anyhow::Result<U256> {
+        key: H256,
+    ) -> anyhow::Result<H256> {
         self.get_storage(address, key, false).await
     }
 
@@ -460,16 +460,16 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
     pub async fn get_original_storage(
         &mut self,
         address: Address,
-        key: U256,
-    ) -> anyhow::Result<U256> {
+        key: H256,
+    ) -> anyhow::Result<H256> {
         self.get_storage(address, key, true).await
     }
 
     pub async fn set_storage(
         &mut self,
         address: Address,
-        key: U256,
-        value: U256,
+        key: H256,
+        value: H256,
     ) -> anyhow::Result<()> {
         let previous = self.get_current_storage(address, key).await?;
         if previous == value {
@@ -508,7 +508,8 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
 
         for (address, obj) in self.objects {
             self.db
-                .update_account(address, obj.initial.clone(), obj.current.clone());
+                .update_account(address, obj.initial.clone(), obj.current.clone())
+                .await?;
             if let Some(current) = obj.current {
                 let code_hash = current.code_hash;
                 if code_hash != EMPTY_HASH

@@ -20,6 +20,7 @@
 )]
 
 pub mod accessors;
+pub mod adapter;
 mod bitmapdb;
 pub mod chain;
 mod changeset;

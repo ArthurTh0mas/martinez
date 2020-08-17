@@ -134,7 +134,10 @@ mod tests {
                 balance: *ETHER,
                 ..Default::default()
             };
-            state.update_account(sender, None, Some(sender_account));
+            state
+                .update_account(sender, None, Some(sender_account))
+                .await
+                .unwrap();
 
             // ---------------------------------------
             // Execute first block
@@ -158,7 +161,7 @@ mod tests {
             let code_hash = H256::from_slice(&Keccak256::digest(&contract_code)[..]);
             assert_eq!(contract_account.code_hash, code_hash);
 
-            let storage_key0 = U256::zero();
+            let storage_key0 = H256::zero();
             let storage0 = state
                 .read_storage(contract_address, DEFAULT_INCARNATION, storage_key0)
                 .await

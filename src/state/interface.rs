@@ -16,8 +16,8 @@ pub trait State: Debug + Send + Sync {
         &self,
         address: Address,
         incarnation: Incarnation,
-        location: U256,
-    ) -> anyhow::Result<U256>;
+        location: H256,
+    ) -> anyhow::Result<H256>;
 
     // Previous non-zero incarnation of an account; 0 if none exists.
     async fn previous_incarnation(&self, address: Address) -> anyhow::Result<Incarnation>;
@@ -53,12 +53,12 @@ pub trait State: Debug + Send + Sync {
     /// Must be called prior to calling update_account/update_account_code/update_storage.
     fn begin_block(&mut self, block_number: BlockNumber);
 
-    fn update_account(
+    async fn update_account(
         &mut self,
         address: Address,
         initial: Option<Account>,
         current: Option<Account>,
-    );
+    ) -> anyhow::Result<()>;
 
     async fn update_account_code(
         &mut self,
@@ -72,8 +72,8 @@ pub trait State: Debug + Send + Sync {
         &mut self,
         address: Address,
         incarnation: Incarnation,
-        location: U256,
-        initial: U256,
-        current: U256,
+        location: H256,
+        initial: H256,
+        current: H256,
     ) -> anyhow::Result<()>;
 }

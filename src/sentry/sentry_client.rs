@@ -6,7 +6,6 @@ use async_trait::async_trait;
 use futures_core::Stream;
 use std::{fmt::Debug, pin::Pin};
 
-#[derive(Clone, Debug)]
 pub struct Status {
     pub total_difficulty: ethereum_types::U256,
     pub best_hash: ethereum_types::H256,
@@ -14,12 +13,10 @@ pub struct Status {
     pub max_block: u64,
 }
 
-pub type PeerId = ethereum_types::H512;
-
 #[derive(Clone, Debug)]
 pub enum PeerFilter {
     MinBlock(u64),
-    PeerId(PeerId),
+    PeerId(ethereum_types::H512),
     Random(u64 /* max peers */),
     All,
 }
@@ -27,7 +24,7 @@ pub enum PeerFilter {
 #[derive(Clone, Debug)]
 pub struct MessageFromPeer {
     pub message: Message,
-    pub from_peer_id: Option<PeerId>,
+    pub from_peer_id: Option<ethereum_types::H512>,
 }
 
 pub type MessageFromPeerStream =
@@ -37,7 +34,8 @@ pub type MessageFromPeerStream =
 pub trait SentryClient: Send + Debug {
     async fn set_status(&mut self, status: Status) -> anyhow::Result<()>;
 
-    async fn penalize_peer(&mut self, peer_id: PeerId) -> anyhow::Result<()>;
+    //async fn penalize_peer(&mut self) -> anyhow::Result<()>;
+    //async fn peer_min_block(&mut self) -> anyhow::Result<()>;
 
     async fn send_message(
         &mut self,

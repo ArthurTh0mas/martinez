@@ -7,15 +7,14 @@ use crate::{
     },
     kv::{
         tables,
-        traits::{Cursor, CursorDupSort},
+        traits::{Cursor, CursorDupSort, Table},
         TableEncode,
     },
-    models::{Account, BlockNumber, EncodedAccount, Incarnation, RlpAccount, EMPTY_ROOT},
+    models::{Account, BlockNumber, Incarnation, RlpAccount, EMPTY_ROOT},
     stagedsync::stage::{ExecOutput, Stage, StageInput, UnwindInput},
-    stages::stage_util::should_do_clean_promotion,
-    MutableTransaction, StageId,
+    zeroless_view, MutableTransaction, StageId,
 };
-use anyhow::{bail, format_err, Context};
+use anyhow::*;
 use async_trait::async_trait;
 use ethereum_types::*;
 use rlp::RlpStream;
@@ -58,6 +57,8 @@ impl From<H256> for Nibbles {
         Self(n.into())
     }
 }
+
+type HashedAccountFusedValue = <tables::HashedAccount as Table>::FusedValue;
 
 #[derive(Debug)]
 struct BranchInProgress {
@@ -395,7 +396,7 @@ fn build_storage_trie(
     collector: &mut Collector<tables::TrieStorage>,
     address_hash: H256,
     incarnation: Incarnation,
-    storage: &[(H256, U256)],
+    storage: &[(H256, H256)],
 ) -> H256 {
     if storage.is_empty() {
         return EMPTY_ROOT;
@@ -408,13 +409,13 @@ fn build_storage_trie(
     let mut current = storage_iter.next();
 
     while let Some(&(location, value)) = &mut current {
-        let current_value = value.encode();
+        let current_value = zeroless_view(&value);
         let current_key = location.into();
         let prev = storage_iter.next();
 
         let prev_key = prev.map(|&(v, _)| v.into());
 
-        let data = rlp::encode(&current_value.as_slice()).to_vec();
+        let data = rlp::encode(&current_value).to_vec();
 
         builder.handle_range(current_key, data, prev_key);
 
@@ -439,7 +440,7 @@ where
     RwTx: MutableTransaction<'db>,
 {
     async fn new(
-        tx: &'tx RwTx,
+        tx: &'tx mut RwTx,
         collector: &'co mut Collector<tables::TrieAccount>,
         storage_collector: &'co mut Collector<tables::TrieStorage>,
     ) -> anyhow::Result<GenerateWalker<'db, 'tx, 'co, RwTx>>
@@ -461,7 +462,7 @@ where
 
     async fn do_get_prev_account(
         &mut self,
-        value: Option<(H256, EncodedAccount)>,
+        value: Option<HashedAccountFusedValue>,
     ) -> anyhow::Result<Option<(H256, RlpAccount)>> {
         if let Some(fused_value) = value {
             let (address_hash, encoded_account) = fused_value;
@@ -489,14 +490,14 @@ where
         &mut self,
         address_hash: H256,
         incarnation: Incarnation,
-    ) -> anyhow::Result<Vec<(H256, U256)>> {
-        let mut storage = Vec::<(H256, U256)>::new();
+    ) -> anyhow::Result<Vec<(H256, H256)>> {
+        let mut storage = Vec::<(H256, H256)>::new();
         let mut found = self
             .storage_cursor
             .seek_exact((address_hash, incarnation))
             .await?;
         while let Some((_, storage_entry)) = found {
-            storage.push((storage_entry.0, storage_entry.1));
+            storage.push((storage_entry.0, (storage_entry.1).0));
             found = self.storage_cursor.next_dup().await?;
         }
         Ok(storage)
@@ -528,26 +529,8 @@ where
     }
 }
 
-pub async fn generate_interhashes<'db: 'tx, 'tx, RwTx>(tx: &RwTx) -> anyhow::Result<H256>
-where
-    RwTx: MutableTransaction<'db>,
-{
-    let mut collector = Collector::new(OPTIMAL_BUFFER_CAPACITY);
-    let mut storage_collector = Collector::new(OPTIMAL_BUFFER_CAPACITY);
-
-    let state_root =
-        generate_interhashes_with_collectors(tx, &mut collector, &mut storage_collector).await?;
-
-    let mut write_cursor = tx.mutable_cursor(&tables::TrieAccount.erased()).await?;
-    collector.load(&mut write_cursor).await?;
-    let mut storage_write_cursor = tx.mutable_cursor(&tables::TrieStorage.erased()).await?;
-    storage_collector.load(&mut storage_write_cursor).await?;
-
-    Ok(state_root)
-}
-
-async fn generate_interhashes_with_collectors<'db: 'tx, 'tx, RwTx>(
-    tx: &RwTx,
+async fn generate_interhashes<'db: 'tx, 'tx, RwTx>(
+    tx: &mut RwTx,
     collector: &mut Collector<tables::TrieAccount>,
     storage_collector: &mut Collector<tables::TrieStorage>,
 ) -> anyhow::Result<H256>
@@ -569,7 +552,7 @@ where
 }
 
 async fn update_interhashes<'db: 'tx, 'tx, RwTx>(
-    tx: &RwTx,
+    tx: &mut RwTx,
     collector: &mut Collector<tables::TrieAccount>,
     storage_collector: &mut Collector<tables::TrieStorage>,
     from: BlockNumber,
@@ -584,21 +567,11 @@ where
     tx.clear_table(&tables::TrieAccount).await?;
     tx.clear_table(&tables::TrieStorage).await?;
 
-    generate_interhashes_with_collectors(tx, collector, storage_collector).await
+    generate_interhashes(tx, collector, storage_collector).await
 }
 
 #[derive(Debug)]
-pub struct Interhashes {
-    clean_promotion_threshold: u64,
-}
-
-impl Interhashes {
-    pub fn new(clean_promotion_threshold: Option<u64>) -> Self {
-        Self {
-            clean_promotion_threshold: clean_promotion_threshold.unwrap_or(1_000_000_000_000),
-        }
-    }
-}
+pub struct Interhashes;
 
 #[async_trait]
 impl<'db, RwTx> Stage<'db, RwTx> for Interhashes
@@ -617,27 +590,18 @@ where
     where
         'db: 'tx,
     {
-        let genesis = BlockNumber(0);
-        let max_block = input
+        let past_progress = input.stage_progress.unwrap_or(BlockNumber(0));
+        let prev_progress = input
             .previous_stage
             .map(|tuple| tuple.1)
-            .ok_or_else(|| format_err!("Cannot be first stage"))?;
-        let past_progress = input.stage_progress.unwrap_or(genesis);
+            .unwrap_or(BlockNumber(0));
 
-        if max_block > past_progress {
+        if prev_progress > past_progress {
             let mut collector = Collector::new(OPTIMAL_BUFFER_CAPACITY);
             let mut storage_collector = Collector::new(OPTIMAL_BUFFER_CAPACITY);
 
-            let trie_root = if should_do_clean_promotion(
-                tx,
-                genesis,
-                past_progress,
-                max_block,
-                self.clean_promotion_threshold,
-            )
-            .await?
-            {
-                generate_interhashes_with_collectors(tx, &mut collector, &mut storage_collector)
+            let trie_root = if past_progress == BlockNumber(0) {
+                generate_interhashes(tx, &mut collector, &mut storage_collector)
                     .await
                     .with_context(|| "Failed to generate interhashes")?
             } else {
@@ -646,7 +610,7 @@ where
                     &mut collector,
                     &mut storage_collector,
                     past_progress,
-                    max_block,
+                    prev_progress,
                 )
                 .await
                 .with_context(|| "Failed to update interhashes")?
@@ -654,21 +618,21 @@ where
 
             let block_state_root = accessors::chain::header::read(
                 tx,
-                accessors::chain::canonical_hash::read(tx, max_block)
+                accessors::chain::canonical_hash::read(tx, prev_progress)
                     .await?
-                    .ok_or_else(|| format_err!("No canonical hash for block {}", max_block))?,
-                max_block,
+                    .ok_or_else(|| anyhow!("No canonical hash for block {}", prev_progress))?,
+                prev_progress,
             )
             .await?
-            .ok_or_else(|| format_err!("No header for block {}", max_block))?
+            .ok_or_else(|| anyhow!("No header for block {}", prev_progress))?
             .state_root;
 
             if block_state_root == trie_root {
-                info!("Block #{} state root OK: {:?}", max_block, trie_root)
+                info!("Block #{} state root OK: {:?}", prev_progress, trie_root)
             } else {
                 bail!(
                     "Block #{} state root mismatch: {:?} != {:?}",
-                    max_block,
+                    prev_progress,
                     trie_root,
                     block_state_root
                 )
@@ -681,7 +645,7 @@ where
         };
 
         Ok(ExecOutput::Progress {
-            stage_progress: cmp::max(max_block, past_progress),
+            stage_progress: cmp::max(prev_progress, past_progress),
             done: true,
             must_commit: true,
         })
@@ -702,10 +666,9 @@ mod tests {
     use super::*;
     use crate::{
         crypto::trie_root,
-        h256_to_u256,
         kv::traits::{MutableCursor, MutableKV},
         models::EMPTY_HASH,
-        new_mem_database, u256_to_h256, zeroless_view,
+        new_mem_database,
     };
     use ethereum_types::{H256, U256};
     use hex_literal::hex;
@@ -731,10 +694,6 @@ mod tests {
 
     fn h256s() -> impl Strategy<Value = H256> {
         any::<[u8; 32]>().prop_map(H256::from)
-    }
-
-    fn u256s() -> impl Strategy<Value = U256> {
-        any::<[u8; 32]>().prop_map(|v| h256_to_u256(H256::from(v)))
     }
 
     prop_compose! {
@@ -771,20 +730,20 @@ mod tests {
             let mut cursor = tx.mutable_cursor(&tables::HashedAccount).await.unwrap();
             for (address_hash, account_model) in accounts {
                 let account = account_model.encode_for_storage(false);
-                cursor.append(address_hash, account).await.unwrap();
+                let fused_value = (address_hash, account);
+                cursor.append(fused_value).await.unwrap();
             }
         }
 
         tx.commit().await.unwrap();
 
-        let tx = db.begin_mutable().await.unwrap();
+        let mut tx = db.begin_mutable().await.unwrap();
 
         let mut _collector = Collector::<tables::TrieAccount>::new(OPTIMAL_BUFFER_CAPACITY);
         let mut _storage_collector = Collector::<tables::TrieStorage>::new(OPTIMAL_BUFFER_CAPACITY);
-        let root =
-            generate_interhashes_with_collectors(&tx, &mut _collector, &mut _storage_collector)
-                .await
-                .unwrap();
+        let root = generate_interhashes(&mut tx, &mut _collector, &mut _storage_collector)
+            .await
+            .unwrap();
         assert_eq!(root, expected);
     }
 
@@ -856,22 +815,21 @@ mod tests {
         do_root_matches(accounts).await;
     }
 
-    type Storage = BTreeMap<H256, U256>;
+    type Storage = BTreeMap<H256, H256>;
 
     fn account_storages() -> impl Strategy<Value = Storage> {
-        prop::collection::btree_map(h256s(), u256s(), 0..100)
+        prop::collection::btree_map(h256s(), h256s(), 0..100)
     }
 
     fn expected_storage_root(storage: Storage) -> H256 {
         if storage.is_empty() {
             EMPTY_ROOT
         } else {
-            trie_root(storage.iter().map(|(k, v)| {
-                (
-                    k.to_fixed_bytes(),
-                    rlp::encode(&zeroless_view(&u256_to_h256(*v))),
-                )
-            }))
+            trie_root(
+                storage
+                    .iter()
+                    .map(|(k, v)| (k.to_fixed_bytes(), rlp::encode(&zeroless_view(&v)))),
+            )
         }
     }
 

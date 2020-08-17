@@ -1,9 +1,7 @@
 use super::{
     fetch_receive_stage::FetchReceiveStage, fetch_request_stage::FetchRequestStage, header_slices,
-    header_slices::HeaderSlices, penalize_stage::PenalizeStage,
-    preverified_hashes_config::PreverifiedHashesConfig, refill_stage::RefillStage,
-    retry_stage::RetryStage, save_stage::SaveStage,
-    top_block_estimate_stage::TopBlockEstimateStage,
+    header_slices::HeaderSlices, preverified_hashes_config::PreverifiedHashesConfig,
+    refill_stage::RefillStage, retry_stage::RetryStage, save_stage::SaveStage,
     verify_stage_preverified::VerifyStagePreverified, HeaderSlicesView,
 };
 use crate::{
@@ -13,48 +11,40 @@ use crate::{
     },
     kv,
     models::BlockNumber,
-    sentry::{messages::BlockHashAndNumber, sentry_client_reactor::*},
+    sentry::sentry_client_reactor::SentryClientReactor,
 };
+use parking_lot::RwLock;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_stream::{StreamExt, StreamMap};
 use tracing::*;
 
-pub struct DownloaderPreverified {
+pub struct DownloaderPreverified<DB: kv::traits::MutableKV + Sync> {
     chain_name: String,
     mem_limit: usize,
-    sentry: SentryClientReactorShared,
+    sentry: Arc<RwLock<SentryClientReactor>>,
+    db: Arc<DB>,
     ui_system: Arc<Mutex<UISystem>>,
 }
 
-pub struct DownloaderPreverifiedReport {
-    pub final_block_id: BlockHashAndNumber,
-    pub estimated_top_block_num: Option<BlockNumber>,
-}
-
-impl DownloaderPreverified {
+impl<DB: kv::traits::MutableKV + Sync> DownloaderPreverified<DB> {
     pub fn new(
         chain_name: String,
         mem_limit: usize,
-        sentry: SentryClientReactorShared,
+        sentry: Arc<RwLock<SentryClientReactor>>,
+        db: Arc<DB>,
         ui_system: Arc<Mutex<UISystem>>,
     ) -> Self {
         Self {
             chain_name,
             mem_limit,
             sentry,
+            db,
             ui_system,
         }
     }
 
-    pub async fn run<
-        'downloader,
-        'db: 'downloader,
-        RwTx: kv::traits::MutableTransaction<'db> + 'db,
-    >(
-        &'downloader self,
-        db_transaction: &'downloader RwTx,
-    ) -> anyhow::Result<DownloaderPreverifiedReport> {
+    pub async fn run(&self) -> anyhow::Result<(BlockNumber, ethereum_types::H256)> {
         let preverified_hashes_config = PreverifiedHashesConfig::new(&self.chain_name)?;
 
         let final_block_num = BlockNumber(
@@ -62,10 +52,6 @@ impl DownloaderPreverified {
                 as u64,
         );
         let final_block_hash = *preverified_hashes_config.hashes.last().unwrap();
-        let final_block_id = BlockHashAndNumber {
-            number: final_block_num,
-            hash: final_block_hash,
-        };
 
         let header_slices = Arc::new(HeaderSlices::new(
             self.mem_limit,
@@ -74,8 +60,7 @@ impl DownloaderPreverified {
         ));
         let sentry = self.sentry.clone();
 
-        let header_slices_view =
-            HeaderSlicesView::new(header_slices.clone(), "DownloaderPreverified");
+        let header_slices_view = HeaderSlicesView::new(header_slices.clone());
         self.ui_system
             .try_lock()?
             .set_view(Some(Box::new(header_slices_view)));
@@ -96,14 +81,10 @@ impl DownloaderPreverified {
         let retry_stage = RetryStage::new(header_slices.clone());
         let verify_stage =
             VerifyStagePreverified::new(header_slices.clone(), preverified_hashes_config);
-        let penalize_stage = PenalizeStage::new(header_slices.clone(), sentry.clone());
-        let save_stage = SaveStage::<RwTx>::new(header_slices.clone(), db_transaction);
+        let save_stage = SaveStage::new(header_slices.clone(), self.db.clone());
         let refill_stage = RefillStage::new(header_slices.clone());
-        let top_block_estimate_stage = TopBlockEstimateStage::new(sentry.clone());
 
-        let can_proceed = fetch_receive_stage.can_proceed_check();
-        let estimated_top_block_num_provider =
-            top_block_estimate_stage.estimated_top_block_num_provider();
+        let can_proceed = fetch_receive_stage.can_proceed_checker();
 
         let mut stream = StreamMap::<&str, StageStream>::new();
         stream.insert(
@@ -116,16 +97,8 @@ impl DownloaderPreverified {
         );
         stream.insert("retry_stage", make_stage_stream(Box::new(retry_stage)));
         stream.insert("verify_stage", make_stage_stream(Box::new(verify_stage)));
-        stream.insert(
-            "penalize_stage",
-            make_stage_stream(Box::new(penalize_stage)),
-        );
         stream.insert("save_stage", make_stage_stream(Box::new(save_stage)));
         stream.insert("refill_stage", make_stage_stream(Box::new(refill_stage)));
-        stream.insert(
-            "top_block_estimate_stage",
-            make_stage_stream(Box::new(top_block_estimate_stage)),
-        );
 
         while let Some((key, result)) = stream.next().await {
             if result.is_err() {
@@ -133,7 +106,7 @@ impl DownloaderPreverified {
                 break;
             }
 
-            if !can_proceed() {
+            if !can_proceed.can_proceed() {
                 break;
             }
             if header_slices.is_empty_at_final_position() {
@@ -143,11 +116,6 @@ impl DownloaderPreverified {
             header_slices.notify_status_watchers();
         }
 
-        let report = DownloaderPreverifiedReport {
-            final_block_id,
-            estimated_top_block_num: estimated_top_block_num_provider(),
-        };
-
-        Ok(report)
+        Ok((final_block_num, final_block_hash))
     }
 }

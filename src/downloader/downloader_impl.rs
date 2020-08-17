@@ -9,32 +9,30 @@ use crate::{
         sentry_client_reactor::SentryClientReactor,
     },
 };
+use parking_lot::RwLock;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 
-pub struct Downloader {
+pub struct Downloader<DB: kv::traits::MutableKV + Sync> {
     opts: Opts,
     chain_config: ChainConfig,
+    db: Arc<DB>,
 }
 
-impl Downloader {
-    pub fn new(opts: Opts, chains_config: ChainsConfig) -> anyhow::Result<Self> {
-        let chain_config = chains_config
-            .get(&opts.chain_name)
-            .ok_or_else(|| anyhow::format_err!("unknown chain '{}'", opts.chain_name))?
-            .clone();
+impl<DB: kv::traits::MutableKV + Sync> Downloader<DB> {
+    pub fn new(opts: Opts, chains_config: ChainsConfig, db: Arc<DB>) -> Self {
+        let chain_config = chains_config.0[&opts.chain_name].clone();
 
-        Ok(Self { opts, chain_config })
+        Self {
+            opts,
+            chain_config,
+            db,
+        }
     }
 
-    pub async fn run<
-        'downloader,
-        'db: 'downloader,
-        RwTx: kv::traits::MutableTransaction<'db> + 'db,
-    >(
-        &'downloader self,
+    pub async fn run(
+        &self,
         sentry_client_opt: Option<Box<dyn SentryClient>>,
-        db_transaction: &'downloader RwTx,
     ) -> anyhow::Result<()> {
         let status = sentry_client::Status {
             total_difficulty: ethereum_types::U256::zero(),
@@ -44,18 +42,15 @@ impl Downloader {
         };
 
         let sentry_api_addr = self.opts.sentry_api_addr.clone();
-        let sentry_client = match sentry_client_opt {
-            Some(mut test_client) => {
-                test_client.set_status(status.clone()).await?;
-                test_client
-            }
-            None => {
-                sentry_client_connector::connect(sentry_api_addr.clone(), status.clone()).await?
-            }
+        let mut sentry_client = match sentry_client_opt {
+            Some(v) => v,
+            None => sentry_client_connector::connect(sentry_api_addr.clone()).await?,
         };
 
+        sentry_client.set_status(status).await?;
+
         let sentry_connector =
-            sentry_client_connector::make_connector_stream(sentry_client, sentry_api_addr, status);
+            sentry_client_connector::make_connector_stream(sentry_client, sentry_api_addr);
         let mut sentry_reactor = SentryClientReactor::new(sentry_connector);
         sentry_reactor.start()?;
         let sentry = Arc::new(RwLock::new(sentry_reactor));
@@ -65,16 +60,17 @@ impl Downloader {
         let ui_system = Arc::new(Mutex::new(ui_system));
 
         let headers_downloader = super::headers::downloader::Downloader::new(
-            self.chain_config.clone(),
+            self.opts.chain_name.clone(),
             sentry.clone(),
+            self.db.clone(),
             ui_system.clone(),
         );
-        headers_downloader.run::<RwTx>(db_transaction).await?;
+        headers_downloader.run().await?;
 
         ui_system.try_lock()?.stop().await?;
 
         {
-            let mut sentry_reactor = sentry.write().await;
+            let mut sentry_reactor = sentry.write();
             sentry_reactor.stop().await?;
         }
 

@@ -5,9 +5,8 @@ use crate::{
         header_slices::{HeaderSlice, HeaderSliceStatus, HeaderSlices},
     },
     models::{BlockHeader, BlockNumber},
-    sentry::chain_config::ChainConfig,
 };
-use anyhow::format_err;
+use anyhow::anyhow;
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use std::{ops::DerefMut, sync::Arc, time::SystemTime};
 use tracing::*;
@@ -15,7 +14,6 @@ use tracing::*;
 /// Verifies the sequence rules to link the slices with the last known verified header and sets Verified status.
 pub struct VerifyStageLinearLink {
     header_slices: Arc<HeaderSlices>,
-    chain_config: ChainConfig,
     start_block_num: BlockNumber,
     start_block_hash: ethereum_types::H256,
     last_verified_header: Option<BlockHeader>,
@@ -26,13 +24,11 @@ pub struct VerifyStageLinearLink {
 impl VerifyStageLinearLink {
     pub fn new(
         header_slices: Arc<HeaderSlices>,
-        chain_config: ChainConfig,
         start_block_num: BlockNumber,
         start_block_hash: ethereum_types::H256,
     ) -> Self {
         Self {
             header_slices: header_slices.clone(),
-            chain_config,
             start_block_num,
             start_block_hash,
             last_verified_header: None,
@@ -70,7 +66,7 @@ impl VerifyStageLinearLink {
         let mut updated_count: usize = 0;
         for i in 0..pending_count {
             let slice_lock = self.header_slices.find_by_index(i).ok_or_else(|| {
-                format_err!(
+                anyhow!(
                     "VerifyStageLinearLink: inconsistent state - less pending slices than expected"
                 )
             })?;
@@ -104,7 +100,9 @@ impl VerifyStageLinearLink {
             }
         } else {
             self.header_slices
-                .set_slice_status(slice.deref_mut(), HeaderSliceStatus::Invalid);
+                .set_slice_status(slice.deref_mut(), HeaderSliceStatus::Empty);
+            slice.headers = None;
+            // TODO: penalize peer?
         }
 
         Some(is_verified)
@@ -140,11 +138,7 @@ impl VerifyStageLinearLink {
         header_slice_verifier::verify_link_by_parent_hash(child, parent)
             && header_slice_verifier::verify_link_block_nums(child, parent)
             && header_slice_verifier::verify_link_timestamps(child, parent)
-            && header_slice_verifier::verify_link_difficulties(
-                child,
-                parent,
-                self.chain_config.chain_spec(),
-            )
+            && header_slice_verifier::verify_link_difficulties(child, parent)
             && header_slice_verifier::verify_link_pow(child, parent)
     }
 }

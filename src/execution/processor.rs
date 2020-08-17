@@ -6,7 +6,6 @@ use crate::{
     },
     consensus::*,
     execution::evm,
-    h256_to_u256,
     models::*,
     state::IntraBlockState,
     State,
@@ -144,7 +143,7 @@ where
         for entry in &*txn.access_list() {
             self.state.access_account(entry.address);
             for &key in &entry.slots {
-                self.state.access_storage(entry.address, h256_to_u256(key));
+                self.state.access_storage(entry.address, key);
             }
         }
 
@@ -678,7 +677,10 @@ mod tests {
                 balance: U256::from(66_252_368 * GIGA),
                 ..Default::default()
             };
-            state.update_account(address, None, Some(account.clone()));
+            state
+                .update_account(address, None, Some(account.clone()))
+                .await
+                .unwrap();
 
             let txn = TransactionWithSender{
                 message: TransactionMessage::EIP1559 {

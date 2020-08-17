@@ -1,9 +1,8 @@
 use super::{address::*, analysis_cache::AnalysisCache, precompiled};
 use crate::{
     chain::protocol_param::{fee, param},
-    h256_to_u256,
     models::*,
-    u256_to_h256, IntraBlockState, State,
+    IntraBlockState, State,
 };
 use anyhow::Context;
 use async_recursion::async_recursion;
@@ -436,13 +435,13 @@ where
                 }
                 InterruptVariant::GetCodeHash(i) => {
                     let address = i.data().address;
-                    let hash = h256_to_u256({
+                    let hash = {
                         if self.state.is_dead(address).await? {
                             H256::zero()
                         } else {
                             self.state.get_code_hash(address).await?
                         }
-                    });
+                    };
                     i.resume(CodeHash { hash })
                 }
                 InterruptVariant::CopyCode(i) => {
@@ -543,13 +542,12 @@ where
                             .parent_hash;
                     }
 
-                    let hash = h256_to_u256(hash);
                     i.resume(BlockHash { hash })
                 }
                 InterruptVariant::EmitLog(i) => {
                     self.state.add_log(Log {
                         address: i.data().address,
-                        topics: i.data().topics.iter().copied().map(u256_to_h256).collect(),
+                        topics: i.data().topics.as_slice().into(),
                         data: i.data().data.clone(),
                     });
 
@@ -749,23 +747,23 @@ mod tests {
             assert_eq!(res.output_data, bytes!("600035600055"));
 
             let contract_address = create_address(caller, 1);
-            let key0 = 0.into();
+            let key0 = H256::zero();
             assert_eq!(
                 state
                     .get_current_storage(contract_address, key0)
                     .await
                     .unwrap(),
-                0x2a.into()
+                H256::from_low_u64_be(0x2a)
             );
 
-            let new_val = 0xf5.into();
+            let new_val = H256::from_low_u64_be(0xf5);
 
             let res = execute(
                 &mut state,
                 &header,
                 &(txn)(
                     TransactionAction::Call(contract_address),
-                    u256_to_h256(new_val).0.to_vec().into(),
+                    new_val.0.to_vec().into(),
                 ),
                 gas,
             )
@@ -936,13 +934,13 @@ mod tests {
             assert_eq!(res.status_code, StatusCode::Success);
             assert_eq!(res.output_data, vec![]);
 
-            let key0 = 0.into();
+            let key0 = H256::zero();
             assert_eq!(
                 state
                     .get_current_storage(caller_address, key0)
                     .await
                     .unwrap(),
-                h256_to_u256(H256::from(caller_address))
+                caller_address.into()
             );
         })
     }
@@ -1014,13 +1012,13 @@ mod tests {
             assert_eq!(res.output_data, vec![]);
 
             let contract_address = create_address(caller, 0);
-            let key0 = 0.into();
+            let key0 = H256::zero();
             assert_eq!(
                 state
                     .get_current_storage(contract_address, key0)
                     .await
                     .unwrap(),
-                U256::zero()
+                H256::zero()
             );
         })
     }
