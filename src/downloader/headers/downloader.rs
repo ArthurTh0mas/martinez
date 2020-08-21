@@ -4,28 +4,27 @@ use crate::{
         ui_system::UISystem,
     },
     kv,
-    sentry::sentry_client_reactor::SentryClientReactor,
+    sentry::{chain_config::ChainConfig, sentry_client_reactor::*},
 };
-use parking_lot::RwLock;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 pub struct Downloader<DB: kv::traits::MutableKV + Sync> {
-    chain_name: String,
-    sentry: Arc<RwLock<SentryClientReactor>>,
+    chain_config: ChainConfig,
+    sentry: SentryClientReactorShared,
     db: Arc<DB>,
     ui_system: Arc<Mutex<UISystem>>,
 }
 
 impl<DB: kv::traits::MutableKV + Sync> Downloader<DB> {
     pub fn new(
-        chain_name: String,
-        sentry: Arc<RwLock<SentryClientReactor>>,
+        chain_config: ChainConfig,
+        sentry: SentryClientReactorShared,
         db: Arc<DB>,
         ui_system: Arc<Mutex<UISystem>>,
     ) -> Self {
         Self {
-            chain_name,
+            chain_config,
             sentry,
             db,
             ui_system,
@@ -36,27 +35,26 @@ impl<DB: kv::traits::MutableKV + Sync> Downloader<DB> {
         let mem_limit = 50 << 20; /* 50 Mb */
 
         let downloader_preverified = downloader_preverified::DownloaderPreverified::new(
-            self.chain_name.clone(),
+            self.chain_config.chain_name(),
             mem_limit,
             self.sentry.clone(),
             self.db.clone(),
             self.ui_system.clone(),
         );
 
-        let (final_preverified_block_num, final_preverified_block_hash) =
-            downloader_preverified.run().await?;
+        let preverified_report = downloader_preverified.run().await?;
 
-        let _downloader_linear = downloader_linear::DownloaderLinear::new(
-            self.chain_name.clone(),
-            final_preverified_block_num,
-            final_preverified_block_hash,
+        let downloader_linear = downloader_linear::DownloaderLinear::new(
+            self.chain_config.clone(),
+            preverified_report.final_block_id,
+            preverified_report.estimated_top_block_num,
             mem_limit,
             self.sentry.clone(),
             self.db.clone(),
             self.ui_system.clone(),
         );
 
-        //downloader_linear.run().await?;
+        downloader_linear.run().await?;
 
         Ok(())
     }

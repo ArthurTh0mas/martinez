@@ -7,17 +7,22 @@ use crate::{
     kv::tables,
     models::*,
     stagedsync::{stage::*, stages::*},
-    upsert_hashed_storage_value, Cursor, MutableCursor, MutableTransaction,
+    stages::stage_util::should_do_clean_promotion,
+    upsert_hashed_storage_value, Cursor, CursorDupSort, MutableCursor, MutableTransaction,
 };
-use anyhow::*;
+use anyhow::format_err;
 use async_trait::async_trait;
+use ethereum_types::*;
 use tokio_stream::StreamExt;
 use tracing::*;
 
-async fn promote_clean_state<'db, Tx>(txn: &Tx) -> anyhow::Result<()>
+pub async fn promote_clean_state<'db, Tx>(txn: &Tx) -> anyhow::Result<()>
 where
     Tx: MutableTransaction<'db>,
 {
+    txn.clear_table(&tables::HashedAccount).await?;
+    txn.clear_table(&tables::HashedStorage).await?;
+
     let mut collector_account = Collector::<tables::HashedAccount>::new(OPTIMAL_BUFFER_CAPACITY);
     let mut collector_storage = Collector::<tables::HashedStorage>::new(OPTIMAL_BUFFER_CAPACITY);
 
@@ -58,11 +63,11 @@ where
     Ok(())
 }
 
-async fn promote_clean_code<'db, Tx>(txn: &Tx) -> anyhow::Result<()>
+pub async fn promote_clean_code<'db, Tx>(txn: &Tx) -> anyhow::Result<()>
 where
     Tx: MutableTransaction<'db>,
 {
-    info!("Hashing code keys");
+    txn.clear_table(&tables::HashedCodeHash).await?;
 
     let mut collector = Collector::<tables::HashedCodeHash>::new(OPTIMAL_BUFFER_CAPACITY);
 
@@ -92,15 +97,14 @@ where
     let mut walker = changeset_table.walk(Some(starting_block));
 
     while let Some((_, tables::AccountChange { address, .. })) = walker.try_next().await? {
-        if let Some(plainstate_data) = plainstate_table
+        let hashed_address = keccak256(address);
+        if let Some(tables::PlainStateFusedValue::Account { account, .. }) = plainstate_table
             .seek_exact(tables::PlainStateKey::Account(address))
             .await?
         {
-            if let tables::PlainStateFusedValue::Account { address, account } = plainstate_data {
-                target_table.upsert((keccak256(address), account)).await?;
-            } else {
-                unreachable!()
-            }
+            target_table.upsert((hashed_address, account)).await?;
+        } else if target_table.seek_exact(hashed_address).await?.is_some() {
+            target_table.delete_current().await?;
         }
     }
 
@@ -126,32 +130,39 @@ where
             incarnation,
             ..
         },
-        _,
+        tables::StorageChange { location, .. },
     )) = walker.try_next().await?
     {
-        if let Some(plainstate_data) = plainstate_table
-            .seek_exact(tables::PlainStateKey::Storage(address, incarnation))
+        let hashed_address = keccak256(address);
+        let hashed_location = keccak256(location);
+        let mut v = H256::zero();
+        if let Some(tables::PlainStateFusedValue::Storage {
+            address: found_address,
+            incarnation: found_incarnation,
+            location: found_location,
+            value,
+        }) = plainstate_table
+            .seek_both_range(
+                tables::PlainStateKey::Storage(address, incarnation),
+                location,
+            )
             .await?
         {
-            if let tables::PlainStateFusedValue::Storage {
-                address,
-                incarnation,
-                location,
-                value,
-            } = plainstate_data
+            if address == found_address
+                && incarnation == found_incarnation
+                && location == found_location
             {
-                upsert_hashed_storage_value(
-                    &mut target_table,
-                    keccak256(address),
-                    incarnation,
-                    keccak256(location),
-                    value,
-                )
-                .await?;
-            } else {
-                unreachable!()
+                v = value;
             }
         }
+        upsert_hashed_storage_value(
+            &mut target_table,
+            hashed_address,
+            incarnation,
+            hashed_location,
+            v,
+        )
+        .await?;
     }
 
     Ok(())
@@ -198,7 +209,18 @@ where
 }
 
 #[derive(Debug)]
-pub struct HashState;
+pub struct HashState {
+    /// Gas threshold beyond which erase hashed state and do clean promotion.
+    pub clean_promotion_threshold: u64,
+}
+
+impl HashState {
+    pub fn new(clean_promotion_threshold: Option<u64>) -> Self {
+        Self {
+            clean_promotion_threshold: clean_promotion_threshold.unwrap_or(1_000_000_000_000),
+        }
+    }
+}
 
 #[async_trait]
 impl<'db, RwTx> Stage<'db, RwTx> for HashState
@@ -217,26 +239,37 @@ where
     where
         'db: 'tx,
     {
-        let previous_stage = input
+        let genesis = BlockNumber(0);
+        let past_progress = input.stage_progress.unwrap_or(genesis);
+        let max_block = input
             .previous_stage
-            .ok_or_else(|| anyhow!("Cannot be first stage"))?
+            .ok_or_else(|| format_err!("Cannot be first stage"))?
             .1;
-        let prev_progress = input.stage_progress.unwrap_or(BlockNumber(0));
 
-        if prev_progress.0 > 0 {
-            info!("Incrementally hashing accounts");
-            promote_accounts(tx, prev_progress).await?;
-            info!("Incrementally hashing storage");
-            promote_storage(tx, prev_progress).await?;
-            info!("Incrementally hashing code");
-            promote_code(tx, prev_progress).await?;
-        } else {
+        if should_do_clean_promotion(
+            tx,
+            genesis,
+            past_progress,
+            max_block,
+            self.clean_promotion_threshold,
+        )
+        .await?
+        {
+            info!("Regenerating hashed state");
             promote_clean_state(tx).await?;
+            info!("Regenerating hashed code");
             promote_clean_code(tx).await?;
+        } else {
+            info!("Incrementally hashing accounts");
+            promote_accounts(tx, past_progress).await?;
+            info!("Incrementally hashing storage");
+            promote_storage(tx, past_progress).await?;
+            info!("Incrementally hashing code");
+            promote_code(tx, past_progress).await?;
         }
 
         Ok(ExecOutput::Progress {
-            stage_progress: previous_stage,
+            stage_progress: max_block,
             done: true,
             must_commit: true,
         })
@@ -262,7 +295,6 @@ mod tests {
         res::chainspec::MAINNET,
         u256_to_h256, Buffer, State, Transaction, DEFAULT_INCARNATION,
     };
-    use ethereum_types::*;
     use hex_literal::*;
     use std::time::Instant;
 
@@ -270,6 +302,15 @@ mod tests {
     async fn stage_hashstate() {
         let db = new_mem_database().unwrap();
         let mut tx = db.begin_mutable().await.unwrap();
+
+        let mut tx_num = 0;
+        let mut gas = 0;
+        tx.set(
+            &tables::CumulativeIndex,
+            (0.into(), tables::CumulativeData { tx_num, gas }),
+        )
+        .await
+        .unwrap();
 
         let block_number = BlockNumber(1);
         let miner = hex!("5a0b54d5dc17e0aadc383d2db43b0a0d3e029c4c").into();
@@ -321,10 +362,7 @@ mod tests {
             ..Account::default()
         };
 
-        buffer
-            .update_account(sender, None, Some(sender_account))
-            .await
-            .unwrap();
+        buffer.update_account(sender, None, Some(sender_account));
 
         // ---------------------------------------
         // Execute first block
@@ -332,6 +370,15 @@ mod tests {
         execute_block(&mut buffer, &MAINNET, &header, &body)
             .await
             .unwrap();
+
+        tx_num += body.transactions.len() as u64;
+        gas += header.gas_used;
+        tx.set(
+            &tables::CumulativeIndex,
+            (header.number, tables::CumulativeData { tx_num, gas }),
+        )
+        .await
+        .unwrap();
 
         let contract_address = create_address(sender, 0);
 
@@ -357,6 +404,15 @@ mod tests {
             .await
             .unwrap();
 
+        tx_num += body.transactions.len() as u64;
+        gas += header.gas_used;
+        tx.set(
+            &tables::CumulativeIndex,
+            (header.number, tables::CumulativeData { tx_num, gas }),
+        )
+        .await
+        .unwrap();
+
         // ---------------------------------------
         // Execute third block
         // ---------------------------------------
@@ -381,22 +437,33 @@ mod tests {
 
         buffer.write_to_db().await.unwrap();
 
+        tx_num += body.transactions.len() as u64;
+        gas += header.gas_used;
+        tx.set(
+            &tables::CumulativeIndex,
+            (header.number, tables::CumulativeData { tx_num, gas }),
+        )
+        .await
+        .unwrap();
+
         // ---------------------------------------
         // Execute stage forward
         // ---------------------------------------
         assert_eq!(
-            HashState {}
-                .execute(
-                    &mut tx,
-                    StageInput {
-                        restarted: false,
-                        first_started_at: (Instant::now(), None),
-                        previous_stage: Some((StageId(""), BlockNumber(3))),
-                        stage_progress: None,
-                    },
-                )
-                .await
-                .unwrap(),
+            HashState {
+                clean_promotion_threshold: u64::MAX,
+            }
+            .execute(
+                &mut tx,
+                StageInput {
+                    restarted: false,
+                    first_started_at: (Instant::now(), None),
+                    previous_stage: Some((StageId(""), BlockNumber(3))),
+                    stage_progress: None,
+                },
+            )
+            .await
+            .unwrap(),
             ExecOutput::Progress {
                 stage_progress: BlockNumber(3),
                 done: true,

@@ -308,12 +308,12 @@ impl State for InMemoryState {
         self.storage_changes.remove(&block_number);
     }
 
-    async fn update_account(
+    fn update_account(
         &mut self,
         address: Address,
         initial: Option<Account>,
         current: Option<Account>,
-    ) -> anyhow::Result<()> {
+    ) {
         self.account_changes
             .entry(self.block_number)
             .or_default()
@@ -327,8 +327,6 @@ impl State for InMemoryState {
                 self.prev_incarnations.insert(address, initial.incarnation);
             }
         }
-
-        Ok(())
     }
 
     async fn update_account_code(
@@ -549,19 +547,16 @@ mod tests {
                 println!("{}", test_name);
                 for (address, account) in fixture {
                     let address = Address::from(address);
-                    state
-                        .update_account(
-                            address,
-                            None,
-                            Some(Account {
-                                nonce: account.nonce.as_u64(),
-                                balance: account.balance,
-                                code_hash: keccak256(account.code),
-                                incarnation: 0.into(),
-                            }),
-                        )
-                        .await
-                        .unwrap();
+                    state.update_account(
+                        address,
+                        None,
+                        Some(Account {
+                            nonce: account.nonce.as_u64(),
+                            balance: account.balance,
+                            code_hash: keccak256(account.code),
+                            incarnation: 0.into(),
+                        }),
+                    );
 
                     for (location, value) in account.storage {
                         state

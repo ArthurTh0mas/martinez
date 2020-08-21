@@ -11,7 +11,7 @@ use crate::{
     },
     Buffer, Cursor, MutableTransaction,
 };
-use anyhow::{anyhow, Context};
+use anyhow::{format_err, Context};
 use async_trait::async_trait;
 use std::time::{Duration, Instant};
 use tracing::*;
@@ -19,6 +19,7 @@ use tracing::*;
 #[derive(Debug)]
 pub struct Execution {
     pub batch_size: u64,
+    pub exit_after_batch: bool,
     pub batch_until: Option<BlockNumber>,
     pub commit_every: Option<Duration>,
     pub prune_from: BlockNumber,
@@ -57,14 +58,16 @@ async fn execute_batch_of_blocks<'db, Tx: MutableTransaction<'db>>(
     loop {
         let block_hash = accessors::chain::canonical_hash::read(tx, block_number)
             .await?
-            .ok_or_else(|| anyhow!("No canonical hash found for block {}", block_number))?;
+            .ok_or_else(|| format_err!("No canonical hash found for block {}", block_number))?;
         let header = accessors::chain::header::read(tx, block_hash, block_number)
             .await?
-            .ok_or_else(|| anyhow!("Header not found: {}/{:?}", block_number, block_hash))?
+            .ok_or_else(|| format_err!("Header not found: {}/{:?}", block_number, block_hash))?
             .into();
         let block = accessors::chain::block_body::read_with_senders(tx, block_hash, block_number)
             .await?
-            .ok_or_else(|| anyhow!("Block body not found: {}/{:?}", block_number, block_hash))?;
+            .ok_or_else(|| {
+                format_err!("Block body not found: {}/{:?}", block_number, block_hash)
+            })?;
 
         let block_spec = chain_config.collect_block_spec(block_number);
 
@@ -128,7 +131,9 @@ async fn execute_batch_of_blocks<'db, Tx: MutableTransaction<'db>>(
                     let elapsed_since_start = now - first_started_at.0;
                     format!(
                         ", progress: {:0>2.2}%, {} remaining",
-                        (current_total_gas as f64 / total_gas as f64) * 100_f64,
+                        ((current_total_gas - first_started_at_gas) as f64
+                            / (total_gas - first_started_at_gas) as f64)
+                            * 100_f64,
                         format_duration(
                             Duration::from_secs(
                                 (elapsed_since_start.as_secs() as f64
@@ -177,16 +182,16 @@ impl<'db, RwTx: MutableTransaction<'db>> Stage<'db, RwTx> for Execution {
         let genesis_hash = tx
             .get(&tables::CanonicalHeader, BlockNumber(0))
             .await?
-            .ok_or_else(|| anyhow!("Genesis block absent"))?;
+            .ok_or_else(|| format_err!("Genesis block absent"))?;
         let chain_config = tx
             .get(&tables::Config, genesis_hash)
             .await?
-            .ok_or_else(|| anyhow!("No chain config for genesis block {:?}", genesis_hash))?;
+            .ok_or_else(|| format_err!("No chain config for genesis block {:?}", genesis_hash))?;
 
         let prev_progress = input.stage_progress.unwrap_or_default();
         let starting_block = prev_progress + 1;
         let max_block = input
-            .previous_stage.ok_or_else(|| anyhow!("Execution stage cannot be executed first, but no previous stage progress specified"))?.1;
+            .previous_stage.ok_or_else(|| format_err!("Execution stage cannot be executed first, but no previous stage progress specified"))?.1;
 
         Ok(if max_block >= starting_block {
             let executed_to = execute_batch_of_blocks(
@@ -202,7 +207,7 @@ impl<'db, RwTx: MutableTransaction<'db>> Stage<'db, RwTx> for Execution {
             )
             .await?;
 
-            let done = executed_to == max_block;
+            let done = executed_to == max_block || self.exit_after_batch;
 
             ExecOutput::Progress {
                 stage_progress: executed_to,
