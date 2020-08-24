@@ -7,7 +7,7 @@ use crate::{
     kv::{tables::HeaderKey, traits::MutableTransaction},
     models::BlockHeader,
 };
-use anyhow::format_err;
+use anyhow::anyhow;
 use parking_lot::RwLock;
 use std::{ops::DerefMut, sync::Arc};
 use tracing::*;
@@ -59,7 +59,7 @@ impl<DB: kv::traits::MutableKV + Sync> SaveStage<DB> {
         let mut saved_count: usize = 0;
         for i in 0..pending_count {
             let slice_lock = self.header_slices.find_by_index(i).ok_or_else(|| {
-                format_err!("SaveStage: inconsistent state - less pending slices than expected")
+                anyhow!("SaveStage: inconsistent state - less pending slices than expected")
             })?;
             let is_verified = slice_lock.read().status == HeaderSliceStatus::Verified;
             if is_verified {
@@ -90,7 +90,7 @@ impl<DB: kv::traits::MutableKV + Sync> SaveStage<DB> {
         let headers = {
             let mut slice = slice_lock.write();
             slice.headers.take().ok_or_else(|| {
-                format_err!("SaveStage: inconsistent state - Verified slice has no headers")
+                anyhow!("SaveStage: inconsistent state - Verified slice has no headers")
             })?
         };
 

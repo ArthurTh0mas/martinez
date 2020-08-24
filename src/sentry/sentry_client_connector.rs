@@ -1,11 +1,9 @@
 use super::{
-    sentry_address::SentryAddress,
-    sentry_client::{SentryClient, Status},
+    sentry_address::SentryAddress, sentry_client::SentryClient,
     sentry_client_impl::SentryClientImpl,
 };
 use futures_core::Stream;
 use std::pin::Pin;
-use tokio::time;
 use tracing::*;
 
 fn is_tonic_transport_error(error: &anyhow::Error) -> bool {
@@ -19,33 +17,15 @@ fn is_tonic_transport_error(error: &anyhow::Error) -> bool {
     false
 }
 
-const RECONNECT_TIMEOUT: u64 = 5; // seconds
-
-pub async fn connect(
-    sentry_api_addr: SentryAddress,
-    status: Status,
-) -> anyhow::Result<Box<dyn SentryClient>> {
+pub async fn connect(sentry_api_addr: SentryAddress) -> anyhow::Result<Box<dyn SentryClient>> {
     loop {
         let result = SentryClientImpl::new(sentry_api_addr.clone()).await;
         match result {
-            Ok(mut client) => {
-                let status_result = client.set_status(status.clone()).await;
-                match status_result {
-                    Ok(_) => return Ok(Box::new(client)),
-                    Err(error) => {
-                        if is_disconnect_error(&error) {
-                            error!("Sentry client disconnected during set_status");
-                            time::sleep(time::Duration::from_secs(RECONNECT_TIMEOUT)).await;
-                            continue;
-                        }
-                        return Err(error);
-                    }
-                }
-            }
+            Ok(client) => return Ok(Box::new(client)),
             Err(error) => {
                 if is_tonic_transport_error(&error) {
                     error!("Sentry server is unreachable at {:?}", sentry_api_addr);
-                    time::sleep(time::Duration::from_secs(RECONNECT_TIMEOUT)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                     continue;
                 }
                 return Err(error);
@@ -60,12 +40,11 @@ pub type SentryClientConnectorStream =
 pub fn make_connector_stream(
     sentry_client: Box<dyn SentryClient>,
     sentry_api_addr: SentryAddress,
-    status: Status,
 ) -> SentryClientConnectorStream {
     Box::pin(async_stream::stream! {
         yield Ok(sentry_client);
         loop {
-            let client = connect(sentry_api_addr.clone(), status.clone()).await?;
+            let client = connect(sentry_api_addr.clone()).await?;
             yield Ok(client);
         }
     })

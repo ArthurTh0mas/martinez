@@ -99,7 +99,7 @@ impl SentryClientReactor {
             .event_loop
             .try_lock()?
             .take()
-            .ok_or_else(|| anyhow::format_err!("already started once"))?;
+            .ok_or_else(|| anyhow::anyhow!("already started once"))?;
         let handle = tokio::spawn(async move {
             let result = event_loop.run().await;
             if let Err(error) = result {
@@ -122,13 +122,6 @@ impl SentryClientReactor {
         if self.stop_signal_sender.try_send(()).is_err() {
             warn!("SentryClientReactor stop signal already sent or the loop died itself");
         }
-    }
-
-    fn is_stopped(&self) -> bool {
-        matches!(
-            self.send_message_sender.try_reserve(),
-            Err(mpsc::error::TrySendError::Closed(_))
-        )
     }
 
     pub async fn penalize_peer(&self, peer_id: PeerId) -> anyhow::Result<()> {
@@ -187,26 +180,14 @@ impl SentryClientReactor {
         &self,
         filter_id: EthMessageId,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = MessageFromPeer> + Send>>> {
-        let receiver = {
-            let receive_messages_senders = self.receive_messages_senders.read();
-
-            // This happens if receive_messages_senders were cleared (see EventLoopReceiveMessagesSendersDropper)
-            if receive_messages_senders.is_empty() {
-                // if the SentryClientReactorEventLoop is stopped
-                if self.is_stopped() {
-                    return Err(anyhow::Error::new(SendMessageError::ReactorStopped));
-                }
-                // if the sentry client stream has ended (during tests)
-                return Ok(Box::pin(tokio_stream::empty()));
-            }
-
-            let receive_messages_sender =
-                receive_messages_senders.get(&filter_id).ok_or_else(|| {
-                    anyhow::format_err!("SentryClientReactor unexpected filter_id {:?}", filter_id)
-                })?;
-
-            receive_messages_sender.subscribe()
-        };
+        let receiver = self
+            .receive_messages_senders
+            .read()
+            .get(&filter_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("SentryClientReactor unexpected filter_id {:?}", filter_id)
+            })?
+            .subscribe();
 
         let stream = BroadcastStream::new(receiver)
             .map_err(|error| match error {
@@ -442,7 +423,7 @@ impl SentryClientReactorEventLoop {
                             let receive_messages_senders = self.receive_messages_senders.read();
                             let sender_opt = receive_messages_senders.get(&id);
                             let sender = sender_opt.ok_or_else(|| {
-                                anyhow::format_err!(
+                                anyhow::anyhow!(
                                     "SentryClientReactor.EventLoop unexpected message id {:?}",
                                     id
                                 )

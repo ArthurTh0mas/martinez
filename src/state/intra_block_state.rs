@@ -508,7 +508,8 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
 
         for (address, obj) in self.objects {
             self.db
-                .update_account(address, obj.initial.clone(), obj.current.clone());
+                .update_account(address, obj.initial.clone(), obj.current.clone())
+                .await?;
             if let Some(current) = obj.current {
                 let code_hash = current.code_hash;
                 if code_hash != EMPTY_HASH
