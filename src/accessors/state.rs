@@ -54,7 +54,7 @@ pub mod tests {
     use crate::{
         h256_to_u256,
         kv::{
-            tables,
+            tables::{self, PlainStateFusedValue},
             traits::{MutableKV, MutableTransaction},
         },
         new_mem_database, DEFAULT_INCARNATION,
@@ -85,20 +85,35 @@ pub mod tests {
         ));
 
         txn.set(
-            &tables::Storage,
-            ((address, DEFAULT_INCARNATION), (loc1, val1.into())),
+            &tables::PlainState,
+            PlainStateFusedValue::Storage {
+                address,
+                location: loc1,
+                incarnation: DEFAULT_INCARNATION,
+                value: val1,
+            },
         )
         .await
         .unwrap();
         txn.set(
-            &tables::Storage,
-            ((address, DEFAULT_INCARNATION), (loc2, val2.into())),
+            &tables::PlainState,
+            PlainStateFusedValue::Storage {
+                address,
+                location: loc2,
+                incarnation: DEFAULT_INCARNATION,
+                value: val2,
+            },
         )
         .await
         .unwrap();
         txn.set(
-            &tables::Storage,
-            ((address, DEFAULT_INCARNATION), (loc3, val3.into())),
+            &tables::PlainState,
+            PlainStateFusedValue::Storage {
+                address,
+                location: loc3,
+                incarnation: DEFAULT_INCARNATION,
+                value: val3,
+            },
         )
         .await
         .unwrap();

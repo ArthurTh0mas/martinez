@@ -13,15 +13,15 @@ use std::{ops::DerefMut, sync::Arc};
 use tracing::*;
 
 /// Saves slices into the database, and sets Saved status.
-pub struct SaveStage<'tx, RwTx> {
+pub struct SaveStage<DB: kv::traits::MutableKV + Sync> {
     header_slices: Arc<HeaderSlices>,
     pending_watch: HeaderSliceStatusWatch,
     remaining_count: usize,
-    db_transaction: &'tx RwTx,
+    db: Arc<DB>,
 }
 
-impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db> + 'db> SaveStage<'tx, RwTx> {
-    pub fn new(header_slices: Arc<HeaderSlices>, db_transaction: &'tx RwTx) -> Self {
+impl<DB: kv::traits::MutableKV + Sync> SaveStage<DB> {
+    pub fn new(header_slices: Arc<HeaderSlices>, db: Arc<DB>) -> Self {
         Self {
             header_slices: header_slices.clone(),
             pending_watch: HeaderSliceStatusWatch::new(
@@ -30,7 +30,7 @@ impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db> + 'db> SaveStage<'tx, RwTx> {
                 "SaveStage",
             ),
             remaining_count: 0,
-            db_transaction,
+            db,
         }
     }
 
@@ -107,16 +107,16 @@ impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db> + 'db> SaveStage<'tx, RwTx> {
     }
 
     async fn save_headers(&self, headers: &[BlockHeader]) -> anyhow::Result<()> {
-        let tx = &self.db_transaction;
+        let tx = self.db.begin_mutable().await?;
         for header_ref in headers {
             // this clone happens mostly on the stack (except extra_data)
             let header = header_ref.clone();
-            self.save_header(header, tx).await?;
+            self.save_header(header, &tx).await?;
         }
-        Ok(())
+        tx.commit().await
     }
 
-    async fn save_header(&self, header: BlockHeader, tx: &RwTx) -> anyhow::Result<()> {
+    async fn save_header(&self, header: BlockHeader, tx: &DB::MutableTx<'_>) -> anyhow::Result<()> {
         let block_num = header.number;
         let header_hash = header.hash();
         let header_key: HeaderKey = (block_num, header_hash);
@@ -140,10 +140,8 @@ impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db> + 'db> SaveStage<'tx, RwTx> {
 }
 
 #[async_trait::async_trait]
-impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db> + 'db> super::stage::Stage
-    for SaveStage<'tx, RwTx>
-{
+impl<DB: kv::traits::MutableKV + Sync> super::stage::Stage for SaveStage<DB> {
     async fn execute(&mut self) -> anyhow::Result<()> {
-        SaveStage::<RwTx>::execute(self).await
+        SaveStage::<DB>::execute(self).await
     }
 }

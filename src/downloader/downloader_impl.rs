@@ -12,29 +12,29 @@ use crate::{
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
-pub struct Downloader {
+pub struct Downloader<DB: kv::traits::MutableKV + Sync> {
     opts: Opts,
     chain_config: ChainConfig,
+    db: Arc<DB>,
 }
 
-impl Downloader {
-    pub fn new(opts: Opts, chains_config: ChainsConfig) -> anyhow::Result<Self> {
+impl<DB: kv::traits::MutableKV + Sync> Downloader<DB> {
+    pub fn new(opts: Opts, chains_config: ChainsConfig, db: Arc<DB>) -> anyhow::Result<Self> {
         let chain_config = chains_config
             .get(&opts.chain_name)
             .ok_or_else(|| anyhow::format_err!("unknown chain '{}'", opts.chain_name))?
             .clone();
 
-        Ok(Self { opts, chain_config })
+        Ok(Self {
+            opts,
+            chain_config,
+            db,
+        })
     }
 
-    pub async fn run<
-        'downloader,
-        'db: 'downloader,
-        RwTx: kv::traits::MutableTransaction<'db> + 'db,
-    >(
-        &'downloader self,
+    pub async fn run(
+        &self,
         sentry_client_opt: Option<Box<dyn SentryClient>>,
-        db_transaction: &'downloader RwTx,
     ) -> anyhow::Result<()> {
         let status = sentry_client::Status {
             total_difficulty: ethereum_types::U256::zero(),
@@ -67,9 +67,10 @@ impl Downloader {
         let headers_downloader = super::headers::downloader::Downloader::new(
             self.chain_config.clone(),
             sentry.clone(),
+            self.db.clone(),
             ui_system.clone(),
         );
-        headers_downloader.run::<RwTx>(db_transaction).await?;
+        headers_downloader.run().await?;
 
         ui_system.try_lock()?.stop().await?;
 

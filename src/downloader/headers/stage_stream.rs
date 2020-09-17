@@ -1,11 +1,11 @@
 use futures_core::Stream;
 use std::pin::Pin;
 
-pub type StageStream<'stream> = Pin<Box<dyn Stream<Item = anyhow::Result<()>> + 'stream>>;
+pub type StageStream = Pin<Box<dyn Stream<Item = anyhow::Result<()>>>>;
 
-pub fn make_stage_stream<'stage>(
-    mut stage: Box<dyn super::stage::Stage + 'stage>,
-) -> StageStream<'stage> {
+pub fn make_stage_stream(
+    mut stage: Box<dyn crate::downloader::headers::stage::Stage>,
+) -> StageStream {
     let stream = async_stream::stream! {
         loop {
             yield stage.execute().await;

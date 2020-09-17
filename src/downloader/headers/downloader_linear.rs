@@ -19,23 +19,25 @@ use tokio::sync::Mutex;
 use tokio_stream::{StreamExt, StreamMap};
 use tracing::*;
 
-pub struct DownloaderLinear {
+pub struct DownloaderLinear<DB: kv::traits::MutableKV + Sync> {
     chain_config: ChainConfig,
     start_block_num: BlockNumber,
     start_block_hash: ethereum_types::H256,
     estimated_top_block_num: Option<BlockNumber>,
     mem_limit: usize,
     sentry: SentryClientReactorShared,
+    db: Arc<DB>,
     ui_system: Arc<Mutex<UISystem>>,
 }
 
-impl DownloaderLinear {
+impl<DB: kv::traits::MutableKV + Sync> DownloaderLinear<DB> {
     pub fn new(
         chain_config: ChainConfig,
         start_block_id: BlockHashAndNumber,
         estimated_top_block_num: Option<BlockNumber>,
         mem_limit: usize,
         sentry: SentryClientReactorShared,
+        db: Arc<DB>,
         ui_system: Arc<Mutex<UISystem>>,
     ) -> Self {
         Self {
@@ -45,6 +47,7 @@ impl DownloaderLinear {
             estimated_top_block_num,
             mem_limit,
             sentry,
+            db,
             ui_system,
         }
     }
@@ -69,14 +72,7 @@ impl DownloaderLinear {
         Ok(estimated_top_block_num)
     }
 
-    pub async fn run<
-        'downloader,
-        'db: 'downloader,
-        RwTx: kv::traits::MutableTransaction<'db> + 'db,
-    >(
-        &'downloader self,
-        db_transaction: &'downloader RwTx,
-    ) -> anyhow::Result<()> {
+    pub async fn run(&self) -> anyhow::Result<()> {
         let header_slices_mem_limit = self.mem_limit;
 
         let trusted_len: u64 = 90_000;
@@ -131,7 +127,7 @@ impl DownloaderLinear {
             self.start_block_hash,
         );
         let penalize_stage = PenalizeStage::new(header_slices.clone(), sentry.clone());
-        let save_stage = SaveStage::<RwTx>::new(header_slices.clone(), db_transaction);
+        let save_stage = SaveStage::new(header_slices.clone(), self.db.clone());
         let refill_stage = RefillStage::new(header_slices.clone());
 
         let can_proceed = fetch_receive_stage.can_proceed_check();
