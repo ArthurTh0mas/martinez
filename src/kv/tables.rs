@@ -341,7 +341,6 @@ macro_rules! rlp_standalone_table_object {
     };
 }
 
-rlp_table_object!(U256);
 rlp_table_object!(BodyForStorage);
 rlp_table_object!(BlockHeader);
 rlp_standalone_table_object!(Transaction);
@@ -432,60 +431,40 @@ where
     }
 }
 
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Deref,
-    DerefMut,
-    Default,
-    Display,
-    PartialEq,
-    Eq,
-    From,
-    Into,
-    PartialOrd,
-    Ord,
-    Hash,
-    Serialize,
-    Deserialize,
-)]
-#[serde(transparent)]
-pub struct ZerolessH256(pub H256);
-
-impl TableEncode for ZerolessH256 {
+impl TableEncode for U256 {
     type Encoded = VariableVec<KECCAK_LENGTH>;
 
     fn encode(self) -> Self::Encoded {
+        let enc = <[u8; 32]>::from(self);
         let mut out = Self::Encoded::default();
-        out.try_extend_from_slice(zeroless_view(&self.0)).unwrap();
-        out
-    }
-}
-
-impl TableDecode for ZerolessH256 {
-    fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        if b.len() > KECCAK_LENGTH {
-            bail!("too long: {} > {}", b.len(), KECCAK_LENGTH);
-        }
-
-        Ok(H256::from_uint(&U256::from_big_endian(b)).into())
-    }
-}
-
-impl TableEncode for (H256, ZerolessH256) {
-    type Encoded = VariableVec<{ KECCAK_LENGTH + KECCAK_LENGTH }>;
-
-    fn encode(self) -> Self::Encoded {
-        let mut out = Self::Encoded::default();
-        out.try_extend_from_slice(&self.0.encode()).unwrap();
-        out.try_extend_from_slice(zeroless_view(&(self.1).0))
+        let byte_len = (self.bits() + 7) / 8;
+        out.try_extend_from_slice(&enc[KECCAK_LENGTH - byte_len..])
             .unwrap();
         out
     }
 }
 
-impl TableDecode for (H256, ZerolessH256) {
+impl TableDecode for U256 {
+    fn decode(b: &[u8]) -> anyhow::Result<Self> {
+        if b.len() > KECCAK_LENGTH {
+            return Err(TooLong::<KECCAK_LENGTH> { got: b.len() }.into());
+        }
+        Ok(Self::from_big_endian(b))
+    }
+}
+
+impl TableEncode for (H256, U256) {
+    type Encoded = VariableVec<{ KECCAK_LENGTH + KECCAK_LENGTH }>;
+
+    fn encode(self) -> Self::Encoded {
+        let mut out = Self::Encoded::default();
+        out.try_extend_from_slice(&self.0.encode()).unwrap();
+        out.try_extend_from_slice(&self.1.encode()).unwrap();
+        out
+    }
+}
+
+impl TableDecode for (H256, U256) {
     fn decode(b: &[u8]) -> anyhow::Result<Self> {
         if b.len() > KECCAK_LENGTH + KECCAK_LENGTH {
             return Err(TooLong::<{ KECCAK_LENGTH + KECCAK_LENGTH }> { got: b.len() }.into());
@@ -497,7 +476,7 @@ impl TableDecode for (H256, ZerolessH256) {
 
         let (location, value) = b.split_at(KECCAK_LENGTH);
 
-        Ok((H256::decode(location)?, ZerolessH256::decode(value)?))
+        Ok((H256::decode(location)?, U256::decode(value)?))
     }
 }
 
@@ -621,7 +600,7 @@ where
     }
 }
 
-impl DupSort for PlainState {
+impl DupSort for Storage {
     type SeekBothKey = H256;
 }
 impl DupSort for AccountChangeSet {
@@ -740,7 +719,7 @@ impl TableEncode for StorageChangeSeekKey {
 #[derive(Clone, Debug, PartialEq)]
 pub struct StorageChange {
     pub location: H256,
-    pub value: H256,
+    pub value: U256,
 }
 
 impl TableEncode for StorageChange {
@@ -749,8 +728,7 @@ impl TableEncode for StorageChange {
     fn encode(self) -> Self::Encoded {
         let mut out = Self::Encoded::default();
         out.try_extend_from_slice(&self.location.encode()).unwrap();
-        out.try_extend_from_slice(&ZerolessH256(self.value).encode())
-            .unwrap();
+        out.try_extend_from_slice(&self.value.encode()).unwrap();
         out
     }
 }
@@ -763,7 +741,7 @@ impl TableDecode for StorageChange {
 
         Ok(Self {
             location: H256::decode(&b[..KECCAK_LENGTH])?,
-            value: ZerolessH256::decode(&b[KECCAK_LENGTH..])?.0,
+            value: U256::decode(&b[KECCAK_LENGTH..])?,
         })
     }
 }
@@ -849,200 +827,13 @@ impl TableDecode for CallTraceSetEntry {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum PlainStateKey {
-    Account(Address),
-    Storage(Address, Incarnation),
-}
-
-impl TableEncode for PlainStateKey {
-    type Encoded = VariableVec<{ ADDRESS_LENGTH + INCARNATION_LENGTH }>;
-
-    fn encode(self) -> Self::Encoded {
-        let mut out = Self::Encoded::default();
-        match self {
-            PlainStateKey::Account(address) => {
-                out.try_extend_from_slice(&address.encode()).unwrap();
-            }
-            PlainStateKey::Storage(address, incarnation) => {
-                out.try_extend_from_slice(&address.encode()).unwrap();
-                out.try_extend_from_slice(&incarnation.encode()).unwrap();
-            }
-        }
-        out
-    }
-}
-
-impl TableDecode for PlainStateKey {
-    fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        const STORAGE_KEY_LEN: usize = ADDRESS_LENGTH + INCARNATION_LENGTH;
-        Ok(match b.len() {
-            ADDRESS_LENGTH => Self::Account(Address::decode(b)?),
-            STORAGE_KEY_LEN => Self::Storage(
-                Address::decode(&b[..ADDRESS_LENGTH])?,
-                Incarnation::decode(&b[ADDRESS_LENGTH..])?,
-            ),
-            _ => bail!(
-                "invalid length: expected one of [{}, {}], got {}",
-                ADDRESS_LENGTH,
-                STORAGE_KEY_LEN,
-                b.len()
-            ),
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum PlainStateSeekKey {
-    Account(Address),
-    StorageAllIncarnations(Address),
-    StorageWithIncarnation(Address, Incarnation),
-}
-
-impl TableEncode for PlainStateSeekKey {
-    type Encoded = VariableVec<{ ADDRESS_LENGTH + INCARNATION_LENGTH }>;
-
-    fn encode(self) -> Self::Encoded {
-        let mut out = Self::Encoded::default();
-        match self {
-            Self::Account(address) | Self::StorageAllIncarnations(address) => {
-                out.try_extend_from_slice(&address.encode()).unwrap();
-            }
-            Self::StorageWithIncarnation(address, incarnation) => {
-                out.try_extend_from_slice(&address.encode()).unwrap();
-                out.try_extend_from_slice(&incarnation.encode()).unwrap();
-            }
-        }
-        out
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum PlainStateFusedValue {
-    Account {
-        address: Address,
-        account: EncodedAccount,
-    },
-    Storage {
-        address: Address,
-        incarnation: Incarnation,
-        location: H256,
-        value: H256,
-    },
-}
-
-impl PlainStateFusedValue {
-    pub fn as_account(&self) -> Option<(Address, EncodedAccount)> {
-        if let PlainStateFusedValue::Account { address, account } = self {
-            Some((*address, account.clone()))
-        } else {
-            None
-        }
-    }
-
-    pub fn as_storage(&self) -> Option<(Address, Incarnation, H256, H256)> {
-        if let Self::Storage {
-            address,
-            incarnation,
-            location,
-            value,
-        } = self
-        {
-            Some((*address, *incarnation, *location, *value))
-        } else {
-            None
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PlainState;
-
-impl Table for PlainState {
-    type Key = PlainStateKey;
-    type Value = VariableVec<MAX_ACCOUNT_LEN>;
-    type SeekKey = PlainStateSeekKey;
-    type FusedValue = PlainStateFusedValue;
-
-    fn db_name(&self) -> string::String<bytes::Bytes> {
-        unsafe {
-            string::String::from_utf8_unchecked(bytes::Bytes::from_static(
-                Self::const_db_name().as_bytes(),
-            ))
-        }
-    }
-
-    fn fuse_values(key: Self::Key, value: Self::Value) -> anyhow::Result<Self::FusedValue> {
-        Ok(match key {
-            PlainStateKey::Account(address) => {
-                if value.len() > MAX_ACCOUNT_LEN {
-                    return Err(InvalidLength::<MAX_ACCOUNT_LEN> { got: value.len() }.into());
-                }
-
-                PlainStateFusedValue::Account {
-                    address,
-                    account: value,
-                }
-            }
-            PlainStateKey::Storage(address, incarnation) => {
-                if value.len() > KECCAK_LENGTH + KECCAK_LENGTH {
-                    return Err(
-                        TooLong::<{ KECCAK_LENGTH + KECCAK_LENGTH }> { got: value.len() }.into(),
-                    );
-                }
-
-                PlainStateFusedValue::Storage {
-                    address,
-                    incarnation,
-                    location: H256::decode(&value[..KECCAK_LENGTH])?,
-                    value: ZerolessH256::decode(&value[KECCAK_LENGTH..])?.0,
-                }
-            }
-        })
-    }
-
-    fn split_fused(fv: Self::FusedValue) -> (Self::Key, Self::Value) {
-        match fv {
-            PlainStateFusedValue::Account { address, account } => {
-                (PlainStateKey::Account(address), account)
-            }
-            PlainStateFusedValue::Storage {
-                address,
-                incarnation,
-                location,
-                value,
-            } => {
-                let mut v = Self::Value::default();
-                v.try_extend_from_slice(&location.encode()).unwrap();
-                v.try_extend_from_slice(&ZerolessH256(value).encode())
-                    .unwrap();
-                (PlainStateKey::Storage(address, incarnation), v)
-            }
-        }
-    }
-}
-
-impl PlainState {
-    pub const fn const_db_name() -> &'static str {
-        "PlainState"
-    }
-
-    pub const fn erased(self) -> ErasedTable<Self> {
-        ErasedTable(self)
-    }
-}
-
-impl std::fmt::Display for PlainState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", Self::const_db_name())
-    }
-}
-
+decl_table!(Account => Address => EncodedAccount);
+decl_table!(Storage => (Address, Incarnation) => (H256, U256));
 decl_table!(PlainCodeHash => (Address, Incarnation) => H256);
 decl_table!(AccountChangeSet => AccountChangeKey => AccountChange);
 decl_table!(StorageChangeSet => StorageChangeKey => StorageChange => StorageChangeSeekKey);
 decl_table!(HashedAccount => H256 => EncodedAccount);
-decl_table!(HashedStorage => (H256, Incarnation) => (H256, ZerolessH256));
+decl_table!(HashedStorage => (H256, Incarnation) => (H256, U256));
 decl_table!(AccountHistory => BitmapKey<Address> => RoaringTreemap);
 decl_table!(StorageHistory => BitmapKey<(Address, H256)> => RoaringTreemap);
 decl_table!(Code => H256 => Bytes);
@@ -1079,7 +870,8 @@ pub type DatabaseChart = Arc<HashMap<&'static str, TableInfo>>;
 
 pub static CHAINDATA_TABLES: Lazy<Arc<HashMap<&'static str, TableInfo>>> = Lazy::new(|| {
     Arc::new(hashmap! {
-        PlainState::const_db_name() => TableInfo {
+        Account::const_db_name() => TableInfo::default(),
+        Storage::const_db_name() => TableInfo {
             dup_sort: true,
         },
         PlainCodeHash::const_db_name() => TableInfo::default(),
@@ -1128,3 +920,24 @@ pub static CHAINDATA_TABLES: Lazy<Arc<HashMap<&'static str, TableInfo>>> = Lazy:
         Issuance::const_db_name() => TableInfo::default(),
     })
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hex_literal::hex;
+
+    #[test]
+    fn u256() {
+        for (fixture, expected) in [
+            (U256::from(0), vec![]),
+            (
+                U256::from(0xDEADBEEFBAADCAFE_u128),
+                hex!("DEADBEEFBAADCAFE").to_vec(),
+            ),
+            (U256::max_value(), hex!("FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF").to_vec()),
+        ] {
+            assert_eq!(fixture.encode().to_vec(), expected);
+            assert_eq!(U256::decode(&expected).unwrap(), fixture);
+        }
+    }
+}
