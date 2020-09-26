@@ -244,7 +244,7 @@ impl<'env, E: EnvironmentKind> traits::MutableTransaction<'env> for MdbxTransact
         self.mutable_cursor(table).await
     }
 
-    async fn set<T>(&self, table: &T, k: T::Key, v: T::Value) -> anyhow::Result<()>
+    async fn set<T>(&self, table: &T, fv: T::FusedValue) -> anyhow::Result<()>
     where
         T: Table,
     {
@@ -254,8 +254,9 @@ impl<'env, E: EnvironmentKind> traits::MutableTransaction<'env> for MdbxTransact
             .map(|info| info.dup_sort)
             .unwrap_or(false)
         {
-            return MutableCursor::<T>::put(&mut self.mutable_cursor(table).await?, k, v).await;
+            return MutableCursor::<T>::put(&mut self.mutable_cursor(table).await?, fv).await;
         }
+        let (k, v) = T::split_fused(fv);
         Ok(self.inner.put(
             &self.inner.open_db(Some(table.db_name().as_ref()))?,
             &k.encode(),
@@ -310,14 +311,14 @@ where
 
 fn map_res_inner<T, E>(
     v: Result<Option<(TableObjectWrapper<T::Key>, TableObjectWrapper<T::Value>)>, E>,
-) -> anyhow::Result<Option<(T::Key, T::Value)>>
+) -> anyhow::Result<Option<T::FusedValue>>
 where
     T: Table,
     <T as Table>::Key: TableDecode,
     E: std::error::Error + Send + Sync + 'static,
 {
     if let Some((k, v)) = v? {
-        return Ok(Some((k.0, v.0)));
+        return Ok(Some(T::fuse_values(k.0, v.0)?));
     }
 
     Ok(None)
@@ -329,14 +330,14 @@ where
     K: TransactionKind,
     T: Table,
 {
-    async fn first(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>>
+    async fn first(&mut self) -> anyhow::Result<Option<T::FusedValue>>
     where
         T::Key: TableDecode,
     {
         Ok(map_res_inner::<T, _>(self.inner.first())?)
     }
 
-    async fn seek(&mut self, key: T::SeekKey) -> anyhow::Result<Option<(T::Key, T::Value)>>
+    async fn seek(&mut self, key: T::SeekKey) -> anyhow::Result<Option<T::FusedValue>>
     where
         T::Key: TableDecode,
     {
@@ -345,7 +346,7 @@ where
         )?)
     }
 
-    async fn seek_exact(&mut self, key: T::Key) -> anyhow::Result<Option<(T::Key, T::Value)>>
+    async fn seek_exact(&mut self, key: T::Key) -> anyhow::Result<Option<T::FusedValue>>
     where
         T::Key: TableDecode,
     {
@@ -354,28 +355,28 @@ where
         )?)
     }
 
-    async fn next(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>>
+    async fn next(&mut self) -> anyhow::Result<Option<T::FusedValue>>
     where
         T::Key: TableDecode,
     {
         Ok(map_res_inner::<T, _>(self.inner.next())?)
     }
 
-    async fn prev(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>>
+    async fn prev(&mut self) -> anyhow::Result<Option<T::FusedValue>>
     where
         T::Key: TableDecode,
     {
         Ok(map_res_inner::<T, _>(self.inner.prev())?)
     }
 
-    async fn last(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>>
+    async fn last(&mut self) -> anyhow::Result<Option<T::FusedValue>>
     where
         T::Key: TableDecode,
     {
         Ok(map_res_inner::<T, _>(self.inner.last())?)
     }
 
-    async fn current(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>>
+    async fn current(&mut self) -> anyhow::Result<Option<T::FusedValue>>
     where
         T::Key: TableDecode,
     {
@@ -393,30 +394,30 @@ where
         &mut self,
         key: T::Key,
         value: T::SeekBothKey,
-    ) -> anyhow::Result<Option<T::Value>>
+    ) -> anyhow::Result<Option<T::FusedValue>>
     where
         T::Key: Clone,
     {
         let res = self.inner.get_both_range::<TableObjectWrapper<T::Value>>(
-            key.encode().as_ref(),
+            key.clone().encode().as_ref(),
             value.encode().as_ref(),
         )?;
 
         if let Some(v) = res {
-            return Ok(Some(v.0));
+            return Ok(Some(T::fuse_values(key, v.0)?));
         }
 
         Ok(None)
     }
 
-    async fn next_dup(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>>
+    async fn next_dup(&mut self) -> anyhow::Result<Option<T::FusedValue>>
     where
         T::Key: TableDecode,
     {
         Ok(map_res_inner::<T, _>(self.inner.next_dup())?)
     }
 
-    async fn next_no_dup(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>>
+    async fn next_no_dup(&mut self) -> anyhow::Result<Option<T::FusedValue>>
     where
         T::Key: TableDecode,
     {
@@ -429,7 +430,8 @@ impl<'txn, T> MutableCursor<'txn, T> for MdbxCursor<'txn, RW>
 where
     T: Table,
 {
-    async fn put(&mut self, key: T::Key, value: T::Value) -> anyhow::Result<()> {
+    async fn put(&mut self, fv: T::FusedValue) -> anyhow::Result<()> {
+        let (key, value) = T::split_fused(fv);
         Ok(self.inner.put(
             key.encode().as_ref(),
             value.encode().as_ref(),
@@ -437,7 +439,8 @@ where
         )?)
     }
 
-    async fn upsert(&mut self, key: T::Key, value: T::Value) -> anyhow::Result<()> {
+    async fn upsert(&mut self, fv: T::FusedValue) -> anyhow::Result<()> {
+        let (key, value) = T::split_fused(fv);
         Ok(self.inner.put(
             key.encode().as_ref(),
             value.encode().as_ref(),
@@ -445,7 +448,8 @@ where
         )?)
     }
 
-    async fn append(&mut self, key: T::Key, value: T::Value) -> anyhow::Result<()> {
+    async fn append(&mut self, fv: T::FusedValue) -> anyhow::Result<()> {
+        let (key, value) = T::split_fused(fv);
         Ok(self.inner.put(
             key.encode().as_ref(),
             value.encode().as_ref(),
@@ -453,7 +457,8 @@ where
         )?)
     }
 
-    async fn delete(&mut self, key: T::Key, value: T::Value) -> anyhow::Result<()> {
+    async fn delete(&mut self, fv: T::FusedValue) -> anyhow::Result<()> {
+        let (key, value) = T::split_fused(fv);
         if self.table_info.dup_sort {
             if self
                 .inner
@@ -492,7 +497,8 @@ where
     async fn delete_current_duplicates(&mut self) -> anyhow::Result<()> {
         Ok(self.inner.del(WriteFlags::NO_DUP_DATA)?)
     }
-    async fn append_dup(&mut self, key: T::Key, value: T::Value) -> anyhow::Result<()> {
+    async fn append_dup(&mut self, fv: T::FusedValue) -> anyhow::Result<()> {
+        let (key, value) = T::split_fused(fv);
         Ok(self.inner.put(
             key.encode().as_ref(),
             value.encode().as_ref(),
