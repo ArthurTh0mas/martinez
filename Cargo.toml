@@ -96,10 +96,6 @@ path = "bin/martinez.rs"
 name = "martinez"
 
 [[bin]]
-path = "bin/martinez-ddl.rs"
-name = "martinez-ddl"
-
-[[bin]]
 path = "bin/martinez-rpc.rs"
 name = "martinez-rpc"
 
