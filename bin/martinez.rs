@@ -1,4 +1,5 @@
 use martinez::{
+    binutil::MartinezDataDir,
     kv::{
         tables,
         traits::{MutableKV, KV},
@@ -27,13 +28,13 @@ use tracing_subscriber::{prelude::*, EnvFilter};
 #[derive(StructOpt)]
 #[structopt(name = "Martinez", about = "Next-generation Ethereum implementation.")]
 pub struct Opt {
-    /// Path to Erigon chain database, where to get blocks from.
-    #[structopt(long, parse(from_os_str))]
-    pub erigon_chaindata: PathBuf,
+    /// Path to Erigon database directory, where to get blocks from.
+    #[structopt(long = "erigon-datadir", parse(from_os_str))]
+    pub erigon_data_dir: PathBuf,
 
-    /// Path to Martinez chain database.
-    #[structopt(long, parse(from_os_str))]
-    pub chaindata: PathBuf,
+    /// Path to Martinez database directory.
+    #[structopt(long = "datadir", help = "Database directory path", default_value)]
+    pub data_dir: MartinezDataDir,
 
     /// Last block where to sync to.
     #[structopt(long)]
@@ -283,7 +284,7 @@ where
             if elapsed > Duration::from_secs(30) {
                 info!(
                     "Highest block {}, batch size: {} blocks with {} transactions, {} tx/sec",
-                    highest_block,
+                    highest_block.0,
                     extracted_blocks_num,
                     extracted_txs_num,
                     extracted_txs_num as f64
@@ -359,7 +360,7 @@ where
 #[allow(unreachable_code)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let opt = Opt::from_args();
+    let opt: Opt = Opt::from_args();
 
     let filter = if std::env::var(EnvFilter::DEFAULT_ENV)
         .unwrap_or_default()
@@ -386,13 +387,17 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting Martinez ({})", version_string());
 
+    let erigon_chain_data = opt.erigon_data_dir.join("chaindata");
+
     let erigon_db = Arc::new(martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
         mdbx::Environment::new(),
-        &opt.erigon_chaindata,
+        &erigon_chain_data,
         martinez::kv::tables::CHAINDATA_TABLES.clone(),
     )?);
 
-    let db = martinez::kv::new_database(&opt.chaindata)?;
+    let martinez_chain_data = opt.data_dir.join("chaindata");
+
+    let db = martinez::kv::new_database(&martinez_chain_data)?;
     async {
         let txn = db.begin_mutable().await?;
         if martinez::genesis::initialize_genesis(&txn, martinez::res::chainspec::MAINNET.clone()).await? {
