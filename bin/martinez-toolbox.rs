@@ -1,12 +1,15 @@
 use martinez::{
     binutil::MartinezDataDir,
     hex_to_bytes,
-    kv::traits::KV,
+    kv::{
+        tables::{self, CHAINDATA_TABLES},
+        traits::*,
+    },
     models::*,
     stagedsync::{self},
     stages::*,
 };
-use anyhow::{bail, ensure, Context};
+use anyhow::{bail, ensure, format_err, Context};
 use bytes::Bytes;
 use itertools::Itertools;
 use std::{borrow::Cow, path::PathBuf};
@@ -68,14 +71,39 @@ pub enum OptCommand {
     #[structopt(name = "download-headers", about = "Run block headers downloader")]
     HeaderDownload {
         #[structopt(flatten)]
-        opts: martinez::downloader::opts::Opts,
+        opts: HeaderDownloadOpts,
+    },
+
+    ReadBlock {
+        block_number: BlockNumber,
     },
 }
 
-async fn blockhashes(data_dir: PathBuf) -> anyhow::Result<()> {
+#[derive(StructOpt)]
+pub struct HeaderDownloadOpts {
+    #[structopt(
+        long = "chain",
+        help = "Name of the testnet to join",
+        default_value = "mainnet"
+    )]
+    pub chain_name: String,
+
+    #[structopt(
+        long = "sentry.api.addr",
+        help = "Sentry GRPC service URL as 'http://host:port'",
+        default_value = "http://localhost:8000"
+    )]
+    pub sentry_api_addr: martinez::sentry::sentry_address::SentryAddress,
+
+    #[structopt(flatten)]
+    pub downloader_opts: martinez::downloader::opts::Opts,
+}
+
+async fn blockhashes(data_dir: MartinezDataDir) -> anyhow::Result<()> {
+    std::fs::create_dir_all(&data_dir.0)?;
     let env = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_rw(
         mdbx::Environment::new(),
-        &data_dir,
+        &data_dir.chain_data_dir(),
         martinez::kv::tables::CHAINDATA_TABLES.clone(),
     )?;
 
@@ -84,28 +112,46 @@ async fn blockhashes(data_dir: PathBuf) -> anyhow::Result<()> {
     staged_sync.run(&env).await?;
 }
 
-async fn header_download(
-    data_dir: PathBuf,
-    opts: martinez::downloader::opts::Opts,
-) -> anyhow::Result<()> {
+#[allow(unreachable_code)]
+async fn header_download(data_dir: MartinezDataDir, opts: HeaderDownloadOpts) -> anyhow::Result<()> {
     let chains_config = martinez::sentry::chain_config::ChainsConfig::new()?;
-    martinez::downloader::opts::Opts::validate_chain_name(
-        &opts.chain_name,
-        chains_config.chain_names().as_slice(),
+    let chain_config = chains_config.get(&opts.chain_name)?;
+
+    let sentry_api_addr = opts.sentry_api_addr.clone();
+    let sentry_connector =
+        martinez::sentry::sentry_client_connector::SentryClientConnectorImpl::new(sentry_api_addr);
+
+    let sentry_status_provider =
+        martinez::downloader::sentry_status_provider::SentryStatusProvider::new(chain_config.clone());
+    let mut sentry_reactor = martinez::sentry::sentry_client_reactor::SentryClientReactor::new(
+        Box::new(sentry_connector),
+        sentry_status_provider.current_status_stream(),
+    );
+    sentry_reactor.start()?;
+    let sentry = sentry_reactor.into_shared();
+
+    let stage = martinez::stages::HeaderDownload::new(
+        chain_config,
+        opts.downloader_opts.headers_mem_limit(),
+        opts.downloader_opts.headers_batch_size,
+        sentry.clone(),
+        sentry_status_provider,
     )?;
 
-    let stage = martinez::stages::HeaderDownload::new(opts, chains_config)?;
-    let db = martinez::kv::new_database(&data_dir)?;
+    std::fs::create_dir_all(&data_dir.0)?;
+    let db = martinez::kv::new_database(&data_dir.chain_data_dir())?;
 
     let mut staged_sync = stagedsync::StagedSync::new();
     staged_sync.push(stage);
-    staged_sync.run(&db).await?
+    staged_sync.run(&db).await?;
+
+    sentry.write().await.stop().await
 }
 
-async fn table_sizes(data_dir: PathBuf, csv: bool) -> anyhow::Result<()> {
+async fn table_sizes(data_dir: MartinezDataDir, csv: bool) -> anyhow::Result<()> {
     let env = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
         mdbx::Environment::new(),
-        &data_dir,
+        &data_dir.chain_data_dir(),
         Default::default(),
     )?;
     let mut sizes = env
@@ -138,10 +184,10 @@ async fn table_sizes(data_dir: PathBuf, csv: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn db_query(data_dir: PathBuf, table: String, key: Bytes) -> anyhow::Result<()> {
+async fn db_query(data_dir: MartinezDataDir, table: String, key: Bytes) -> anyhow::Result<()> {
     let env = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
         mdbx::Environment::new(),
-        &data_dir,
+        &data_dir.chain_data_dir(),
         Default::default(),
     )?;
 
@@ -164,14 +210,14 @@ async fn db_query(data_dir: PathBuf, table: String, key: Bytes) -> anyhow::Resul
 }
 
 async fn db_walk(
-    data_dir: PathBuf,
+    data_dir: MartinezDataDir,
     table: String,
     starting_key: Option<Bytes>,
     max_entries: Option<usize>,
 ) -> anyhow::Result<()> {
     let env = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
         mdbx::Environment::new(),
-        &data_dir,
+        &data_dir.chain_data_dir(),
         Default::default(),
     )?;
 
@@ -188,8 +234,6 @@ async fn db_walk(
     .enumerate()
     .take(max_entries.unwrap_or(usize::MAX))
     {
-        use martinez::kv::TableDecode;
-
         let (k, v) = item?;
         println!(
             "{} / {:?} / {:?} / {:?} / {:?}",
@@ -273,6 +317,59 @@ async fn check_table_eq(db1_path: PathBuf, db2_path: PathBuf, table: String) -> 
     Ok(())
 }
 
+async fn read_block(data_dir: MartinezDataDir, block_num: BlockNumber) -> anyhow::Result<()> {
+    let env = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
+        mdbx::Environment::new(),
+        &data_dir.chain_data_dir(),
+        CHAINDATA_TABLES.clone(),
+    )?;
+
+    let tx = env.begin().await?;
+
+    let canonical_hash = tx
+        .get(&tables::CanonicalHeader, block_num)
+        .await?
+        .ok_or_else(|| format_err!("no such canonical block"))?;
+    let header = tx
+        .get(&tables::Header, (block_num, canonical_hash))
+        .await?
+        .ok_or_else(|| format_err!("header not found"))?;
+    let body =
+        martinez::accessors::chain::block_body::read_without_senders(&tx, canonical_hash, block_num)
+            .await?
+            .ok_or_else(|| format_err!("block body not found"))?;
+
+    let partial_header = PartialHeader::from(header.clone());
+
+    let block = Block::new(partial_header.clone(), body.transactions, body.ommers);
+
+    ensure!(
+        block.header.transactions_root == header.transactions_root,
+        "root mismatch: expected in header {:?}, computed {:?}",
+        header.transactions_root,
+        block.header.transactions_root
+    );
+    ensure!(
+        block.header.ommers_hash == header.ommers_hash,
+        "root mismatch: expected in header {:?}, computed {:?}",
+        header.ommers_hash,
+        block.header.ommers_hash
+    );
+
+    println!("{:?}", partial_header);
+    println!("OMMERS:");
+    for (i, v) in block.ommers.into_iter().enumerate() {
+        println!("[{}] {:?}", i, v);
+    }
+
+    println!("TRANSACTIONS:");
+    for (i, v) in block.transactions.into_iter().enumerate() {
+        println!("[{}/{:?}] {:?}", i, v.hash(), v);
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let opt: Opt = Opt::from_args();
@@ -292,18 +389,17 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     match opt.command {
-        OptCommand::DbStats { csv } => table_sizes(opt.data_dir.0, csv).await?,
-        OptCommand::Blockhashes => blockhashes(opt.data_dir.0).await?,
-        OptCommand::DbQuery { table, key } => db_query(opt.data_dir.0, table, key).await?,
+        OptCommand::DbStats { csv } => table_sizes(opt.data_dir, csv).await?,
+        OptCommand::Blockhashes => blockhashes(opt.data_dir).await?,
+        OptCommand::DbQuery { table, key } => db_query(opt.data_dir, table, key).await?,
         OptCommand::DbWalk {
             table,
             starting_key,
             max_entries,
-        } => db_walk(opt.data_dir.0, table, starting_key, max_entries).await?,
+        } => db_walk(opt.data_dir, table, starting_key, max_entries).await?,
         OptCommand::CheckEqual { db1, db2, table } => check_table_eq(db1, db2, table).await?,
-        OptCommand::HeaderDownload { opts } => {
-            header_download(opt.data_dir.0.clone(), opts).await?
-        }
+        OptCommand::HeaderDownload { opts } => header_download(opt.data_dir, opts).await?,
+        OptCommand::ReadBlock { block_number } => read_block(opt.data_dir, block_number).await?,
     }
 
     Ok(())

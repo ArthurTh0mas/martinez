@@ -2,23 +2,22 @@ use crate::{
     accessors,
     consensus::engine_factory,
     execution::{analysis_cache::AnalysisCache, processor::ExecutionProcessor},
-    kv::tables,
+    h256_to_u256,
+    kv::{tables, traits::*},
     models::*,
-    stagedsync::{
-        format_duration,
-        stage::{ExecOutput, Stage, StageInput},
-        stages::EXECUTION,
-    },
-    Buffer, Cursor, MutableTransaction,
+    stagedsync::{format_duration, stage::*, stages::EXECUTION},
+    upsert_storage_value, Buffer,
 };
 use anyhow::{format_err, Context};
 use async_trait::async_trait;
 use std::time::{Duration, Instant};
+use tokio_stream::StreamExt;
 use tracing::*;
 
 #[derive(Debug)]
 pub struct Execution {
     pub batch_size: u64,
+    pub history_batch_size: u64,
     pub exit_after_batch: bool,
     pub batch_until: Option<BlockNumber>,
     pub commit_every: Option<Duration>,
@@ -31,6 +30,7 @@ async fn execute_batch_of_blocks<'db, Tx: MutableTransaction<'db>>(
     chain_config: ChainSpec,
     max_block: BlockNumber,
     batch_size: u64,
+    history_batch_size: u64,
     batch_until: Option<BlockNumber>,
     commit_every: Option<Duration>,
     starting_block: BlockNumber,
@@ -44,6 +44,7 @@ async fn execute_batch_of_blocks<'db, Tx: MutableTransaction<'db>>(
     let mut block_number = starting_block;
     let mut gas_since_start = 0;
     let mut gas_since_last_message = 0;
+    let mut gas_since_history_commit = 0;
     let batch_started_at = Instant::now();
     let first_started_at_gas = tx
         .get(
@@ -90,6 +91,12 @@ async fn execute_batch_of_blocks<'db, Tx: MutableTransaction<'db>>(
 
         gas_since_start += header.gas_used;
         gas_since_last_message += header.gas_used;
+        gas_since_history_commit += header.gas_used;
+
+        if gas_since_history_commit >= history_batch_size {
+            buffer.write_history().await?;
+            gas_since_history_commit = 0;
+        }
 
         let now = Instant::now();
 
@@ -199,6 +206,7 @@ impl<'db, RwTx: MutableTransaction<'db>> Stage<'db, RwTx> for Execution {
                 chain_config,
                 max_block,
                 self.batch_size,
+                self.history_batch_size,
                 self.batch_until,
                 self.commit_every,
                 starting_block,
@@ -227,12 +235,54 @@ impl<'db, RwTx: MutableTransaction<'db>> Stage<'db, RwTx> for Execution {
         &self,
         tx: &'tx mut RwTx,
         input: crate::stagedsync::stage::UnwindInput,
-    ) -> anyhow::Result<()>
+    ) -> anyhow::Result<UnwindOutput>
     where
         'db: 'tx,
     {
-        let _ = tx;
-        let _ = input;
-        todo!()
+        info!("Unwinding accounts");
+        let mut account_cursor = tx.mutable_cursor(&tables::Account).await?;
+
+        let mut account_cs_cursor = tx.mutable_cursor(&tables::AccountChangeSet).await?;
+        let mut account_walker = account_cs_cursor.walk_back(None);
+        while let Some((block_number, tables::AccountChange { address, account })) =
+            account_walker.try_next().await?
+        {
+            if block_number == input.unwind_to {
+                break;
+            }
+
+            if let Some(account) = account {
+                account_cursor.put(address, account).await?;
+            } else if account_cursor.seek(address).await?.is_some() {
+                account_cursor.delete_current().await?;
+            }
+        }
+
+        info!("Unwinding storage");
+        let mut storage_cursor = tx.mutable_cursor_dupsort(&tables::Storage).await?;
+
+        let mut storage_cs_cursor = tx.mutable_cursor(&tables::StorageChangeSet).await?;
+        let mut storage_walker = storage_cs_cursor.walk_back(None);
+
+        while let Some((
+            tables::StorageChangeKey {
+                block_number,
+                address,
+            },
+            tables::StorageChange { location, value },
+        )) = storage_walker.try_next().await?
+        {
+            if block_number == input.unwind_to {
+                break;
+            }
+
+            upsert_storage_value(&mut storage_cursor, address, h256_to_u256(location), value)
+                .await?;
+        }
+
+        Ok(UnwindOutput {
+            stage_progress: input.unwind_to,
+            must_commit: true,
+        })
     }
 }

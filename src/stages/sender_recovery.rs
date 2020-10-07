@@ -4,10 +4,7 @@ use crate::{
         traits::{Cursor, MutableCursor, TableEncode},
     },
     models::*,
-    stagedsync::{
-        format_duration,
-        stage::{ExecOutput, Stage, StageInput, UnwindInput},
-    },
+    stagedsync::{format_duration, stage::*},
     MutableTransaction, StageId,
 };
 use async_trait::async_trait;
@@ -36,13 +33,15 @@ where
     where
         'db: 'tx,
     {
+        let original_highest_block = input.stage_progress.unwrap_or(BlockNumber(0));
+        let mut highest_block = original_highest_block;
+
         const BUFFERING_FACTOR: usize = 5000;
         let mut body_cur = tx.cursor(&tables::BlockBody).await?;
         let mut tx_cur = tx.cursor(&tables::BlockTransaction.erased()).await?;
         let mut senders_cur = tx.mutable_cursor(&tables::TxSender.erased()).await?;
         senders_cur.last().await?;
 
-        let mut highest_block = input.stage_progress.unwrap_or(BlockNumber(0));
         let mut walker = body_cur.walk(Some(BlockNumber(highest_block.0 + 1)));
         let mut batch = Vec::with_capacity(BUFFERING_FACTOR);
         let started_at = Instant::now();
@@ -153,15 +152,32 @@ where
         Ok(ExecOutput::Progress {
             stage_progress: highest_block,
             done,
-            must_commit: true,
+            must_commit: highest_block > original_highest_block,
         })
     }
 
-    async fn unwind<'tx>(&self, _tx: &'tx mut RwTx, _input: UnwindInput) -> anyhow::Result<()>
+    async fn unwind<'tx>(
+        &self,
+        tx: &'tx mut RwTx,
+        input: UnwindInput,
+    ) -> anyhow::Result<UnwindOutput>
     where
         'db: 'tx,
     {
-        todo!()
+        let mut senders_cur = tx.mutable_cursor(&tables::TxSender).await?;
+
+        while let Some(((block_number, _), _)) = senders_cur.last().await? {
+            if block_number > input.unwind_to {
+                senders_cur.delete_current().await?;
+            } else {
+                break;
+            }
+        }
+
+        Ok(UnwindOutput {
+            stage_progress: input.unwind_to,
+            must_commit: true,
+        })
     }
 }
 

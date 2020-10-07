@@ -7,61 +7,57 @@ use super::{
 };
 use crate::{
     downloader::{
-        headers::stage_stream::{make_stage_stream, StageStream},
-        ui_system::UISystem,
+        headers::{
+            header_slices::align_block_num_to_slice_start,
+            stage_stream::{make_stage_stream, StageStream},
+        },
+        ui_system::{UISystemShared, UISystemViewScope},
     },
     kv,
     models::BlockNumber,
     sentry::{chain_config::ChainConfig, messages::BlockHashAndNumber, sentry_client_reactor::*},
 };
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio_stream::{StreamExt, StreamMap};
 use tracing::*;
 
+#[derive(Debug)]
 pub struct DownloaderLinear {
     chain_config: ChainConfig,
-    start_block_num: BlockNumber,
-    start_block_hash: ethereum_types::H256,
-    estimated_top_block_num: Option<BlockNumber>,
     mem_limit: usize,
     sentry: SentryClientReactorShared,
-    ui_system: Arc<Mutex<UISystem>>,
+}
+
+pub struct DownloaderLinearReport {
+    pub loaded_count: usize,
+    pub final_block_num: BlockNumber,
+    pub target_final_block_num: BlockNumber,
+    pub estimated_top_block_num: BlockNumber,
 }
 
 impl DownloaderLinear {
     pub fn new(
         chain_config: ChainConfig,
-        start_block_id: BlockHashAndNumber,
-        estimated_top_block_num: Option<BlockNumber>,
         mem_limit: usize,
         sentry: SentryClientReactorShared,
-        ui_system: Arc<Mutex<UISystem>>,
     ) -> Self {
         Self {
             chain_config,
-            start_block_num: start_block_id.number,
-            start_block_hash: start_block_id.hash,
-            estimated_top_block_num,
             mem_limit,
             sentry,
-            ui_system,
         }
     }
 
-    async fn estimate_top_block_num(&self) -> anyhow::Result<BlockNumber> {
-        // if estimated in advance
-        if let Some(estimated_top_block_num) = self.estimated_top_block_num {
-            return Ok(estimated_top_block_num);
-        }
+    async fn estimate_top_block_num(
+        &self,
+        start_block_num: BlockNumber,
+    ) -> anyhow::Result<BlockNumber> {
         info!("DownloaderLinear: waiting to estimate a top block number...");
         let stage = TopBlockEstimateStage::new(self.sentry.clone());
         while !stage.is_over() && stage.estimated_top_block_num().is_none() {
             stage.execute().await?;
         }
-        let estimated_top_block_num = stage
-            .estimated_top_block_num()
-            .unwrap_or(self.start_block_num);
+        let estimated_top_block_num = stage.estimated_top_block_num().unwrap_or(start_block_num);
         info!(
             "DownloaderLinear: estimated top block number = {}",
             estimated_top_block_num.0
@@ -72,34 +68,52 @@ impl DownloaderLinear {
     pub async fn run<'downloader, 'db: 'downloader, RwTx: kv::traits::MutableTransaction<'db>>(
         &'downloader self,
         db_transaction: &'downloader RwTx,
-    ) -> anyhow::Result<()> {
-        let header_slices_mem_limit = self.mem_limit;
+        start_block_id: BlockHashAndNumber,
+        estimated_top_block_num: Option<BlockNumber>,
+        max_blocks_count: usize,
+        ui_system: UISystemShared,
+    ) -> anyhow::Result<DownloaderLinearReport> {
+        let start_block_num = start_block_id.number;
 
         let trusted_len: u64 = 90_000;
-        let estimated_top_block_num = self.estimate_top_block_num().await?.0;
-        let slice_size = header_slices::HEADER_SLICE_SIZE as u64;
-        let header_slices_final_block_num = if estimated_top_block_num > trusted_len {
-            (estimated_top_block_num - trusted_len) / slice_size * slice_size
-        } else {
-            0
+
+        let estimated_top_block_num = match estimated_top_block_num {
+            Some(block_num) => block_num,
+            None => self.estimate_top_block_num(start_block_num).await?,
         };
-        // header_slices_final_block_num >= start_block_num
-        let header_slices_final_block_num = BlockNumber(u64::max(
-            header_slices_final_block_num,
-            self.start_block_num.0,
+
+        let target_final_block_num = if estimated_top_block_num.0 > trusted_len {
+            align_block_num_to_slice_start(BlockNumber(estimated_top_block_num.0 - trusted_len))
+        } else {
+            BlockNumber(0)
+        };
+        let final_block_num = BlockNumber(std::cmp::min(
+            target_final_block_num.0,
+            align_block_num_to_slice_start(BlockNumber(
+                start_block_num.0 + (max_blocks_count as u64),
+            ))
+            .0,
         ));
 
+        if start_block_num.0 >= final_block_num.0 {
+            return Ok(DownloaderLinearReport {
+                loaded_count: 0,
+                final_block_num: start_block_num,
+                target_final_block_num,
+                estimated_top_block_num,
+            });
+        }
+
         let header_slices = Arc::new(HeaderSlices::new(
-            header_slices_mem_limit,
-            self.start_block_num,
-            header_slices_final_block_num,
+            self.mem_limit,
+            start_block_num,
+            final_block_num,
         ));
         let sentry = self.sentry.clone();
 
         let header_slices_view = HeaderSlicesView::new(header_slices.clone(), "DownloaderLinear");
-        self.ui_system
-            .try_lock()?
-            .set_view(Some(Box::new(header_slices_view)));
+        let _header_slices_view_scope =
+            UISystemViewScope::new(&ui_system, Box::new(header_slices_view));
 
         // Downloading happens with several stages where
         // each of the stages processes blocks in one status,
@@ -123,8 +137,8 @@ impl DownloaderLinear {
         let verify_link_stage = VerifyStageLinearLink::new(
             header_slices.clone(),
             self.chain_config.clone(),
-            self.start_block_num,
-            self.start_block_hash,
+            start_block_num,
+            start_block_id.hash,
         );
         let penalize_stage = PenalizeStage::new(header_slices.clone(), sentry.clone());
         let save_stage = SaveStage::<RwTx>::new(header_slices.clone(), db_transaction);
@@ -164,6 +178,13 @@ impl DownloaderLinear {
             header_slices.notify_status_watchers();
         }
 
-        Ok(())
+        let report = DownloaderLinearReport {
+            loaded_count: (header_slices.min_block_num().0 - start_block_num.0) as usize,
+            final_block_num: header_slices.min_block_num(),
+            target_final_block_num,
+            estimated_top_block_num,
+        };
+
+        Ok(report)
     }
 }
