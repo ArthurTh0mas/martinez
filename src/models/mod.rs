@@ -24,6 +24,7 @@ pub use ethereum_types::Address;
 pub const KECCAK_LENGTH: usize = H256::len_bytes();
 pub const ADDRESS_LENGTH: usize = Address::len_bytes();
 pub const BLOCK_NUMBER_LENGTH: usize = size_of::<u64>();
+pub const INCARNATION_LENGTH: usize = size_of::<u64>();
 
 macro_rules! u64_wrapper {
     ($ty:ident) => {
@@ -87,6 +88,7 @@ macro_rules! u64_wrapper {
 u64_wrapper!(BlockNumber);
 u64_wrapper!(ChainId);
 u64_wrapper!(NetworkId);
+u64_wrapper!(Incarnation);
 u64_wrapper!(TxIndex);
 
 #[allow(non_upper_case_globals)]

@@ -1,8 +1,10 @@
-use super::header::BlockHeader;
-use crate::{models::BlockNumber, sentry::sentry_client::PeerId};
+use crate::{
+    models::{BlockHeader as Header, BlockNumber},
+    sentry::sentry_client::PeerId,
+};
 use parking_lot::RwLock;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, LinkedList},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
@@ -33,7 +35,7 @@ pub enum HeaderSliceStatus {
 pub struct HeaderSlice {
     pub start_block_num: BlockNumber,
     pub status: HeaderSliceStatus,
-    pub headers: Option<Vec<BlockHeader>>,
+    pub headers: Option<Vec<Header>>,
     pub from_peer_id: Option<PeerId>,
     pub request_time: Option<time::Instant>,
     pub request_attempt: u16,
@@ -53,14 +55,14 @@ struct HeaderSliceStatusWatch {
 /// HeaderSlice 1: headers 192-384
 /// HeaderSlice 2: headers 384-576
 pub struct HeaderSlices {
-    slices: RwLock<VecDeque<Arc<RwLock<HeaderSlice>>>>,
+    slices: RwLock<LinkedList<Arc<RwLock<HeaderSlice>>>>,
     max_slices: usize,
     max_block_num: AtomicU64,
     final_block_num: BlockNumber,
     state_watches: HashMap<HeaderSliceStatus, HeaderSliceStatusWatch>,
 }
 
-pub(super) const HEADER_SLICE_SIZE: usize = 192;
+pub const HEADER_SLICE_SIZE: usize = 192;
 
 const ATOMIC_ORDERING: Ordering = Ordering::SeqCst;
 
@@ -70,7 +72,7 @@ impl HeaderSlices {
         start_block_num: BlockNumber,
         final_block_num: BlockNumber,
     ) -> Self {
-        let max_slices = mem_limit / std::mem::size_of::<BlockHeader>() / HEADER_SLICE_SIZE;
+        let max_slices = mem_limit / std::mem::size_of::<Header>() / HEADER_SLICE_SIZE;
 
         assert_eq!(
             (start_block_num.0 as usize) % HEADER_SLICE_SIZE,
@@ -86,7 +88,7 @@ impl HeaderSlices {
         let total_block_num = final_block_num.0 as usize - start_block_num.0 as usize;
         let max_slices = std::cmp::min(max_slices, total_block_num / HEADER_SLICE_SIZE);
 
-        let mut slices = VecDeque::new();
+        let mut slices = LinkedList::new();
         for i in 0..max_slices {
             let slice = HeaderSlice {
                 start_block_num: BlockNumber(start_block_num.0 + (i * HEADER_SLICE_SIZE) as u64),
@@ -141,18 +143,17 @@ impl HeaderSlices {
             .collect::<Vec<HeaderSliceStatus>>()
     }
 
-    pub fn for_each<F>(&self, f: F)
+    pub fn for_each<F>(&self, mut f: F) -> anyhow::Result<()>
     where
-        F: FnMut(&Arc<RwLock<HeaderSlice>>),
+        F: FnMut(&RwLock<HeaderSlice>) -> Option<anyhow::Result<()>>,
     {
-        self.slices.read().iter().for_each(f);
-    }
-
-    pub fn try_fold<B, C, F>(&self, init: C, f: F) -> std::ops::ControlFlow<B, C>
-    where
-        F: FnMut(C, &Arc<RwLock<HeaderSlice>>) -> std::ops::ControlFlow<B, C>,
-    {
-        self.slices.read().iter().try_fold(init, f)
+        for slice_lock in self.slices.read().iter() {
+            let result_opt = f(slice_lock);
+            if let Some(result) = result_opt {
+                return result;
+            }
+        }
+        Ok(())
     }
 
     pub fn find_by_start_block_num(
@@ -174,38 +175,28 @@ impl HeaderSlices {
             .map(Arc::clone)
     }
 
-    pub fn find_batch_by_status(
-        &self,
-        status: HeaderSliceStatus,
-        batch_size: usize,
-    ) -> Vec<Arc<RwLock<HeaderSlice>>> {
-        let mut batch = Vec::new();
+    pub fn find_first(&self) -> Option<Arc<RwLock<HeaderSlice>>> {
         let slices = self.slices.read();
-        for slice_lock in slices.iter() {
-            let slice = slice_lock.read();
-            if slice.status == status {
-                batch.push(slice_lock.clone());
-                if batch.len() == batch_size {
-                    break;
-                }
-            }
-        }
-        batch
+        slices.front().map(Arc::clone)
+    }
+
+    pub fn find_by_index(&self, index: usize) -> Option<Arc<RwLock<HeaderSlice>>> {
+        let slices = self.slices.read();
+        slices.iter().nth(index).map(Arc::clone)
     }
 
     pub fn remove(&self, status: HeaderSliceStatus) {
         let mut slices = self.slices.write();
-
-        let mut cursor = 0;
+        let mut cursor = slices.cursor_front_mut();
         let mut count: usize = 0;
 
-        while cursor < slices.len() {
-            let current_status = slices[cursor].read().status;
+        while cursor.current().is_some() {
+            let current_status = cursor.current().unwrap().read().status;
             if current_status == status {
-                slices.remove(cursor);
+                cursor.remove_current();
                 count += 1;
             } else {
-                cursor += 1;
+                cursor.move_next();
             }
         }
 
@@ -307,9 +298,4 @@ impl HeaderSlices {
     pub fn is_empty_at_final_position(&self) -> bool {
         (self.max_block_num() >= self.final_block_num) && self.slices.read().is_empty()
     }
-}
-
-pub fn align_block_num_to_slice_start(num: BlockNumber) -> BlockNumber {
-    let slice_size = HEADER_SLICE_SIZE as u64;
-    BlockNumber(num.0 / slice_size * slice_size)
 }

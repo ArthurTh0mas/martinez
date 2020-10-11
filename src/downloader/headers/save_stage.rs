@@ -1,18 +1,15 @@
-use super::{
-    header::BlockHeader,
-    header_slice_status_watch::HeaderSliceStatusWatch,
-    header_slices::{HeaderSlice, HeaderSliceStatus, HeaderSlices},
-};
 use crate::{
+    downloader::headers::{
+        header_slice_status_watch::HeaderSliceStatusWatch,
+        header_slices::{HeaderSlice, HeaderSliceStatus, HeaderSlices},
+    },
     kv,
     kv::{tables::HeaderKey, traits::MutableTransaction},
+    models::BlockHeader,
 };
 use anyhow::format_err;
 use parking_lot::RwLock;
-use std::{
-    ops::{ControlFlow, DerefMut},
-    sync::Arc,
-};
+use std::{ops::DerefMut, sync::Arc};
 use tracing::*;
 
 /// Saves slices into the database, and sets Saved status.
@@ -60,18 +57,12 @@ impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>> SaveStage<'tx, RwTx> {
 
     async fn save_pending_monotonic(&mut self, pending_count: usize) -> anyhow::Result<usize> {
         let mut saved_count: usize = 0;
-        for _ in 0..pending_count {
-            let initial_value = Option::<Arc<RwLock<HeaderSlice>>>::None;
-            let next_slice_lock = self.header_slices.try_fold(initial_value, |_, slice_lock| {
-                let slice = slice_lock.read();
-                match slice.status {
-                    HeaderSliceStatus::Saved => ControlFlow::Continue(None),
-                    HeaderSliceStatus::Verified => ControlFlow::Break(Some(slice_lock.clone())),
-                    _ => ControlFlow::Break(None),
-                }
-            });
-
-            if let ControlFlow::Break(Some(slice_lock)) = next_slice_lock {
+        for i in 0..pending_count {
+            let slice_lock = self.header_slices.find_by_index(i).ok_or_else(|| {
+                format_err!("SaveStage: inconsistent state - less pending slices than expected")
+            })?;
+            let is_verified = slice_lock.read().status == HeaderSliceStatus::Verified;
+            if is_verified {
                 self.save_slice(slice_lock).await?;
                 saved_count += 1;
             } else {
@@ -126,14 +117,12 @@ impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>> SaveStage<'tx, RwTx> {
     }
 
     async fn save_header(&self, header: BlockHeader, tx: &RwTx) -> anyhow::Result<()> {
-        let block_num = header.number();
+        let block_num = header.number;
         let header_hash = header.hash();
         let header_key: HeaderKey = (block_num, header_hash);
-        let total_difficulty = header.difficulty();
+        let total_difficulty = header.difficulty;
 
-        // saving a precomputed RLP representation
-        tx.set(&HeaderTableWithBytes, header_key, header.rlp_repr())
-            .await?;
+        tx.set(&kv::tables::Header, header_key, header).await?;
         tx.set(&kv::tables::HeaderNumber, header_hash, block_num)
             .await?;
         tx.set(&kv::tables::CanonicalHeader, block_num, header_hash)
@@ -148,20 +137,6 @@ impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>> SaveStage<'tx, RwTx> {
             .await?;
 
         Ok(())
-    }
-}
-
-#[derive(Debug)]
-struct HeaderTableWithBytes;
-
-impl kv::traits::Table for HeaderTableWithBytes {
-    type Key = <kv::tables::Header as kv::traits::Table>::Key;
-    type Value = bytes::Bytes;
-    type SeekKey = <kv::tables::Header as kv::traits::Table>::SeekKey;
-
-    fn db_name(&self) -> string::String<bytes::Bytes> {
-        let table = kv::tables::Header;
-        table.db_name()
     }
 }
 

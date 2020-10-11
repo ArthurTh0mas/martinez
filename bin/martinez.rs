@@ -1,21 +1,18 @@
 use martinez::{
     binutil::MartinezDataDir,
-    downloader::sentry_status_provider::SentryStatusProvider,
     kv::{
         tables,
         traits::{MutableKV, KV},
         TableEncode,
     },
     models::*,
-    sentry::{
-        sentry_client_connector::SentryClientConnectorImpl,
-        sentry_client_reactor::SentryClientReactor,
+    stagedsync::{
+        self,
+        stage::{ExecOutput, Stage, StageInput, UnwindInput},
     },
-    stagedsync::{self, stage::*},
     stages::*,
     version_string, Cursor, MutableCursor, MutableTransaction, StageId, Transaction,
 };
-use anyhow::bail;
 use async_trait::async_trait;
 use rayon::prelude::*;
 use std::{
@@ -33,43 +30,19 @@ use tracing_subscriber::{prelude::*, EnvFilter};
 pub struct Opt {
     /// Path to Erigon database directory, where to get blocks from.
     #[structopt(long = "erigon-datadir", parse(from_os_str))]
-    pub erigon_data_dir: Option<PathBuf>,
+    pub erigon_data_dir: PathBuf,
 
     /// Path to Martinez database directory.
     #[structopt(long = "datadir", help = "Database directory path", default_value)]
     pub data_dir: MartinezDataDir,
 
-    /// Name of the testnet to join
-    #[structopt(
-        long = "chain",
-        help = "Name of the testnet to join",
-        default_value = "mainnet"
-    )]
-    pub chain_name: String,
-
-    /// Sentry GRPC service URL
-    #[structopt(
-        long = "sentry.api.addr",
-        help = "Sentry GRPC service URL as 'http://host:port'",
-        default_value = "http://localhost:8000"
-    )]
-    pub sentry_api_addr: martinez::sentry::sentry_address::SentryAddress,
-
     /// Last block where to sync to.
     #[structopt(long)]
     pub max_block: Option<BlockNumber>,
 
-    /// Downloader options.
-    #[structopt(flatten)]
-    pub downloader_opts: martinez::downloader::opts::Opts,
-
-    /// Execution batch size (Ggas).
-    #[structopt(long, default_value = "5000")]
+    /// Execution batch size (Mgas).
+    #[structopt(long, default_value = "10000000")]
     pub execution_batch_size: u64,
-
-    /// Execution history batch size (Ggas).
-    #[structopt(long, default_value = "250")]
-    pub execution_history_batch_size: u64,
 
     /// Exit execution stage after batch.
     #[structopt(long, env)]
@@ -105,8 +78,7 @@ where
     where
         'db: 'tx,
     {
-        let original_highest_block = input.stage_progress.unwrap_or(BlockNumber(0));
-        let mut highest_block = original_highest_block;
+        let mut highest_block = input.stage_progress.unwrap_or(BlockNumber(0));
 
         let erigon_tx = self.db.begin().await?;
 
@@ -117,15 +89,12 @@ where
         let mut erigon_td_cur = erigon_tx.cursor(&tables::HeadersTotalDifficulty).await?;
         let mut td_cur = tx.mutable_cursor(&tables::HeadersTotalDifficulty).await?;
 
-        if erigon_tx
-            .get(&tables::CanonicalHeader, highest_block)
-            .await?
-            != tx.get(&tables::CanonicalHeader, highest_block).await?
-        {
-            return Ok(ExecOutput::Unwind {
-                unwind_to: BlockNumber(highest_block.0 - 1),
-            });
-        }
+        assert_eq!(
+            erigon_tx
+                .get(&tables::CanonicalHeader, highest_block)
+                .await?,
+            tx.get(&tables::CanonicalHeader, highest_block).await?
+        );
 
         let mut walker = erigon_canonical_cur.walk(Some(highest_block + 1));
         while let Some((block_number, canonical_hash)) = walker.try_next().await? {
@@ -165,11 +134,11 @@ where
         Ok(ExecOutput::Progress {
             stage_progress: highest_block,
             done: true,
-            must_commit: highest_block > original_highest_block,
+            must_commit: true,
         })
     }
 
-    async fn unwind<'tx>(&self, _: &'tx mut RwTx, _: UnwindInput) -> anyhow::Result<UnwindOutput>
+    async fn unwind<'tx>(&self, _: &'tx mut RwTx, _: UnwindInput) -> anyhow::Result<()>
     where
         'db: 'tx,
     {
@@ -202,23 +171,9 @@ where
     where
         'db: 'tx,
     {
-        let original_highest_block = input.stage_progress.unwrap_or(BlockNumber(0));
-        let mut highest_block = original_highest_block;
-
         const MAX_TXS_PER_BATCH: usize = 500_000;
         const BUFFERING_FACTOR: usize = 500_000;
         let erigon_tx = self.db.begin().await?;
-
-        if erigon_tx
-            .get(&tables::CanonicalHeader, highest_block)
-            .await?
-            != tx.get(&tables::CanonicalHeader, highest_block).await?
-        {
-            return Ok(ExecOutput::Unwind {
-                unwind_to: BlockNumber(highest_block.0 - 1),
-            });
-        }
-
         let mut canonical_header_cur = tx.cursor(&tables::CanonicalHeader).await?;
 
         let mut erigon_body_cur = erigon_tx.cursor(&tables::BlockBody).await?;
@@ -229,6 +184,7 @@ where
             .mutable_cursor(&tables::BlockTransaction.erased())
             .await?;
 
+        let mut highest_block = input.stage_progress.unwrap_or(BlockNumber(0));
         let prev_body = tx
             .get(
                 &tables::BlockBody,
@@ -243,7 +199,7 @@ where
             .unwrap();
 
         let mut starting_index = prev_body.base_tx_id + prev_body.tx_amount as u64;
-        let mut canonical_header_walker = canonical_header_cur.walk(Some(highest_block + 1));
+        let mut walker = canonical_header_cur.walk(Some(highest_block + 1));
         let mut batch = Vec::with_capacity(BUFFERING_FACTOR);
         let mut converted = Vec::with_capacity(BUFFERING_FACTOR);
 
@@ -254,39 +210,17 @@ where
         let done = loop {
             let mut no_more_bodies = false;
             let mut accum_txs = 0;
-            while let Some((block_num, block_hash)) = canonical_header_walker.try_next().await? {
+            while let Some((block_num, block_hash)) = walker.try_next().await? {
                 if let Some((_, body)) = erigon_body_cur.seek_exact((block_num, block_hash)).await?
                 {
                     let base_tx_id = body.base_tx_id;
-                    let block_tx_base_key = base_tx_id.encode();
+                    let block_tx_base_key = base_tx_id.encode().to_vec();
 
                     let txs = erigon_tx_cur
-                        .walk(Some(block_tx_base_key.to_vec()))
+                        .walk(Some(block_tx_base_key))
                         .take(body.tx_amount)
                         .collect::<anyhow::Result<Vec<_>>>()
                         .await?;
-
-                    if let Some((txkey, _)) = txs.first() {
-                        if *txkey != block_tx_base_key {
-                            bail!(
-                                "Base txkey mismatch for block #{}/{}: {:?} != {:?}",
-                                block_num,
-                                block_hash,
-                                txkey,
-                                block_tx_base_key
-                            );
-                        }
-                    }
-
-                    if txs.len() != body.tx_amount {
-                        bail!(
-                            "Invalid tx amount in Erigon for block #{}/{}: {} != {}",
-                            block_num,
-                            block_hash,
-                            body.tx_amount,
-                            txs.len()
-                        );
-                    }
 
                     accum_txs += body.tx_amount;
                     batch.push((block_num, block_hash, body, txs));
@@ -345,10 +279,6 @@ where
                 }
             }
 
-            if no_more_bodies {
-                break true;
-            }
-
             let now = Instant::now();
             let elapsed = now - started_at;
             if elapsed > Duration::from_secs(30) {
@@ -368,10 +298,10 @@ where
         Ok(ExecOutput::Progress {
             stage_progress: highest_block,
             done,
-            must_commit: highest_block > original_highest_block,
+            must_commit: true,
         })
     }
-    async fn unwind<'tx>(&self, _: &'tx mut RwTx, _: UnwindInput) -> anyhow::Result<UnwindOutput>
+    async fn unwind<'tx>(&self, _: &'tx mut RwTx, _: UnwindInput) -> anyhow::Result<()>
     where
         'db: 'tx,
     {
@@ -419,18 +349,11 @@ where
             },
         )
     }
-    async fn unwind<'tx>(
-        &self,
-        _: &'tx mut RwTx,
-        input: UnwindInput,
-    ) -> anyhow::Result<UnwindOutput>
+    async fn unwind<'tx>(&self, _: &'tx mut RwTx, _: UnwindInput) -> anyhow::Result<()>
     where
         'db: 'tx,
     {
-        Ok(UnwindOutput {
-            stage_progress: input.unwind_to,
-            must_commit: true,
-        })
+        Ok(())
     }
 }
 
@@ -439,7 +362,6 @@ where
 async fn main() -> anyhow::Result<()> {
     let opt: Opt = Opt::from_args();
 
-    // tracing setup
     let filter = if std::env::var(EnvFilter::DEFAULT_ENV)
         .unwrap_or_default()
         .is_empty()
@@ -465,28 +387,20 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting Martinez ({})", version_string());
 
-    let chains_config = martinez::sentry::chain_config::ChainsConfig::new()?;
-    let chain_config = chains_config.get(&opt.chain_name)?;
+    let erigon_chain_data = opt.erigon_data_dir.join("chaindata");
 
-    // database setup
-    let erigon_db = if let Some(erigon_data_dir) = opt.erigon_data_dir {
-        let erigon_chain_data_dir = erigon_data_dir.join("chaindata");
-        let erigon_db = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
-            mdbx::Environment::new(),
-            &erigon_chain_data_dir,
-            martinez::kv::tables::CHAINDATA_TABLES.clone(),
-        )?;
-        Some(Arc::new(erigon_db))
-    } else {
-        None
-    };
+    let erigon_db = Arc::new(martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
+        mdbx::Environment::new(),
+        &erigon_chain_data,
+        martinez::kv::tables::CHAINDATA_TABLES.clone(),
+    )?);
 
-    std::fs::create_dir_all(&opt.data_dir.0)?;
-    let martinez_chain_data_dir = opt.data_dir.chain_data_dir();
-    let db = martinez::kv::new_database(&martinez_chain_data_dir)?;
+    let martinez_chain_data = opt.data_dir.join("chaindata");
+
+    let db = martinez::kv::new_database(&martinez_chain_data)?;
     async {
         let txn = db.begin_mutable().await?;
-        if martinez::genesis::initialize_genesis(&txn, chain_config.chain_spec().clone()).await? {
+        if martinez::genesis::initialize_genesis(&txn, martinez::res::chainspec::MAINNET.clone()).await? {
             txn.commit().await?;
         }
 
@@ -495,47 +409,23 @@ async fn main() -> anyhow::Result<()> {
     .instrument(span!(Level::INFO, "", " Genesis initialization "))
     .await?;
 
-    let sentry_status_provider = SentryStatusProvider::new(chain_config.clone());
-    // staged sync setup
     let mut staged_sync = stagedsync::StagedSync::new();
     // staged_sync.set_min_progress_to_commit_after_stage(2);
-    if let Some(erigon_db) = erigon_db.clone() {
-        staged_sync.push(ConvertHeaders {
-            db: erigon_db,
-            max_block: opt.max_block,
-        });
-    } else {
-        // sentry setup
-        let mut sentry_reactor = SentryClientReactor::new(
-            Box::new(SentryClientConnectorImpl::new(opt.sentry_api_addr.clone())),
-            sentry_status_provider.current_status_stream(),
-        );
-        sentry_reactor.start()?;
-
-        staged_sync.push(HeaderDownload::new(
-            chain_config,
-            opt.downloader_opts.headers_mem_limit(),
-            opt.downloader_opts.headers_batch_size,
-            sentry_reactor.into_shared(),
-            sentry_status_provider,
-        )?);
-    }
+    staged_sync.push(ConvertHeaders {
+        db: erigon_db.clone(),
+        max_block: opt.max_block,
+    });
+    staged_sync.push(ConvertBodies {
+        db: erigon_db.clone(),
+    });
     staged_sync.push(BlockHashes);
-    if let Some(erigon_db) = erigon_db {
-        staged_sync.push(ConvertBodies { db: erigon_db });
-    } else {
-        // also add body download stage here
-    }
     staged_sync.push(CumulativeIndex);
     staged_sync.push(SenderRecovery);
     staged_sync.push(Execution {
-        batch_size: opt.execution_batch_size.saturating_mul(1_000_000_000_u64),
-        history_batch_size: opt
-            .execution_history_batch_size
-            .saturating_mul(1_000_000_000_u64),
+        batch_size: opt.execution_batch_size.saturating_mul(1_000_000_u64),
         exit_after_batch: opt.execution_exit_after_batch,
         batch_until: None,
-        commit_every: None,
+        commit_every: Some(Duration::from_secs(120)),
         prune_from: BlockNumber(0),
     });
     staged_sync.push(HashState::new(None));

@@ -8,31 +8,27 @@ use super::{
 };
 use crate::{
     downloader::{
-        headers::{
-            header_slices::align_block_num_to_slice_start,
-            stage_stream::{make_stage_stream, StageStream},
-        },
-        ui_system::{UISystemShared, UISystemViewScope},
+        headers::stage_stream::{make_stage_stream, StageStream},
+        ui_system::UISystem,
     },
     kv,
     models::BlockNumber,
-    sentry::sentry_client_reactor::*,
+    sentry::{messages::BlockHashAndNumber, sentry_client_reactor::*},
 };
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tokio_stream::{StreamExt, StreamMap};
 use tracing::*;
 
-#[derive(Debug)]
 pub struct DownloaderPreverified {
-    preverified_hashes_config: PreverifiedHashesConfig,
+    chain_name: String,
     mem_limit: usize,
     sentry: SentryClientReactorShared,
+    ui_system: Arc<Mutex<UISystem>>,
 }
 
 pub struct DownloaderPreverifiedReport {
-    pub loaded_count: usize,
-    pub final_block_num: BlockNumber,
-    pub target_final_block_num: BlockNumber,
+    pub final_block_id: BlockHashAndNumber,
     pub estimated_top_block_num: Option<BlockNumber>,
 }
 
@@ -41,59 +37,44 @@ impl DownloaderPreverified {
         chain_name: String,
         mem_limit: usize,
         sentry: SentryClientReactorShared,
-    ) -> anyhow::Result<Self> {
-        let preverified_hashes_config = PreverifiedHashesConfig::new(&chain_name)?;
-
-        let instance = Self {
-            preverified_hashes_config,
+        ui_system: Arc<Mutex<UISystem>>,
+    ) -> Self {
+        Self {
+            chain_name,
             mem_limit,
             sentry,
-        };
-        Ok(instance)
-    }
-
-    fn target_final_block_num(&self) -> BlockNumber {
-        let slice_size = header_slices::HEADER_SLICE_SIZE as u64;
-        BlockNumber((self.preverified_hashes_config.hashes.len() as u64 - 1) * slice_size)
+            ui_system,
+        }
     }
 
     pub async fn run<'downloader, 'db: 'downloader, RwTx: kv::traits::MutableTransaction<'db>>(
         &'downloader self,
         db_transaction: &'downloader RwTx,
-        start_block_num: BlockNumber,
-        max_blocks_count: usize,
-        ui_system: UISystemShared,
     ) -> anyhow::Result<DownloaderPreverifiedReport> {
-        let start_block_num = align_block_num_to_slice_start(start_block_num);
-        let target_final_block_num = self.target_final_block_num();
-        let final_block_num = BlockNumber(std::cmp::min(
-            target_final_block_num.0,
-            align_block_num_to_slice_start(BlockNumber(
-                start_block_num.0 + (max_blocks_count as u64),
-            ))
-            .0,
-        ));
+        let preverified_hashes_config = PreverifiedHashesConfig::new(&self.chain_name)?;
 
-        if start_block_num.0 >= final_block_num.0 {
-            return Ok(DownloaderPreverifiedReport {
-                loaded_count: 0,
-                final_block_num: start_block_num,
-                target_final_block_num,
-                estimated_top_block_num: None,
-            });
-        }
+        let final_block_num = BlockNumber(
+            ((preverified_hashes_config.hashes.len() - 1) * header_slices::HEADER_SLICE_SIZE)
+                as u64,
+        );
+        let final_block_hash = *preverified_hashes_config.hashes.last().unwrap();
+        let final_block_id = BlockHashAndNumber {
+            number: final_block_num,
+            hash: final_block_hash,
+        };
 
         let header_slices = Arc::new(HeaderSlices::new(
             self.mem_limit,
-            start_block_num,
+            BlockNumber(0),
             final_block_num,
         ));
         let sentry = self.sentry.clone();
 
         let header_slices_view =
             HeaderSlicesView::new(header_slices.clone(), "DownloaderPreverified");
-        let _header_slices_view_scope =
-            UISystemViewScope::new(&ui_system, Box::new(header_slices_view));
+        self.ui_system
+            .try_lock()?
+            .set_view(Some(Box::new(header_slices_view)));
 
         // Downloading happens with several stages where
         // each of the stages processes blocks in one status,
@@ -109,10 +90,8 @@ impl DownloaderPreverified {
         );
         let fetch_receive_stage = FetchReceiveStage::new(header_slices.clone(), sentry.clone());
         let retry_stage = RetryStage::new(header_slices.clone());
-        let verify_stage = VerifyStagePreverified::new(
-            header_slices.clone(),
-            self.preverified_hashes_config.clone(),
-        );
+        let verify_stage =
+            VerifyStagePreverified::new(header_slices.clone(), preverified_hashes_config);
         let penalize_stage = PenalizeStage::new(header_slices.clone(), sentry.clone());
         let save_stage = SaveStage::<RwTx>::new(header_slices.clone(), db_transaction);
         let refill_stage = RefillStage::new(header_slices.clone());
@@ -158,9 +137,7 @@ impl DownloaderPreverified {
         }
 
         let report = DownloaderPreverifiedReport {
-            loaded_count: (header_slices.min_block_num().0 - start_block_num.0) as usize,
-            final_block_num: header_slices.min_block_num(),
-            target_final_block_num,
+            final_block_id,
             estimated_top_block_num: estimated_top_block_num_provider(),
         };
 

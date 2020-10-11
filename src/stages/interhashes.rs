@@ -10,8 +10,8 @@ use crate::{
         traits::{Cursor, CursorDupSort},
         TableEncode,
     },
-    models::{Account, BlockNumber, RlpAccount, EMPTY_ROOT},
-    stagedsync::stage::{ExecOutput, Stage, StageInput, UnwindInput, *},
+    models::{Account, BlockNumber, EncodedAccount, Incarnation, RlpAccount, EMPTY_ROOT},
+    stagedsync::stage::{ExecOutput, Stage, StageInput, UnwindInput},
     stages::stage_util::should_do_clean_promotion,
     MutableTransaction, StageId,
 };
@@ -246,10 +246,14 @@ struct StorageTrieCollector<'co> {
 }
 
 impl<'co> StorageTrieCollector<'co> {
-    fn new(collector: &'co mut Collector<tables::TrieStorage>, hashed_address: H256) -> Self {
+    fn new(
+        collector: &'co mut Collector<tables::TrieStorage>,
+        hashed_address: H256,
+        incarnation: Incarnation,
+    ) -> Self {
         Self {
             collector,
-            path_prefix: TableEncode::encode(hashed_address).to_vec(),
+            path_prefix: TableEncode::encode((hashed_address, incarnation)).to_vec(),
         }
     }
 }
@@ -390,13 +394,14 @@ where
 fn build_storage_trie(
     collector: &mut Collector<tables::TrieStorage>,
     address_hash: H256,
+    incarnation: Incarnation,
     storage: &[(H256, U256)],
 ) -> H256 {
     if storage.is_empty() {
         return EMPTY_ROOT;
     }
 
-    let wrapped_collector = StorageTrieCollector::new(collector, address_hash);
+    let wrapped_collector = StorageTrieCollector::new(collector, address_hash, incarnation);
     let mut builder = TrieBuilder::new(wrapped_collector);
 
     let mut storage_iter = storage.iter().rev();
@@ -456,10 +461,14 @@ where
 
     async fn do_get_prev_account(
         &mut self,
-        value: Option<(H256, Account)>,
+        value: Option<(H256, EncodedAccount)>,
     ) -> anyhow::Result<Option<(H256, RlpAccount)>> {
-        if let Some((address_hash, account)) = value {
-            let storage_root = self.visit_storage(address_hash).await?;
+        if let Some(fused_value) = value {
+            let (address_hash, encoded_account) = fused_value;
+            let account = Account::decode_for_storage(encoded_account.as_ref())?.unwrap();
+            let storage_root = self
+                .visit_storage(address_hash, account.incarnation)
+                .await?;
             Ok(Some((address_hash, account.to_rlp(storage_root))))
         } else {
             Ok(None)
@@ -479,9 +488,13 @@ where
     async fn storage_for_account(
         &mut self,
         address_hash: H256,
+        incarnation: Incarnation,
     ) -> anyhow::Result<Vec<(H256, U256)>> {
         let mut storage = Vec::<(H256, U256)>::new();
-        let mut found = self.storage_cursor.seek_exact(address_hash).await?;
+        let mut found = self
+            .storage_cursor
+            .seek_exact((address_hash, incarnation))
+            .await?;
         while let Some((_, storage_entry)) = found {
             storage.push((storage_entry.0, storage_entry.1));
             found = self.storage_cursor.next_dup().await?;
@@ -489,9 +502,14 @@ where
         Ok(storage)
     }
 
-    async fn visit_storage(&mut self, address_hash: H256) -> anyhow::Result<H256> {
-        let storage = self.storage_for_account(address_hash).await?;
-        let storage_root = build_storage_trie(self.storage_collector, address_hash, &storage);
+    async fn visit_storage(
+        &mut self,
+        address_hash: H256,
+        incarnation: Incarnation,
+    ) -> anyhow::Result<H256> {
+        let storage = self.storage_for_account(address_hash, incarnation).await?;
+        let storage_root =
+            build_storage_trie(self.storage_collector, address_hash, incarnation, &storage);
         Ok(storage_root)
     }
 
@@ -536,9 +554,6 @@ async fn generate_interhashes_with_collectors<'db: 'tx, 'tx, RwTx>(
 where
     RwTx: MutableTransaction<'db>,
 {
-    tx.clear_table(&tables::TrieAccount).await?;
-    tx.clear_table(&tables::TrieStorage).await?;
-
     let mut walker = GenerateWalker::new(tx, collector, storage_collector).await?;
     let mut current = walker.get_last_account().await?;
 
@@ -565,6 +580,9 @@ where
 {
     let _ = from;
     let _ = to;
+
+    tx.clear_table(&tables::TrieAccount).await?;
+    tx.clear_table(&tables::TrieStorage).await?;
 
     generate_interhashes_with_collectors(tx, collector, storage_collector).await
 }
@@ -669,23 +687,13 @@ where
         })
     }
 
-    async fn unwind<'tx>(
-        &self,
-        tx: &'tx mut RwTx,
-        input: UnwindInput,
-    ) -> anyhow::Result<UnwindOutput>
+    async fn unwind<'tx>(&self, tx: &'tx mut RwTx, input: UnwindInput) -> anyhow::Result<()>
     where
         'db: 'tx,
     {
+        let _ = tx;
         let _ = input;
-        // TODO: proper unwind
-        tx.clear_table(&tables::TrieAccount).await?;
-        tx.clear_table(&tables::TrieStorage).await?;
-
-        Ok(UnwindOutput {
-            stage_progress: BlockNumber(0),
-            must_commit: true,
-        })
+        todo!()
     }
 }
 
@@ -734,10 +742,12 @@ mod tests {
             nonce in any::<u64>(),
             balance in any::<[u8; 32]>(),
             code_hash in any::<[u8; 32]>(),
+            incarnation in any::<u64>(),
         ) -> Account {
             let balance = U256::from(balance);
             let code_hash = H256::from(code_hash);
-            Account { nonce, balance, code_hash }
+            let incarnation = Incarnation::from(incarnation);
+            Account { nonce, balance, code_hash, incarnation }
         }
     }
 
@@ -759,7 +769,8 @@ mod tests {
 
         {
             let mut cursor = tx.mutable_cursor(&tables::HashedAccount).await.unwrap();
-            for (address_hash, account) in accounts {
+            for (address_hash, account_model) in accounts {
+                let account = account_model.encode_for_storage(false);
                 cursor.append(address_hash, account).await.unwrap();
             }
         }
@@ -797,6 +808,7 @@ mod tests {
             nonce: 0,
             balance: U256::zero(),
             code_hash: EMPTY_HASH,
+            incarnation: Incarnation(0),
         };
         accounts.insert(H256::from_low_u64_be(1), account1);
         do_root_matches(accounts).await
@@ -809,16 +821,19 @@ mod tests {
             nonce: 6685434669699468178,
             balance: U256::from(13764859329281365277u128),
             code_hash: EMPTY_HASH,
+            incarnation: Incarnation(38),
         };
         let a2 = Account {
             nonce: 0,
             balance: U256::zero(),
             code_hash: EMPTY_HASH,
+            incarnation: Incarnation(0),
         };
         let a3 = Account {
             nonce: 0,
             balance: U256::zero(),
             code_hash: EMPTY_HASH,
+            incarnation: Incarnation(0),
         };
         accounts.insert(
             H256::from(hex!(
@@ -860,10 +875,10 @@ mod tests {
         }
     }
 
-    fn do_storage_root_matches(storage: Storage, hashed_address: H256) {
+    fn do_storage_root_matches(storage: Storage, hashed_address: H256, incarnation: Incarnation) {
         let mut _collector = Collector::<tables::TrieStorage>::new(OPTIMAL_BUFFER_CAPACITY);
         let vec_storage = storage.iter().map(|(&k, &v)| (k, v)).collect::<Vec<_>>();
-        let actual = build_storage_trie(&mut _collector, hashed_address, &vec_storage);
+        let actual = build_storage_trie(&mut _collector, hashed_address, incarnation, &vec_storage);
         let expected = expected_storage_root(storage);
         assert_eq!(expected, actual);
     }
@@ -873,8 +888,9 @@ mod tests {
         fn storage_root_matches(
             storage in account_storages(),
             hashed_address in prop::array::uniform32(any::<u8>()),
+            incarnation in 0u64..
         ) {
-            do_storage_root_matches(storage, H256(hashed_address));
+            do_storage_root_matches(storage, H256(hashed_address), Incarnation(incarnation));
         }
     }
 
