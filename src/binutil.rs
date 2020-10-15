@@ -6,6 +6,12 @@ use std::{fmt::Display, path::PathBuf};
 
 pub struct MartinezDataDir(pub PathBuf);
 
+impl MartinezDataDir {
+    pub fn chain_data_dir(&self) -> PathBuf {
+        self.0.join("chaindata")
+    }
+}
+
 impl Default for MartinezDataDir {
     fn default() -> Self {
         Self(

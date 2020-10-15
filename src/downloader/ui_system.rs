@@ -1,7 +1,10 @@
 use crate::downloader::ui_view::UIView;
 use parking_lot::Mutex;
 use std::{sync::Arc, time::Duration};
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, Mutex as AsyncMutex},
+    task::JoinHandle,
+};
 use tracing::*;
 
 pub struct UISystem {
@@ -9,6 +12,12 @@ pub struct UISystem {
     event_loop: Option<UISystemEventLoop>,
     event_loop_handle: Option<JoinHandle<()>>,
     stop_signal_sender: mpsc::Sender<()>,
+}
+
+pub type UISystemShared = Arc<tokio::sync::Mutex<UISystem>>;
+
+pub struct UISystemViewScope {
+    ui_system: Arc<AsyncMutex<UISystem>>,
 }
 
 struct UISystemEventLoop {
@@ -71,6 +80,26 @@ impl UISystem {
     }
 }
 
+impl UISystemViewScope {
+    pub fn new(
+        ui_system: &Arc<AsyncMutex<UISystem>>,
+        view: Box<dyn UIView>,
+    ) -> anyhow::Result<Self> {
+        ui_system.try_lock()?.set_view(Some(view));
+        Ok(Self {
+            ui_system: ui_system.clone(),
+        })
+    }
+}
+
+impl Drop for UISystemViewScope {
+    fn drop(&mut self) {
+        if let Ok(ui_system) = self.ui_system.try_lock() {
+            ui_system.set_view(None);
+        }
+    }
+}
+
 impl UISystemEventLoop {
     async fn run(self) -> anyhow::Result<()> {
         let mut stop_signal_receiver = self.stop_signal_receiver;
@@ -92,7 +121,7 @@ impl UISystemEventLoop {
             }
         }
 
-        info!("UISystem stopped");
+        debug!("UISystemEventLoop stopped");
         Ok(())
     }
 }

@@ -4,7 +4,7 @@ use crate::{
 };
 use parking_lot::RwLock;
 use std::{
-    collections::{HashMap, LinkedList},
+    collections::{HashMap, VecDeque},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
@@ -55,14 +55,14 @@ struct HeaderSliceStatusWatch {
 /// HeaderSlice 1: headers 192-384
 /// HeaderSlice 2: headers 384-576
 pub struct HeaderSlices {
-    slices: RwLock<LinkedList<Arc<RwLock<HeaderSlice>>>>,
+    slices: RwLock<VecDeque<Arc<RwLock<HeaderSlice>>>>,
     max_slices: usize,
     max_block_num: AtomicU64,
     final_block_num: BlockNumber,
     state_watches: HashMap<HeaderSliceStatus, HeaderSliceStatusWatch>,
 }
 
-pub const HEADER_SLICE_SIZE: usize = 192;
+pub(super) const HEADER_SLICE_SIZE: usize = 192;
 
 const ATOMIC_ORDERING: Ordering = Ordering::SeqCst;
 
@@ -88,7 +88,7 @@ impl HeaderSlices {
         let total_block_num = final_block_num.0 as usize - start_block_num.0 as usize;
         let max_slices = std::cmp::min(max_slices, total_block_num / HEADER_SLICE_SIZE);
 
-        let mut slices = LinkedList::new();
+        let mut slices = VecDeque::new();
         for i in 0..max_slices {
             let slice = HeaderSlice {
                 start_block_num: BlockNumber(start_block_num.0 + (i * HEADER_SLICE_SIZE) as u64),
@@ -143,17 +143,18 @@ impl HeaderSlices {
             .collect::<Vec<HeaderSliceStatus>>()
     }
 
-    pub fn for_each<F>(&self, mut f: F) -> anyhow::Result<()>
+    pub fn for_each<F>(&self, f: F)
     where
-        F: FnMut(&RwLock<HeaderSlice>) -> Option<anyhow::Result<()>>,
+        F: FnMut(&Arc<RwLock<HeaderSlice>>),
     {
-        for slice_lock in self.slices.read().iter() {
-            let result_opt = f(slice_lock);
-            if let Some(result) = result_opt {
-                return result;
-            }
-        }
-        Ok(())
+        self.slices.read().iter().for_each(f);
+    }
+
+    pub fn try_fold<B, C, F>(&self, init: C, f: F) -> std::ops::ControlFlow<B, C>
+    where
+        F: FnMut(C, &Arc<RwLock<HeaderSlice>>) -> std::ops::ControlFlow<B, C>,
+    {
+        self.slices.read().iter().try_fold(init, f)
     }
 
     pub fn find_by_start_block_num(
@@ -175,28 +176,38 @@ impl HeaderSlices {
             .map(Arc::clone)
     }
 
-    pub fn find_first(&self) -> Option<Arc<RwLock<HeaderSlice>>> {
+    pub fn find_batch_by_status(
+        &self,
+        status: HeaderSliceStatus,
+        batch_size: usize,
+    ) -> Vec<Arc<RwLock<HeaderSlice>>> {
+        let mut batch = Vec::new();
         let slices = self.slices.read();
-        slices.front().map(Arc::clone)
-    }
-
-    pub fn find_by_index(&self, index: usize) -> Option<Arc<RwLock<HeaderSlice>>> {
-        let slices = self.slices.read();
-        slices.iter().nth(index).map(Arc::clone)
+        for slice_lock in slices.iter() {
+            let slice = slice_lock.read();
+            if slice.status == status {
+                batch.push(slice_lock.clone());
+                if batch.len() == batch_size {
+                    break;
+                }
+            }
+        }
+        batch
     }
 
     pub fn remove(&self, status: HeaderSliceStatus) {
         let mut slices = self.slices.write();
-        let mut cursor = slices.cursor_front_mut();
+
+        let mut cursor = 0;
         let mut count: usize = 0;
 
-        while cursor.current().is_some() {
-            let current_status = cursor.current().unwrap().read().status;
+        while cursor < slices.len() {
+            let current_status = slices[cursor].read().status;
             if current_status == status {
-                cursor.remove_current();
+                slices.remove(cursor);
                 count += 1;
             } else {
-                cursor.move_next();
+                cursor += 1;
             }
         }
 
@@ -298,4 +309,9 @@ impl HeaderSlices {
     pub fn is_empty_at_final_position(&self) -> bool {
         (self.max_block_num() >= self.final_block_num) && self.slices.read().is_empty()
     }
+}
+
+pub fn align_block_num_to_slice_start(num: BlockNumber) -> BlockNumber {
+    let slice_size = HEADER_SLICE_SIZE as u64;
+    BlockNumber(num.0 / slice_size * slice_size)
 }
