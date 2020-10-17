@@ -167,7 +167,7 @@ impl InMemoryState {
             .unwrap_or_default()
         {
             if let Some(account) = account {
-                self.accounts.insert(address, account);
+                self.accounts.insert(address, account.clone());
             } else {
                 self.accounts.remove(&address);
             }

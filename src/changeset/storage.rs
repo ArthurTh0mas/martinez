@@ -9,10 +9,14 @@ use ethereum_types::*;
 impl HistoryKind for StorageHistory {
     type Key = (Address, H256);
     type Value = U256;
+    type IndexChunkKey = (Address, H256);
     type IndexTable = tables::StorageHistory;
     type ChangeSetTable = tables::StorageChangeSet;
     type EncodedStream<'cs> = impl EncodedStream<'cs, Self::ChangeSetTable>;
 
+    fn index_chunk_key((address, location): Self::Key) -> Self::IndexChunkKey {
+        (address, location)
+    }
     async fn find<'tx, C>(
         cursor: &mut C,
         block_number: BlockNumber,
@@ -40,7 +44,7 @@ impl HistoryKind for StorageHistory {
     }
 
     fn encode(block_number: BlockNumber, changes: &ChangeSet<Self>) -> Self::EncodedStream<'_> {
-        changes.iter().map(move |(&(address, location), &value)| {
+        changes.iter().map(move |&((address, location), value)| {
             (
                 StorageChangeKey {
                     block_number,
@@ -57,7 +61,7 @@ impl HistoryKind for StorageHistory {
             address,
         }: <Self::ChangeSetTable as Table>::Key,
         StorageChange { location, value }: <Self::ChangeSetTable as Table>::Value,
-    ) -> (BlockNumber, (Self::Key, Self::Value)) {
+    ) -> (BlockNumber, Change<Self::Key, Self::Value>) {
         (block_number, ((address, location), value))
     }
 }
@@ -115,15 +119,15 @@ mod tests {
                 for j in 0..num_of_keys {
                     let key = get_test_data_at_index(i, j);
                     let val = (value_generator)(j);
-                    ch.insert(key, val);
+                    ch.insert((key, val));
                 }
             }
 
             let mut ch2 = StorageChangeSet::new();
 
             for (k, v) in StorageHistory::encode(0.into(), &ch) {
-                let (_, (key, value)) = StorageHistory::decode(k, v);
-                ch2.insert(key, value);
+                let (_, change) = StorageHistory::decode(k, v);
+                ch2.insert(change);
             }
 
             assert_eq!(ch, ch2)
@@ -151,17 +155,15 @@ mod tests {
                 for j in 0..num_of_keys {
                     let key = get_test_data_at_index(i, j);
                     let val = hash_value_generator(j);
-                    ch.insert(key, val);
+                    ch.insert((key, val));
                 }
             }
 
-            for ((_, (transformed_key, transformed_value)), (&original_key, &original_value)) in
-                StorageHistory::encode(0.into(), &ch)
-                    .map(|(k, v)| StorageHistory::decode(k, v))
-                    .zip(&ch)
+            for ((_, transformed), original) in StorageHistory::encode(0.into(), &ch)
+                .map(|(k, v)| StorageHistory::decode(k, v))
+                .zip(&ch)
             {
-                assert_eq!(transformed_key, original_key);
-                assert_eq!(transformed_value, original_value);
+                assert_eq!(transformed, *original);
             }
         };
 
@@ -188,7 +190,9 @@ mod tests {
 
             for i in 0..num_of_elements {
                 for j in 0..num_of_keys {
-                    ch.insert(get_test_data_at_index(i, j), hash_value_generator(j));
+                    let key = get_test_data_at_index(i, j);
+                    let val = hash_value_generator(j);
+                    ch.insert((key, val));
                 }
             }
 
