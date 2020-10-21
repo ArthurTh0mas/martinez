@@ -4,7 +4,7 @@ use bytes::Bytes;
 use ethereum_types::*;
 use evmodin::host::AccessStatus;
 use hex_literal::hex;
-use std::{collections::*, fmt::Debug};
+use std::collections::*;
 
 #[derive(Debug)]
 pub struct Snapshot {
@@ -22,7 +22,6 @@ where
 
     pub(crate) objects: HashMap<Address, Object>,
     pub(crate) storage: HashMap<Address, Storage>,
-    pub(crate) incarnations: HashMap<Address, u64>,
 
     // pointer stability?
     pub(crate) existing_code: HashMap<H256, Bytes>,
@@ -52,7 +51,7 @@ async fn get_object<'m, 'db, S: State>(
 
             if let Some(account) = accdata {
                 Some(entry.insert(Object {
-                    initial: Some(account),
+                    initial: Some(account.clone()),
                     current: Some(account),
                 }))
             } else {
@@ -103,7 +102,6 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
             db,
             objects: Default::default(),
             storage: Default::default(),
-            incarnations: Default::default(),
             existing_code: Default::default(),
             new_code: Default::default(),
             journal: Default::default(),
@@ -151,11 +149,15 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
         let mut current = Account::default();
         let mut initial = None;
 
+        let mut prev_incarnation: Option<Incarnation> = None;
         self.journal.push({
             if let Some(prev) = get_object(self.db, &mut self.objects, address).await? {
-                initial = prev.initial;
+                initial = prev.initial.clone();
                 if let Some(prev_current) = &prev.current {
                     current.balance = prev_current.balance;
+                    prev_incarnation = Some(prev_current.incarnation);
+                } else if let Some(prev_initial) = &prev.initial {
+                    prev_incarnation = Some(prev_initial.incarnation);
                 }
                 Delta::Update {
                     address,
@@ -166,8 +168,12 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
             }
         });
 
-        *self.incarnations.entry(address).or_default() += 1;
-        self.journal.push(Delta::Incarnation { address });
+        let mut prev_incarnation = prev_incarnation.unwrap_or(Incarnation(0));
+        if prev_incarnation.0 == 0 {
+            prev_incarnation = self.db.previous_incarnation(address).await?;
+        }
+
+        current.incarnation = prev_incarnation + 1;
 
         self.objects.insert(
             address,
@@ -193,7 +199,6 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
         // Doesn't create a delta since it's called at the end of a transcation,
         // when we don't need snapshots anymore.
 
-        *self.incarnations.entry(address).or_default() += 1;
         self.storage.remove(&address);
         if let Some(obj) = get_object(self.db, &mut self.objects, address).await? {
             obj.current = None;
@@ -407,7 +412,7 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
         original: bool,
     ) -> anyhow::Result<U256> {
         if let Some(obj) = get_object(self.db, &mut self.objects, address).await? {
-            if obj.current.is_some() {
+            if let Some(current) = &obj.current {
                 let storage = self.storage.entry(address).or_default();
 
                 if !original {
@@ -420,11 +425,13 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
                     return Ok(v.original);
                 }
 
-                if obj.initial.is_none() || self.incarnations.contains_key(&address) {
+                let incarnation = current.incarnation;
+                if obj.initial.is_none() || obj.initial.as_ref().unwrap().incarnation != incarnation
+                {
                     return Ok(U256::zero());
                 }
 
-                let val = self.db.read_storage(address, key).await?;
+                let val = self.db.read_storage(address, incarnation, key).await?;
 
                 self.storage.entry(address).or_default().committed.insert(
                     key,
@@ -486,22 +493,13 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
     pub async fn write_to_db(self, block_number: BlockNumber) -> anyhow::Result<()> {
         self.db.begin_block(block_number);
 
-        for (address, incarnation) in self.incarnations {
-            if incarnation > 0 {
-                for (location, initial) in self.db.all_storage(address).await? {
-                    self.db
-                        .update_storage(address, location, initial, U256::zero())
-                        .await?
-                }
-            }
-        }
-
         for (address, storage) in self.storage {
             if let Some(obj) = self.objects.get(&address) {
-                if obj.current.is_some() {
+                if let Some(current) = &obj.current {
                     for (key, val) in &storage.committed {
+                        let incarnation = current.incarnation;
                         self.db
-                            .update_storage(address, *key, val.initial, val.original)
+                            .update_storage(address, incarnation, *key, val.initial, val.original)
                             .await?;
                     }
                 }
@@ -509,11 +507,26 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
         }
 
         for (address, obj) in self.objects {
-            self.db.update_account(address, obj.initial, obj.current);
-        }
-
-        for (code_hash, code) in self.new_code {
-            self.db.update_code(code_hash, code).await?
+            self.db
+                .update_account(address, obj.initial.clone(), obj.current.clone());
+            if let Some(current) = obj.current {
+                let code_hash = current.code_hash;
+                if code_hash != EMPTY_HASH
+                    && (obj.initial.is_none()
+                        || obj.initial.as_ref().unwrap().incarnation != current.incarnation)
+                {
+                    if let Some(code) = self.new_code.get(&code_hash) {
+                        self.db
+                            .update_account_code(
+                                address,
+                                current.incarnation,
+                                code_hash,
+                                code.clone(),
+                            )
+                            .await?;
+                    }
+                }
+            }
         }
 
         Ok(())

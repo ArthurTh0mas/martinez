@@ -8,31 +8,27 @@ use super::{
 };
 use crate::{
     downloader::{
-        headers::{
-            header_slices::align_block_num_to_slice_start,
-            stage_stream::{make_stage_stream, StageStream},
-        },
-        ui_system::{UISystemShared, UISystemViewScope},
+        headers::stage_stream::{make_stage_stream, StageStream},
+        ui_system::UISystem,
     },
     kv,
     models::BlockNumber,
     sentry::sentry_client_reactor::*,
 };
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tokio_stream::{StreamExt, StreamMap};
 use tracing::*;
 
-#[derive(Debug)]
 pub struct DownloaderPreverified {
     preverified_hashes_config: PreverifiedHashesConfig,
     mem_limit: usize,
     sentry: SentryClientReactorShared,
+    ui_system: Arc<Mutex<UISystem>>,
 }
 
 pub struct DownloaderPreverifiedReport {
-    pub loaded_count: usize,
     pub final_block_num: BlockNumber,
-    pub target_final_block_num: BlockNumber,
     pub estimated_top_block_num: Option<BlockNumber>,
 }
 
@@ -41,6 +37,7 @@ impl DownloaderPreverified {
         chain_name: String,
         mem_limit: usize,
         sentry: SentryClientReactorShared,
+        ui_system: Arc<Mutex<UISystem>>,
     ) -> anyhow::Result<Self> {
         let preverified_hashes_config = PreverifiedHashesConfig::new(&chain_name)?;
 
@@ -48,11 +45,12 @@ impl DownloaderPreverified {
             preverified_hashes_config,
             mem_limit,
             sentry,
+            ui_system,
         };
         Ok(instance)
     }
 
-    fn target_final_block_num(&self) -> BlockNumber {
+    fn final_block_num(&self) -> BlockNumber {
         let slice_size = header_slices::HEADER_SLICE_SIZE as u64;
         BlockNumber((self.preverified_hashes_config.hashes.len() as u64 - 1) * slice_size)
     }
@@ -61,24 +59,14 @@ impl DownloaderPreverified {
         &'downloader self,
         db_transaction: &'downloader RwTx,
         start_block_num: BlockNumber,
-        max_blocks_count: usize,
-        ui_system: UISystemShared,
     ) -> anyhow::Result<DownloaderPreverifiedReport> {
-        let start_block_num = align_block_num_to_slice_start(start_block_num);
-        let target_final_block_num = self.target_final_block_num();
-        let final_block_num = BlockNumber(std::cmp::min(
-            target_final_block_num.0,
-            align_block_num_to_slice_start(BlockNumber(
-                start_block_num.0 + (max_blocks_count as u64),
-            ))
-            .0,
-        ));
+        let slice_size = header_slices::HEADER_SLICE_SIZE as u64;
+        let start_block_num = BlockNumber(start_block_num.0 / slice_size * slice_size);
+        let final_block_num = self.final_block_num();
 
         if start_block_num.0 >= final_block_num.0 {
             return Ok(DownloaderPreverifiedReport {
-                loaded_count: 0,
                 final_block_num: start_block_num,
-                target_final_block_num,
                 estimated_top_block_num: None,
             });
         }
@@ -92,8 +80,9 @@ impl DownloaderPreverified {
 
         let header_slices_view =
             HeaderSlicesView::new(header_slices.clone(), "DownloaderPreverified");
-        let _header_slices_view_scope =
-            UISystemViewScope::new(&ui_system, Box::new(header_slices_view));
+        self.ui_system
+            .try_lock()?
+            .set_view(Some(Box::new(header_slices_view)));
 
         // Downloading happens with several stages where
         // each of the stages processes blocks in one status,
@@ -158,9 +147,7 @@ impl DownloaderPreverified {
         }
 
         let report = DownloaderPreverifiedReport {
-            loaded_count: (header_slices.min_block_num().0 - start_block_num.0) as usize,
             final_block_num: header_slices.min_block_num(),
-            target_final_block_num,
             estimated_top_block_num: estimated_top_block_num_provider(),
         };
 

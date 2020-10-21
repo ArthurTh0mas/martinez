@@ -1,62 +1,84 @@
-use super::sentry_status_provider::SentryStatusProvider;
 use crate::{
-    downloader::headers::downloader::{DownloaderReport, DownloaderRunState},
+    downloader::opts::Opts,
     kv,
     models::BlockNumber,
-    sentry::{chain_config::ChainConfig, sentry_client_reactor::SentryClientReactorShared},
+    sentry::{
+        chain_config::{ChainConfig, ChainsConfig},
+        sentry_client,
+        sentry_client::SentryClient,
+        sentry_client_connector,
+        sentry_client_reactor::SentryClientReactor,
+    },
 };
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Debug)]
 pub struct Downloader {
-    headers_downloader: super::headers::downloader::Downloader,
-    sentry_status_provider: SentryStatusProvider,
+    opts: Opts,
+    chain_config: ChainConfig,
 }
 
 impl Downloader {
-    pub fn new(
-        chain_config: ChainConfig,
-        mem_limit: usize,
-        sentry: SentryClientReactorShared,
-        sentry_status_provider: SentryStatusProvider,
-    ) -> anyhow::Result<Self> {
-        let headers_downloader =
-            super::headers::downloader::Downloader::new(chain_config, mem_limit, sentry)?;
+    pub fn new(opts: Opts, chains_config: ChainsConfig) -> anyhow::Result<Self> {
+        let chain_config = chains_config
+            .get(&opts.chain_name)
+            .ok_or_else(|| anyhow::format_err!("unknown chain '{}'", opts.chain_name))?
+            .clone();
 
-        let instance = Self {
-            headers_downloader,
-            sentry_status_provider,
-        };
-        Ok(instance)
+        Ok(Self { opts, chain_config })
     }
 
     pub async fn run<'downloader, 'db: 'downloader, RwTx: kv::traits::MutableTransaction<'db>>(
         &'downloader self,
+        sentry_client_opt: Option<Box<dyn SentryClient>>,
         db_transaction: &'downloader RwTx,
         start_block_num: BlockNumber,
-        max_blocks_count: usize,
-        previous_run_state: Option<DownloaderRunState>,
-    ) -> anyhow::Result<DownloaderReport> {
-        self.sentry_status_provider.update(db_transaction).await?;
+    ) -> anyhow::Result<BlockNumber> {
+        let status = sentry_client::Status {
+            total_difficulty: ethereum_types::U256::zero(),
+            best_hash: ethereum_types::H256::zero(),
+            chain_fork_config: self.chain_config.clone(),
+            max_block: 0,
+        };
+
+        let sentry_api_addr = self.opts.sentry_api_addr.clone();
+        let sentry_client = match sentry_client_opt {
+            Some(mut test_client) => {
+                test_client.set_status(status.clone()).await?;
+                test_client
+            }
+            None => {
+                sentry_client_connector::connect(sentry_api_addr.clone(), status.clone()).await?
+            }
+        };
+
+        let sentry_connector =
+            sentry_client_connector::make_connector_stream(sentry_client, sentry_api_addr, status);
+        let mut sentry_reactor = SentryClientReactor::new(sentry_connector);
+        sentry_reactor.start()?;
+        let sentry = Arc::new(RwLock::new(sentry_reactor));
 
         let mut ui_system = crate::downloader::ui_system::UISystem::new();
         ui_system.start()?;
         let ui_system = Arc::new(Mutex::new(ui_system));
 
-        let report = self
-            .headers_downloader
-            .run::<RwTx>(
-                db_transaction,
-                start_block_num,
-                max_blocks_count,
-                previous_run_state,
-                ui_system.clone(),
-            )
+        let headers_downloader = super::headers::downloader::Downloader::new(
+            self.chain_config.clone(),
+            sentry.clone(),
+            ui_system.clone(),
+        )?;
+        let final_block_num = headers_downloader
+            .run::<RwTx>(db_transaction, start_block_num)
             .await?;
 
         ui_system.try_lock()?.stop().await?;
 
-        Ok(report)
+        {
+            let mut sentry_reactor = sentry.write().await;
+            sentry_reactor.stop().await?;
+        }
+
+        Ok(final_block_num)
     }
 }

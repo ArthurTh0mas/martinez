@@ -43,7 +43,7 @@ impl PenalizeStage {
             bad_peers
         );
         self.penalize_peers(bad_peers).await?;
-        self.reset_pending();
+        self.reset_pending()?;
 
         debug!("PenalizeStage: done");
         Ok(())
@@ -59,11 +59,12 @@ impl PenalizeStage {
                     None => warn!("PenalizeStage: got an invalid headers slice from an unknown peer starting at: {:?}", slice.start_block_num),
                 }
             }
-        });
+            None
+        })?;
         Ok(peers)
     }
 
-    fn reset_pending(&self) {
+    fn reset_pending(&self) -> anyhow::Result<()> {
         self.header_slices.for_each(|slice_lock| {
             let slice = slice_lock.upgradable_read();
             if slice.status == HeaderSliceStatus::Invalid {
@@ -72,7 +73,8 @@ impl PenalizeStage {
                     .set_slice_status(slice.deref_mut(), HeaderSliceStatus::Empty);
                 slice.headers = None;
             }
-        });
+            None
+        })
     }
 
     async fn penalize_peers(&self, peers: HashSet<PeerId>) -> anyhow::Result<()> {
