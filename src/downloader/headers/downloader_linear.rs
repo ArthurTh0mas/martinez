@@ -11,28 +11,28 @@ use crate::{
             header_slices::align_block_num_to_slice_start,
             stage_stream::{make_stage_stream, StageStream},
         },
-        ui_system::{UISystem, UISystemViewScope},
+        ui_system::{UISystemShared, UISystemViewScope},
     },
     kv,
     models::BlockNumber,
     sentry::{chain_config::ChainConfig, messages::BlockHashAndNumber, sentry_client_reactor::*},
 };
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio_stream::{StreamExt, StreamMap};
 use tracing::*;
 
+#[derive(Debug)]
 pub struct DownloaderLinear {
     chain_config: ChainConfig,
     mem_limit: usize,
     sentry: SentryClientReactorShared,
-    ui_system: Arc<Mutex<UISystem>>,
 }
 
 pub struct DownloaderLinearReport {
     pub loaded_count: usize,
     pub final_block_num: BlockNumber,
     pub target_final_block_num: BlockNumber,
+    pub estimated_top_block_num: BlockNumber,
 }
 
 impl DownloaderLinear {
@@ -40,13 +40,11 @@ impl DownloaderLinear {
         chain_config: ChainConfig,
         mem_limit: usize,
         sentry: SentryClientReactorShared,
-        ui_system: Arc<Mutex<UISystem>>,
     ) -> Self {
         Self {
             chain_config,
             mem_limit,
             sentry,
-            ui_system,
         }
     }
 
@@ -73,18 +71,19 @@ impl DownloaderLinear {
         start_block_id: BlockHashAndNumber,
         estimated_top_block_num: Option<BlockNumber>,
         max_blocks_count: usize,
+        ui_system: UISystemShared,
     ) -> anyhow::Result<DownloaderLinearReport> {
         let start_block_num = start_block_id.number;
 
         let trusted_len: u64 = 90_000;
 
         let estimated_top_block_num = match estimated_top_block_num {
-            Some(block_num) => block_num.0,
-            None => self.estimate_top_block_num(start_block_num).await?.0,
+            Some(block_num) => block_num,
+            None => self.estimate_top_block_num(start_block_num).await?,
         };
 
-        let target_final_block_num = if estimated_top_block_num > trusted_len {
-            align_block_num_to_slice_start(BlockNumber(estimated_top_block_num - trusted_len))
+        let target_final_block_num = if estimated_top_block_num.0 > trusted_len {
+            align_block_num_to_slice_start(BlockNumber(estimated_top_block_num.0 - trusted_len))
         } else {
             BlockNumber(0)
         };
@@ -101,6 +100,7 @@ impl DownloaderLinear {
                 loaded_count: 0,
                 final_block_num: start_block_num,
                 target_final_block_num,
+                estimated_top_block_num,
             });
         }
 
@@ -113,7 +113,7 @@ impl DownloaderLinear {
 
         let header_slices_view = HeaderSlicesView::new(header_slices.clone(), "DownloaderLinear");
         let _header_slices_view_scope =
-            UISystemViewScope::new(&self.ui_system, Box::new(header_slices_view));
+            UISystemViewScope::new(&ui_system, Box::new(header_slices_view));
 
         // Downloading happens with several stages where
         // each of the stages processes blocks in one status,
@@ -182,6 +182,7 @@ impl DownloaderLinear {
             loaded_count: (header_slices.min_block_num().0 - start_block_num.0) as usize,
             final_block_num: header_slices.min_block_num(),
             target_final_block_num,
+            estimated_top_block_num,
         };
 
         Ok(report)
