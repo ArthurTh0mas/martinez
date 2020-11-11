@@ -15,7 +15,6 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     marker::PhantomData,
 };
-use tracing::*;
 
 // address -> storage-encoded initial value
 pub type AccountChanges = BTreeMap<Address, Option<Account>>;
@@ -252,23 +251,19 @@ where
         let mut account_table = self.txn.mutable_cursor(&tables::Account).await?;
         let mut storage_table = self.txn.mutable_cursor_dupsort(&tables::Storage).await?;
 
-        debug!("Writing state");
+        let addresses = self.accounts.keys().chain(self.storage.keys());
 
-        let mut account_addresses = self.accounts.keys().collect::<Vec<_>>();
-        account_addresses.sort_unstable();
-        for &address in account_addresses {
+        for &address in addresses {
             if let Some(account) = self.accounts.get(&address) {
-                if let Some(account) = account {
-                    account_table.upsert(address, *account).await?;
-                } else if account_table.seek_exact(address).await?.is_some() {
+                if account_table.seek_exact(address).await?.is_some() {
                     account_table.delete_current().await?;
                 }
-            }
-        }
 
-        let mut storage_addresses = self.storage.keys().collect::<Vec<_>>();
-        storage_addresses.sort_unstable();
-        for &address in storage_addresses {
+                if let Some(account) = account {
+                    account_table.upsert(address, *account).await?;
+                }
+            }
+
             if let Some(storage) = self.storage.get(&address) {
                 for (&k, &v) in storage {
                     upsert_storage_value(&mut storage_table, address, k, v).await?;
@@ -276,13 +271,11 @@ where
             }
         }
 
-        debug!("Writing code");
         let mut code_table = self.txn.mutable_cursor(&tables::Code).await?;
         for (code_hash, code) in self.hash_to_code {
             code_table.upsert(code_hash, code).await?;
         }
 
-        debug!("Writing account changes");
         let mut account_change_table = self.txn.mutable_cursor(&tables::AccountChangeSet).await?;
         for (block_number, account_entries) in self.account_changes {
             for (address, account) in account_entries {
@@ -292,7 +285,6 @@ where
             }
         }
 
-        debug!("Writing storage changes");
         let mut storage_change_table = self.txn.mutable_cursor(&tables::StorageChangeSet).await?;
         for (block_number, storage_entries) in self.storage_changes {
             for (address, storage_entries) in storage_entries {
