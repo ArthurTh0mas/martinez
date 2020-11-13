@@ -9,8 +9,9 @@ use martinez::{
 use anyhow::{bail, ensure, Context};
 use bytes::Bytes;
 use itertools::Itertools;
-use std::{borrow::Cow, path::PathBuf};
+use std::{borrow::Cow, path::PathBuf, sync::Arc};
 use structopt::StructOpt;
+use tokio::sync::RwLock;
 use tracing::*;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
@@ -68,34 +69,14 @@ pub enum OptCommand {
     #[structopt(name = "download-headers", about = "Run block headers downloader")]
     HeaderDownload {
         #[structopt(flatten)]
-        opts: HeaderDownloadOpts,
+        opts: martinez::downloader::opts::Opts,
     },
 }
 
-#[derive(StructOpt)]
-pub struct HeaderDownloadOpts {
-    #[structopt(
-        long = "chain",
-        help = "Name of the testnet to join",
-        default_value = "mainnet"
-    )]
-    pub chain_name: String,
-
-    #[structopt(
-        long = "sentry.api.addr",
-        help = "Sentry GRPC service URL as 'http://host:port'",
-        default_value = "http://localhost:8000"
-    )]
-    pub sentry_api_addr: martinez::sentry::sentry_address::SentryAddress,
-
-    #[structopt(flatten)]
-    pub downloader_opts: martinez::downloader::opts::Opts,
-}
-
-async fn blockhashes(data_dir: MartinezDataDir) -> anyhow::Result<()> {
+async fn blockhashes(data_dir: PathBuf) -> anyhow::Result<()> {
     let env = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_rw(
         mdbx::Environment::new(),
-        &data_dir.chain_data_dir(),
+        &data_dir,
         martinez::kv::tables::CHAINDATA_TABLES.clone(),
     )?;
 
@@ -105,9 +86,20 @@ async fn blockhashes(data_dir: MartinezDataDir) -> anyhow::Result<()> {
 }
 
 #[allow(unreachable_code)]
-async fn header_download(data_dir: MartinezDataDir, opts: HeaderDownloadOpts) -> anyhow::Result<()> {
+async fn header_download(
+    data_dir: PathBuf,
+    opts: martinez::downloader::opts::Opts,
+) -> anyhow::Result<()> {
     let chains_config = martinez::sentry::chain_config::ChainsConfig::new()?;
-    let chain_config = chains_config.get(&opts.chain_name)?;
+    martinez::downloader::opts::Opts::validate_chain_name(
+        &opts.chain_name,
+        chains_config.chain_names().as_slice(),
+    )?;
+
+    let chain_config = chains_config
+        .get(&opts.chain_name)
+        .ok_or_else(|| anyhow::format_err!("unknown chain '{}'", opts.chain_name))?
+        .clone();
 
     let sentry_api_addr = opts.sentry_api_addr.clone();
     let sentry_connector =
@@ -120,17 +112,16 @@ async fn header_download(data_dir: MartinezDataDir, opts: HeaderDownloadOpts) ->
         sentry_status_provider.current_status_stream(),
     );
     sentry_reactor.start()?;
-    let sentry = sentry_reactor.into_shared();
+    let sentry = Arc::new(RwLock::new(sentry_reactor));
 
     let stage = martinez::stages::HeaderDownload::new(
         chain_config,
-        opts.downloader_opts.headers_mem_limit(),
-        opts.downloader_opts.headers_batch_size,
+        opts.headers_mem_limit(),
+        opts.headers_batch_size,
         sentry.clone(),
         sentry_status_provider,
-    )?;
-
-    let db = martinez::kv::new_database(&data_dir.chain_data_dir())?;
+    );
+    let db = martinez::kv::new_database(&data_dir)?;
 
     let mut staged_sync = stagedsync::StagedSync::new();
     staged_sync.push(stage);
@@ -139,10 +130,10 @@ async fn header_download(data_dir: MartinezDataDir, opts: HeaderDownloadOpts) ->
     sentry.write().await.stop().await
 }
 
-async fn table_sizes(data_dir: MartinezDataDir, csv: bool) -> anyhow::Result<()> {
+async fn table_sizes(data_dir: PathBuf, csv: bool) -> anyhow::Result<()> {
     let env = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
         mdbx::Environment::new(),
-        &data_dir.chain_data_dir(),
+        &data_dir,
         Default::default(),
     )?;
     let mut sizes = env
@@ -175,10 +166,10 @@ async fn table_sizes(data_dir: MartinezDataDir, csv: bool) -> anyhow::Result<()>
     Ok(())
 }
 
-async fn db_query(data_dir: MartinezDataDir, table: String, key: Bytes) -> anyhow::Result<()> {
+async fn db_query(data_dir: PathBuf, table: String, key: Bytes) -> anyhow::Result<()> {
     let env = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
         mdbx::Environment::new(),
-        &data_dir.chain_data_dir(),
+        &data_dir,
         Default::default(),
     )?;
 
@@ -201,14 +192,14 @@ async fn db_query(data_dir: MartinezDataDir, table: String, key: Bytes) -> anyho
 }
 
 async fn db_walk(
-    data_dir: MartinezDataDir,
+    data_dir: PathBuf,
     table: String,
     starting_key: Option<Bytes>,
     max_entries: Option<usize>,
 ) -> anyhow::Result<()> {
     let env = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
         mdbx::Environment::new(),
-        &data_dir.chain_data_dir(),
+        &data_dir,
         Default::default(),
     )?;
 
@@ -329,16 +320,18 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     match opt.command {
-        OptCommand::DbStats { csv } => table_sizes(opt.data_dir, csv).await?,
-        OptCommand::Blockhashes => blockhashes(opt.data_dir).await?,
-        OptCommand::DbQuery { table, key } => db_query(opt.data_dir, table, key).await?,
+        OptCommand::DbStats { csv } => table_sizes(opt.data_dir.0, csv).await?,
+        OptCommand::Blockhashes => blockhashes(opt.data_dir.0).await?,
+        OptCommand::DbQuery { table, key } => db_query(opt.data_dir.0, table, key).await?,
         OptCommand::DbWalk {
             table,
             starting_key,
             max_entries,
-        } => db_walk(opt.data_dir, table, starting_key, max_entries).await?,
+        } => db_walk(opt.data_dir.0, table, starting_key, max_entries).await?,
         OptCommand::CheckEqual { db1, db2, table } => check_table_eq(db1, db2, table).await?,
-        OptCommand::HeaderDownload { opts } => header_download(opt.data_dir, opts).await?,
+        OptCommand::HeaderDownload { opts } => {
+            header_download(opt.data_dir.0.clone(), opts).await?
+        }
     }
 
     Ok(())

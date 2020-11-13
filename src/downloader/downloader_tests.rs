@@ -1,7 +1,7 @@
 use crate::{
     downloader::{
-        headers::downloader::DownloaderReport, sentry_status_provider::SentryStatusProvider,
-        Downloader,
+        headers::downloader::DownloaderReport, opts::Opts,
+        sentry_status_provider::SentryStatusProvider, Downloader,
     },
     kv,
     kv::traits::{MutableKV, MutableTransaction},
@@ -13,11 +13,14 @@ use crate::{
         sentry_client_reactor::{SentryClientReactor, SentryClientReactorShared},
     },
 };
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 fn make_chain_config() -> chain_config::ChainConfig {
     let chains_config = chain_config::ChainsConfig::new().unwrap();
-    let chain_name = "mainnet";
-    chains_config.get(chain_name).unwrap()
+    let args = Vec::<String>::new();
+    let opts = Opts::new(Some(args), chains_config.chain_names().as_slice()).unwrap();
+    chains_config.get(&opts.chain_name).unwrap().clone()
 }
 
 fn make_sentry_reactor(
@@ -26,7 +29,7 @@ fn make_sentry_reactor(
 ) -> SentryClientReactorShared {
     let sentry_connector = Box::new(SentryClientConnectorTest::new(Box::new(sentry)));
     let sentry_reactor = SentryClientReactor::new(sentry_connector, current_status_stream);
-    sentry_reactor.into_shared()
+    Arc::new(RwLock::new(sentry_reactor))
 }
 
 async fn run_downloader(
@@ -72,7 +75,6 @@ async fn noop() {
         byte_unit::n_mib_bytes!(50) as usize,
         sentry_reactor.clone(),
         status_provider,
-    )
-    .unwrap();
+    );
     run_downloader(downloader, sentry_reactor).await.unwrap();
 }

@@ -10,7 +10,9 @@ use tokio::sync::Mutex;
 
 #[derive(Debug)]
 pub struct Downloader {
-    headers_downloader: super::headers::downloader::Downloader,
+    chain_config: ChainConfig,
+    mem_limit: usize,
+    sentry: SentryClientReactorShared,
     sentry_status_provider: SentryStatusProvider,
 }
 
@@ -20,15 +22,13 @@ impl Downloader {
         mem_limit: usize,
         sentry: SentryClientReactorShared,
         sentry_status_provider: SentryStatusProvider,
-    ) -> anyhow::Result<Self> {
-        let headers_downloader =
-            super::headers::downloader::Downloader::new(chain_config, mem_limit, sentry)?;
-
-        let instance = Self {
-            headers_downloader,
+    ) -> Self {
+        Self {
+            chain_config,
+            mem_limit,
+            sentry,
             sentry_status_provider,
-        };
-        Ok(instance)
+        }
     }
 
     pub async fn run<'downloader, 'db: 'downloader, RwTx: kv::traits::MutableTransaction<'db>>(
@@ -44,14 +44,18 @@ impl Downloader {
         ui_system.start()?;
         let ui_system = Arc::new(Mutex::new(ui_system));
 
-        let report = self
-            .headers_downloader
+        let headers_downloader = super::headers::downloader::Downloader::new(
+            self.chain_config.clone(),
+            self.mem_limit,
+            self.sentry.clone(),
+            ui_system.clone(),
+        )?;
+        let report = headers_downloader
             .run::<RwTx>(
                 db_transaction,
                 start_block_num,
                 max_blocks_count,
                 previous_run_state,
-                ui_system.clone(),
             )
             .await?;
 

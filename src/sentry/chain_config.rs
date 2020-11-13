@@ -67,11 +67,8 @@ impl ChainsConfig {
         Ok(ChainsConfig(configs))
     }
 
-    pub fn get(&self, chain_name: &str) -> anyhow::Result<ChainConfig> {
-        self.0
-            .get(&chain_name.to_lowercase())
-            .cloned()
-            .ok_or_else(|| anyhow::format_err!("unknown chain '{}'", chain_name))
+    pub fn get(&self, chain_name: &str) -> Option<&ChainConfig> {
+        self.0.get(&chain_name.to_lowercase())
     }
 }
 

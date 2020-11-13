@@ -25,15 +25,14 @@ impl HeaderDownload {
         batch_size: usize,
         sentry: SentryClientReactorShared,
         sentry_status_provider: SentryStatusProvider,
-    ) -> anyhow::Result<Self> {
-        let downloader = Downloader::new(chain_config, mem_limit, sentry, sentry_status_provider)?;
+    ) -> Self {
+        let downloader = Downloader::new(chain_config, mem_limit, sentry, sentry_status_provider);
 
-        let instance = Self {
+        Self {
             downloader,
             batch_size,
             previous_run_state: Arc::new(AsyncMutex::new(None)),
-        };
-        Ok(instance)
+        }
     }
 
     async fn load_previous_run_state(&self) -> Option<HeaderDownloaderRunState> {
