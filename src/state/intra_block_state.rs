@@ -488,7 +488,11 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
 
         for (address, incarnation) in self.incarnations {
             if incarnation > 0 {
-                self.db.erase_storage(address).await?
+                for (location, initial) in self.db.all_storage(address).await? {
+                    self.db
+                        .update_storage(address, location, initial, U256::zero())
+                        .await?
+                }
             }
         }
 
