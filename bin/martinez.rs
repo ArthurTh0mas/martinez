@@ -1,16 +1,11 @@
 use martinez::{
     binutil::MartinezDataDir,
-    downloader::sentry_status_provider::SentryStatusProvider,
     kv::{
         tables,
         traits::{MutableKV, KV},
         TableEncode,
     },
     models::*,
-    sentry::{
-        sentry_client_connector::SentryClientConnectorImpl,
-        sentry_client_reactor::SentryClientReactor,
-    },
     stagedsync::{
         self,
         stage::{ExecOutput, Stage, StageInput, UnwindInput},
@@ -65,8 +60,8 @@ pub struct Opt {
     #[structopt(flatten)]
     pub downloader_opts: martinez::downloader::opts::Opts,
 
-    /// Execution batch size (Ggas).
-    #[structopt(long, default_value = "1000")]
+    /// Execution batch size (Mgas).
+    #[structopt(long, default_value = "10000000")]
     pub execution_batch_size: u64,
 
     /// Exit execution stage after batch.
@@ -103,8 +98,7 @@ where
     where
         'db: 'tx,
     {
-        let original_highest_block = input.stage_progress.unwrap_or(BlockNumber(0));
-        let mut highest_block = original_highest_block;
+        let mut highest_block = input.stage_progress.unwrap_or(BlockNumber(0));
 
         let erigon_tx = self.db.begin().await?;
 
@@ -160,7 +154,7 @@ where
         Ok(ExecOutput::Progress {
             stage_progress: highest_block,
             done: true,
-            must_commit: highest_block > original_highest_block,
+            must_commit: true,
         })
     }
 
@@ -197,9 +191,6 @@ where
     where
         'db: 'tx,
     {
-        let original_highest_block = input.stage_progress.unwrap_or(BlockNumber(0));
-        let mut highest_block = original_highest_block;
-
         const MAX_TXS_PER_BATCH: usize = 500_000;
         const BUFFERING_FACTOR: usize = 500_000;
         let erigon_tx = self.db.begin().await?;
@@ -213,6 +204,7 @@ where
             .mutable_cursor(&tables::BlockTransaction.erased())
             .await?;
 
+        let mut highest_block = input.stage_progress.unwrap_or(BlockNumber(0));
         let prev_body = tx
             .get(
                 &tables::BlockBody,
@@ -326,7 +318,7 @@ where
         Ok(ExecOutput::Progress {
             stage_progress: highest_block,
             done,
-            must_commit: highest_block > original_highest_block,
+            must_commit: true,
         })
     }
     async fn unwind<'tx>(&self, _: &'tx mut RwTx, _: UnwindInput) -> anyhow::Result<()>
@@ -433,7 +425,6 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let martinez_chain_data_dir = opt.data_dir.chain_data_dir();
-    std::fs::create_dir_all(&opt.data_dir.0)?;
     let db = martinez::kv::new_database(&martinez_chain_data_dir)?;
     async {
         let txn = db.begin_mutable().await?;
@@ -446,7 +437,19 @@ async fn main() -> anyhow::Result<()> {
     .instrument(span!(Level::INFO, "", " Genesis initialization "))
     .await?;
 
-    let sentry_status_provider = SentryStatusProvider::new(chain_config.clone());
+    // sentry setup
+    let sentry_connector = martinez::sentry::sentry_client_connector::SentryClientConnectorImpl::new(
+        opt.sentry_api_addr.clone(),
+    );
+    let sentry_status_provider =
+        martinez::downloader::sentry_status_provider::SentryStatusProvider::new(chain_config.clone());
+    let mut sentry_reactor = martinez::sentry::sentry_client_reactor::SentryClientReactor::new(
+        Box::new(sentry_connector),
+        sentry_status_provider.current_status_stream(),
+    );
+    sentry_reactor.start()?;
+    let sentry = sentry_reactor.into_shared();
+
     // staged sync setup
     let mut staged_sync = stagedsync::StagedSync::new();
     // staged_sync.set_min_progress_to_commit_after_stage(2);
@@ -457,18 +460,11 @@ async fn main() -> anyhow::Result<()> {
         });
         staged_sync.push(ConvertBodies { db: erigon_db });
     } else {
-        // sentry setup
-        let mut sentry_reactor = SentryClientReactor::new(
-            Box::new(SentryClientConnectorImpl::new(opt.sentry_api_addr.clone())),
-            sentry_status_provider.current_status_stream(),
-        );
-        sentry_reactor.start()?;
-
-        staged_sync.push(HeaderDownload::new(
+        staged_sync.push(martinez::stages::HeaderDownload::new(
             chain_config,
             opt.downloader_opts.headers_mem_limit(),
             opt.downloader_opts.headers_batch_size,
-            sentry_reactor.into_shared(),
+            sentry,
             sentry_status_provider,
         )?);
         // also add body download stage here
@@ -477,10 +473,10 @@ async fn main() -> anyhow::Result<()> {
     staged_sync.push(CumulativeIndex);
     staged_sync.push(SenderRecovery);
     staged_sync.push(Execution {
-        batch_size: opt.execution_batch_size.saturating_mul(1_000_000_000_u64),
+        batch_size: opt.execution_batch_size.saturating_mul(1_000_000_u64),
         exit_after_batch: opt.execution_exit_after_batch,
         batch_until: None,
-        commit_every: None,
+        commit_every: Some(Duration::from_secs(120)),
         prune_from: BlockNumber(0),
     });
     staged_sync.push(HashState::new(None));

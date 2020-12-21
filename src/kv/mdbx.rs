@@ -39,19 +39,14 @@ impl<E: EnvironmentKind> Environment<E> {
         ro: bool,
     ) -> anyhow::Result<Self> {
         b.set_max_dbs(std::cmp::max(chart.len(), 1));
-
-        b.set_flags(::mdbx::EnvironmentFlags {
-            mode: if ro {
-                ::mdbx::Mode::ReadOnly
-            } else {
-                ::mdbx::Mode::ReadWrite {
-                    sync_mode: ::mdbx::SyncMode::Durable,
-                }
-            },
-            no_rdahead: true,
-            coalesce: true,
-            ..Default::default()
-        });
+        if ro {
+            b.set_flags(::mdbx::EnvironmentFlags {
+                mode: ::mdbx::Mode::ReadOnly,
+                no_rdahead: true,
+                coalesce: true,
+                ..Default::default()
+            });
+        }
 
         Ok(Self {
             inner: b
