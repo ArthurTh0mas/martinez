@@ -128,13 +128,20 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
 
                     // Re-invoke the stage until it reports `StageOutput::done`.
                     let done_progress = loop {
-                        let stage_progress = stage_id.get_progress(&tx).await?;
+                        let prev_progress = stage_id.get_progress(&tx).await?;
 
                         let exec_output: anyhow::Result<_> = async {
-                            if !restarted {
+                            if restarted {
+                                debug!(
+                                    "Invoking stage @ {}",
+                                    prev_progress
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_else(|| "genesis".to_string())
+                                );
+                            } else {
                                 info!(
                                     "RUNNING from {}",
-                                    stage_progress
+                                    prev_progress
                                         .map(|s| s.to_string())
                                         .unwrap_or_else(|| "genesis".to_string())
                                 );
@@ -147,7 +154,7 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                                         restarted,
                                         first_started_at: (start_time, start_progress),
                                         previous_stage,
-                                        stage_progress,
+                                        stage_progress: prev_progress,
                                     },
                                 )
                                 .await?;
@@ -159,11 +166,25 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                                     stage_progress,
                                     ..
                                 } => {
+                                    let time = Instant::now() - start_time;
                                     if *done {
-                                        let time = Instant::now() - start_time;
                                         info!(
                                             "DONE @ {} in {}",
                                             stage_progress,
+                                            format_duration(time, true)
+                                        );
+                                    } else {
+                                        debug!(
+                                            "Stage invocation complete @ {}{} in {}",
+                                            stage_progress,
+                                            if let Some(prev_progress) = prev_progress {
+                                                format!(
+                                                    " (+{} blocks)",
+                                                    stage_progress.saturating_sub(*prev_progress)
+                                                )
+                                            } else {
+                                                String::new()
+                                            },
                                             format_duration(time, true)
                                         );
                                     }
@@ -201,7 +222,9 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                                         >= self.min_progress_to_commit_after_stage
                                 {
                                     // Commit and restart transaction.
+                                    debug!("Commit requested");
                                     tx.commit().await?;
+                                    debug!("Commit complete");
                                     tx = db.begin_mutable().await?;
                                 }
 

@@ -52,7 +52,7 @@ async fn get_object<'m, 'db, S: State>(
 
             if let Some(account) = accdata {
                 Some(entry.insert(Object {
-                    initial: Some(account.clone()),
+                    initial: Some(account),
                     current: Some(account),
                 }))
             } else {
@@ -153,7 +153,7 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
 
         self.journal.push({
             if let Some(prev) = get_object(self.db, &mut self.objects, address).await? {
-                initial = prev.initial.clone();
+                initial = prev.initial;
                 if let Some(prev_current) = &prev.current {
                     current.balance = prev_current.balance;
                 }
@@ -488,11 +488,7 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
 
         for (address, incarnation) in self.incarnations {
             if incarnation > 0 {
-                for (location, initial) in self.db.all_storage(address).await? {
-                    self.db
-                        .update_storage(address, location, initial, U256::zero())
-                        .await?
-                }
+                self.db.erase_storage(address).await?
             }
         }
 
@@ -509,8 +505,7 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
         }
 
         for (address, obj) in self.objects {
-            self.db
-                .update_account(address, obj.initial.clone(), obj.current.clone());
+            self.db.update_account(address, obj.initial, obj.current);
         }
 
         for (code_hash, code) in self.new_code {

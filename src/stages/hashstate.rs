@@ -32,7 +32,7 @@ where
         collector_account.collect(Entry::new(keccak256(address), account));
 
         i += 1;
-        if i % 500_000 == 0 {
+        if i % 5_000_000 == 0 {
             debug!("Converted {} entries", i);
         }
     }
@@ -60,7 +60,7 @@ where
         collector_storage.collect(Entry::new(keccak256(address), (keccak256(location), value)));
 
         i += 1;
-        if i % 500_000 == 0 {
+        if i % 5_000_000 == 0 {
             debug!("Converted {} entries", i);
         }
     }
@@ -138,7 +138,8 @@ pub struct HashState {
 impl HashState {
     pub fn new(clean_promotion_threshold: Option<u64>) -> Self {
         Self {
-            clean_promotion_threshold: clean_promotion_threshold.unwrap_or(1_000_000_000_000),
+            clean_promotion_threshold: clean_promotion_threshold
+                .unwrap_or(1_000_000_u64 * 1_000_000_u64),
         }
     }
 }
@@ -400,12 +401,9 @@ mod tests {
 
         let mut hashed_address_table = tx.cursor(&tables::HashedAccount).await.unwrap();
         let sender_keccak = keccak256(sender);
-        let (_, account_encoded) = hashed_address_table
+        let (_, account) = hashed_address_table
             .seek_exact(sender_keccak)
             .await
-            .unwrap()
-            .unwrap();
-        let account = Account::decode_for_storage(&*account_encoded)
             .unwrap()
             .unwrap();
         assert_eq!(account.nonce, 3);
