@@ -67,12 +67,8 @@ pub struct Opt {
     pub downloader_opts: martinez::downloader::opts::Opts,
 
     /// Execution batch size (Ggas).
-    #[structopt(long, default_value = "5000")]
+    #[structopt(long, default_value = "1000")]
     pub execution_batch_size: u64,
-
-    /// Execution history batch size (Ggas).
-    #[structopt(long, default_value = "250")]
-    pub execution_history_batch_size: u64,
 
     /// Exit execution stage after batch.
     #[structopt(long, env)]
@@ -508,9 +504,6 @@ async fn main() -> anyhow::Result<()> {
     staged_sync.push(SenderRecovery);
     staged_sync.push(Execution {
         batch_size: opt.execution_batch_size.saturating_mul(1_000_000_000_u64),
-        history_batch_size: opt
-            .execution_history_batch_size
-            .saturating_mul(1_000_000_000_u64),
         exit_after_batch: opt.execution_exit_after_batch,
         batch_until: None,
         commit_every: None,
