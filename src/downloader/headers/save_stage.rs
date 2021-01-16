@@ -3,10 +3,7 @@ use super::{
     header_slice_status_watch::HeaderSliceStatusWatch,
     header_slices::{HeaderSlice, HeaderSliceStatus, HeaderSlices},
 };
-use crate::{
-    kv,
-    kv::{tables::HeaderKey, traits::MutableTransaction},
-};
+use crate::{kv, kv::traits::MutableTransaction};
 use anyhow::format_err;
 use parking_lot::RwLock;
 use std::{
@@ -128,11 +125,10 @@ impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>> SaveStage<'tx, RwTx> {
     async fn save_header(&self, header: BlockHeader, tx: &RwTx) -> anyhow::Result<()> {
         let block_num = header.number();
         let header_hash = header.hash();
-        let header_key: HeaderKey = (block_num, header_hash);
         let total_difficulty = header.difficulty();
 
         // saving a precomputed RLP representation
-        tx.set(&HeaderTableWithBytes, header_key, header.rlp_repr())
+        tx.set(&HeaderTableWithBytes, block_num, header.rlp_repr())
             .await?;
         tx.set(&kv::tables::HeaderNumber, header_hash, block_num)
             .await?;
@@ -140,7 +136,7 @@ impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>> SaveStage<'tx, RwTx> {
             .await?;
         tx.set(
             &kv::tables::HeadersTotalDifficulty,
-            header_key,
+            block_num,
             total_difficulty,
         )
         .await?;

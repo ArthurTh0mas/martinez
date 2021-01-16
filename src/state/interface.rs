@@ -16,29 +16,16 @@ pub trait State: Debug + Send + Sync {
 
     async fn erase_storage(&mut self, address: Address) -> anyhow::Result<()>;
 
-    async fn read_header(
-        &self,
-        block_number: BlockNumber,
-        block_hash: H256,
-    ) -> anyhow::Result<Option<BlockHeader>>;
+    async fn read_header(&self, block_number: BlockNumber) -> anyhow::Result<Option<BlockHeader>>;
 
-    async fn read_body(
-        &self,
-        block_number: BlockNumber,
-        block_hash: H256,
-    ) -> anyhow::Result<Option<BlockBody>>;
+    async fn read_body(&self, block_number: BlockNumber) -> anyhow::Result<Option<BlockBody>>;
 
     async fn read_body_with_senders(
         &self,
         block_number: BlockNumber,
-        block_hash: H256,
     ) -> anyhow::Result<Option<BlockBodyWithSenders>>;
 
-    async fn total_difficulty(
-        &self,
-        block_number: BlockNumber,
-        block_hash: H256,
-    ) -> anyhow::Result<Option<U256>>;
+    async fn total_difficulty(&self, block_number: BlockNumber) -> anyhow::Result<Option<U256>>;
 
     /// State changes
     /// Change sets are backward changes of the state, i.e. account/storage values _at the beginning of a block_.

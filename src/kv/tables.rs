@@ -712,8 +712,6 @@ impl TableDecode for StorageChange {
     }
 }
 
-pub type HeaderKey = (BlockNumber, H256);
-
 #[derive(Clone, Debug)]
 pub struct CumulativeData {
     pub tx_num: u64,
@@ -809,9 +807,9 @@ decl_table!(SnapshotInfo => Vec<u8> => Vec<u8>);
 decl_table!(BittorrentInfo => Vec<u8> => Vec<u8>);
 decl_table!(HeaderNumber => H256 => BlockNumber);
 decl_table!(CanonicalHeader => BlockNumber => H256);
-decl_table!(Header => HeaderKey => BlockHeader => BlockNumber);
-decl_table!(HeadersTotalDifficulty => HeaderKey => U256);
-decl_table!(BlockBody => HeaderKey => BodyForStorage => BlockNumber);
+decl_table!(Header => BlockNumber => BlockHeader => BlockNumber);
+decl_table!(HeadersTotalDifficulty => BlockNumber => U256);
+decl_table!(BlockBody => BlockNumber => BodyForStorage => BlockNumber);
 decl_table!(BlockTransaction => TxIndex => Transaction);
 decl_table!(CumulativeIndex => BlockNumber => CumulativeData);
 decl_table!(LogTopicIndex => Vec<u8> => RoaringTreemap);
@@ -822,7 +820,7 @@ decl_table!(CallToIndex => Vec<u8> => RoaringTreemap);
 decl_table!(BlockTransactionLookup => H256 => TruncateStart<BlockNumber>);
 decl_table!(Config => H256 => ChainSpec);
 decl_table!(SyncStage => StageId => BlockNumber);
-decl_table!(TxSender => HeaderKey => Vec<Address>);
+decl_table!(TxSender => BlockNumber => Vec<Address>);
 decl_table!(LastBlock => Vec<u8> => Vec<u8>);
 decl_table!(Migration => Vec<u8> => Vec<u8>);
 decl_table!(Sequence => Vec<u8> => Vec<u8>);

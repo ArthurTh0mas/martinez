@@ -102,9 +102,7 @@ impl ConsensusEngineBase {
         header: &BlockHeader,
     ) -> anyhow::Result<Option<BlockHeader>> {
         if let Some(parent_number) = header.number.0.checked_sub(1) {
-            return state
-                .read_header(parent_number.into(), header.parent_hash)
-                .await;
+            return state.read_header(parent_number.into()).await;
         }
 
         Ok(None)
@@ -116,16 +114,12 @@ impl ConsensusEngineBase {
         &self,
         branch_header: &BlockHeader,
         mainline_header: &BlockHeader,
-        mainline_hash: H256,
         n: usize,
         state: &mut dyn State,
         old_ommers: &mut Vec<BlockHeader>,
     ) -> anyhow::Result<bool> {
         if n > 0 && branch_header != mainline_header {
-            if let Some(mainline_body) = state
-                .read_body(mainline_header.number, mainline_hash)
-                .await?
-            {
+            if let Some(mainline_body) = state.read_body(mainline_header.number).await? {
                 old_ommers.extend_from_slice(&mainline_body.ommers);
 
                 let mainline_parent = self.get_parent_header(state, mainline_header).await?;
@@ -139,14 +133,7 @@ impl ConsensusEngineBase {
                     }
 
                     return self
-                        .is_kin(
-                            branch_header,
-                            &mainline_parent,
-                            mainline_header.parent_hash,
-                            n - 1,
-                            state,
-                            old_ommers,
-                        )
+                        .is_kin(branch_header, &mainline_parent, n - 1, state, old_ommers)
                         .await;
                 }
             }
@@ -250,14 +237,7 @@ impl ConsensusEngineBase {
                 .context(ValidationError::InvalidOmmerHeader)?;
             let mut old_ommers = vec![];
             if !self
-                .is_kin(
-                    ommer,
-                    &parent,
-                    block.header.parent_hash,
-                    6,
-                    state,
-                    &mut old_ommers,
-                )
+                .is_kin(ommer, &parent, 6, state, &mut old_ommers)
                 .await?
             {
                 return Err(ValidationError::NotAnOmmer.into());
