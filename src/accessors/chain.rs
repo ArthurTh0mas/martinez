@@ -54,12 +54,13 @@ pub mod header {
 
     pub async fn read<'db, Tx: ReadTransaction<'db>>(
         tx: &Tx,
+        hash: H256,
         number: impl Into<BlockNumber>,
     ) -> anyhow::Result<Option<BlockHeader>> {
         let number = number.into();
-        trace!("Reading header for block {}", number);
+        trace!("Reading header for block {}/{:?}", number, hash);
 
-        tx.get(&tables::Header, number).await
+        tx.get(&tables::Header, (number, hash)).await
     }
 }
 
@@ -121,28 +122,40 @@ pub mod tx_sender {
 
     pub async fn read<'db, Tx: ReadTransaction<'db>>(
         tx: &Tx,
+        hash: H256,
         number: impl Into<BlockNumber>,
     ) -> anyhow::Result<Vec<Address>> {
         let number = number.into();
 
-        trace!("Reading transaction senders for block {}", number,);
+        trace!(
+            "Reading transaction senders for block {}/{:?}",
+            number,
+            hash
+        );
 
-        Ok(tx.get(&tables::TxSender, number).await?.unwrap_or_default())
+        Ok(tx
+            .get(&tables::TxSender, (number, hash))
+            .await?
+            .unwrap_or_default())
     }
 
     pub async fn write<'db, RwTx: MutableTransaction<'db>>(
         tx: &RwTx,
+        hash: H256,
         number: impl Into<BlockNumber>,
         senders: Vec<Address>,
     ) -> anyhow::Result<()> {
         let number = number.into();
         trace!(
-            "Writing {} transaction senders for block {}",
+            "Writing {} transaction senders for block {}/{:?}",
             senders.len(),
             number,
+            hash
         );
 
-        tx.set(&tables::TxSender, number, senders).await.unwrap();
+        tx.set(&tables::TxSender, (number, hash), senders)
+            .await
+            .unwrap();
 
         Ok(())
     }
@@ -153,30 +166,33 @@ pub mod storage_body {
 
     pub async fn read<'db, Tx: ReadTransaction<'db>>(
         tx: &Tx,
+        hash: H256,
         number: impl Into<BlockNumber>,
     ) -> anyhow::Result<Option<BodyForStorage>> {
         let number = number.into();
-        trace!("Reading storage body for block {}", number);
+        trace!("Reading storage body for block {}/{:?}", number, hash);
 
-        tx.get(&tables::BlockBody, number).await
+        tx.get(&tables::BlockBody, (number, hash)).await
     }
 
     pub async fn has<'db, Tx: ReadTransaction<'db>>(
         tx: &Tx,
+        hash: H256,
         number: impl Into<BlockNumber>,
     ) -> anyhow::Result<bool> {
-        Ok(read(tx, number).await?.is_some())
+        Ok(read(tx, hash, number).await?.is_some())
     }
 
     pub async fn write<'db, RwTx: MutableTransaction<'db>>(
         tx: &RwTx,
+        hash: H256,
         number: impl Into<BlockNumber>,
         body: &BodyForStorage,
     ) -> anyhow::Result<()> {
         let number = number.into();
-        trace!("Writing storage body for block {}", number);
+        trace!("Writing storage body for block {}/{:?}", number, hash);
 
-        tx.set(&tables::BlockBody, number, body.clone())
+        tx.set(&tables::BlockBody, (number, hash), body.clone())
             .await
             .unwrap();
 
@@ -189,9 +205,10 @@ pub mod block_body {
 
     async fn read_base<'db, Tx: ReadTransaction<'db>>(
         tx: &Tx,
+        hash: H256,
         number: impl Into<BlockNumber>,
     ) -> anyhow::Result<Option<(BlockBody, TxIndex)>> {
-        if let Some(body) = super::storage_body::read(tx, number).await? {
+        if let Some(body) = super::storage_body::read(tx, hash, number).await? {
             let transactions = super::tx::read(tx, body.base_tx_id, body.tx_amount).await?;
 
             return Ok(Some((
@@ -208,18 +225,20 @@ pub mod block_body {
 
     pub async fn read_without_senders<'db, Tx: ReadTransaction<'db>>(
         tx: &Tx,
+        hash: H256,
         number: impl Into<BlockNumber>,
     ) -> anyhow::Result<Option<BlockBody>> {
-        Ok(read_base(tx, number).await?.map(|(v, _)| v))
+        Ok(read_base(tx, hash, number).await?.map(|(v, _)| v))
     }
 
     pub async fn read_with_senders<'db, Tx: ReadTransaction<'db>>(
         tx: &Tx,
+        hash: H256,
         number: impl Into<BlockNumber>,
     ) -> anyhow::Result<Option<BlockBodyWithSenders>> {
         let number = number.into();
-        if let Some((body, _)) = read_base(tx, number).await? {
-            let senders = super::tx_sender::read(tx, number).await?;
+        if let Some((body, _)) = read_base(tx, hash, number).await? {
+            let senders = super::tx_sender::read(tx, hash, number).await?;
 
             return Ok(Some(BlockBodyWithSenders {
                 transactions: body
@@ -244,12 +263,14 @@ pub mod td {
 
     pub async fn read<'db, Tx: ReadTransaction<'db>>(
         tx: &Tx,
+        hash: H256,
         number: impl Into<BlockNumber>,
     ) -> anyhow::Result<Option<U256>> {
         let number = number.into();
-        trace!("Reading total difficulty at block {}", number);
+        trace!("Reading total difficulty at block {}/{:?}", number, hash);
 
-        tx.get(&tables::HeadersTotalDifficulty, number).await
+        tx.get(&tables::HeadersTotalDifficulty, (number, hash))
+            .await
     }
 }
 
@@ -339,12 +360,16 @@ mod tests {
         let rwtx = db.begin_mutable().await.unwrap();
         let rwtx = &rwtx;
 
-        storage_body::write(rwtx, 1, &body).await.unwrap();
+        storage_body::write(rwtx, block1_hash, 1, &body)
+            .await
+            .unwrap();
         canonical_hash::write(rwtx, 1, block1_hash).await.unwrap();
         tx::write(rwtx, 1, &txs).await.unwrap();
-        tx_sender::write(rwtx, 1, senders.to_vec()).await.unwrap();
+        tx_sender::write(rwtx, block1_hash, 1, senders.to_vec())
+            .await
+            .unwrap();
 
-        let recovered_body = storage_body::read(rwtx, 1)
+        let recovered_body = storage_body::read(rwtx, block1_hash, 1)
             .await
             .unwrap()
             .expect("Could not recover storage body.");
@@ -353,7 +378,7 @@ mod tests {
             .unwrap()
             .expect("Could not recover block hash");
         let recovered_txs = tx::read(rwtx, 1, 2).await.unwrap();
-        let recovered_senders = tx_sender::read(rwtx, 1).await.unwrap();
+        let recovered_senders = tx_sender::read(rwtx, block1_hash, 1).await.unwrap();
 
         assert_eq!(body, recovered_body);
         assert_eq!(block1_hash, recovered_hash);

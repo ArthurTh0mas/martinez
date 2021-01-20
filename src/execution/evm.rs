@@ -537,7 +537,7 @@ where
                         hash = self
                             .state
                             .db()
-                            .read_header(BlockNumber(base_number.0 - i))
+                            .read_header(BlockNumber(base_number.0 - i), hash)
                             .await?
                             .context("no header")?
                             .parent_hash;

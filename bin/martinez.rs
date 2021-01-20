@@ -11,7 +11,10 @@ use martinez::{
         sentry_client_connector::SentryClientConnectorImpl,
         sentry_client_reactor::SentryClientReactor,
     },
-    stagedsync::{self, stage::*},
+    stagedsync::{
+        self,
+        stage::{ExecOutput, Stage, StageInput, UnwindInput},
+    },
     stages::*,
     version_string, Cursor, MutableCursor, MutableTransaction, StageId, Transaction,
 };
@@ -117,15 +120,12 @@ where
         let mut erigon_td_cur = erigon_tx.cursor(&tables::HeadersTotalDifficulty).await?;
         let mut td_cur = tx.mutable_cursor(&tables::HeadersTotalDifficulty).await?;
 
-        if erigon_tx
-            .get(&tables::CanonicalHeader, highest_block)
-            .await?
-            != tx.get(&tables::CanonicalHeader, highest_block).await?
-        {
-            return Ok(ExecOutput::Unwind {
-                unwind_to: BlockNumber(highest_block.0 - 1),
-            });
-        }
+        assert_eq!(
+            erigon_tx
+                .get(&tables::CanonicalHeader, highest_block)
+                .await?,
+            tx.get(&tables::CanonicalHeader, highest_block).await?
+        );
 
         let mut walker = erigon_canonical_cur.walk(Some(highest_block + 1));
         while let Some((block_number, canonical_hash)) = walker.try_next().await? {
@@ -169,7 +169,7 @@ where
         })
     }
 
-    async fn unwind<'tx>(&self, _: &'tx mut RwTx, _: UnwindInput) -> anyhow::Result<UnwindOutput>
+    async fn unwind<'tx>(&self, _: &'tx mut RwTx, _: UnwindInput) -> anyhow::Result<()>
     where
         'db: 'tx,
     {
@@ -208,17 +208,6 @@ where
         const MAX_TXS_PER_BATCH: usize = 500_000;
         const BUFFERING_FACTOR: usize = 500_000;
         let erigon_tx = self.db.begin().await?;
-
-        if erigon_tx
-            .get(&tables::CanonicalHeader, highest_block)
-            .await?
-            != tx.get(&tables::CanonicalHeader, highest_block).await?
-        {
-            return Ok(ExecOutput::Unwind {
-                unwind_to: BlockNumber(highest_block.0 - 1),
-            });
-        }
-
         let mut canonical_header_cur = tx.cursor(&tables::CanonicalHeader).await?;
 
         let mut erigon_body_cur = erigon_tx.cursor(&tables::BlockBody).await?;
@@ -243,7 +232,7 @@ where
             .unwrap();
 
         let mut starting_index = prev_body.base_tx_id + prev_body.tx_amount as u64;
-        let mut canonical_header_walker = canonical_header_cur.walk(Some(highest_block + 1));
+        let mut walker = canonical_header_cur.walk(Some(highest_block + 1));
         let mut batch = Vec::with_capacity(BUFFERING_FACTOR);
         let mut converted = Vec::with_capacity(BUFFERING_FACTOR);
 
@@ -254,7 +243,7 @@ where
         let done = loop {
             let mut no_more_bodies = false;
             let mut accum_txs = 0;
-            while let Some((block_num, block_hash)) = canonical_header_walker.try_next().await? {
+            while let Some((block_num, block_hash)) = walker.try_next().await? {
                 if let Some((_, body)) = erigon_body_cur.seek_exact((block_num, block_hash)).await?
                 {
                     let base_tx_id = body.base_tx_id;
@@ -345,10 +334,6 @@ where
                 }
             }
 
-            if no_more_bodies {
-                break true;
-            }
-
             let now = Instant::now();
             let elapsed = now - started_at;
             if elapsed > Duration::from_secs(30) {
@@ -371,7 +356,7 @@ where
             must_commit: highest_block > original_highest_block,
         })
     }
-    async fn unwind<'tx>(&self, _: &'tx mut RwTx, _: UnwindInput) -> anyhow::Result<UnwindOutput>
+    async fn unwind<'tx>(&self, _: &'tx mut RwTx, _: UnwindInput) -> anyhow::Result<()>
     where
         'db: 'tx,
     {
@@ -419,18 +404,11 @@ where
             },
         )
     }
-    async fn unwind<'tx>(
-        &self,
-        _: &'tx mut RwTx,
-        input: UnwindInput,
-    ) -> anyhow::Result<UnwindOutput>
+    async fn unwind<'tx>(&self, _: &'tx mut RwTx, _: UnwindInput) -> anyhow::Result<()>
     where
         'db: 'tx,
     {
-        Ok(UnwindOutput {
-            stage_progress: input.unwind_to,
-            must_commit: true,
-        })
+        Ok(())
     }
 }
 

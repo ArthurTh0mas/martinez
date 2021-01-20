@@ -1,5 +1,6 @@
 use crate::{
     kv,
+    kv::tables::HeaderKey,
     models::BlockNumber,
     sentry::{chain_config::ChainConfig, sentry_client::Status, sentry_client_connector},
 };
@@ -57,8 +58,9 @@ impl SentryStatusProvider {
             .await?
             .ok_or(SentryStatusProviderError::StatusDataNotFound)?;
 
+        let header_key: HeaderKey = (block_num, header_hash);
         let total_difficulty = tx
-            .get(&kv::tables::HeadersTotalDifficulty, block_num)
+            .get(&kv::tables::HeadersTotalDifficulty, header_key)
             .await?
             .ok_or(SentryStatusProviderError::StatusDataNotFound)?;
 

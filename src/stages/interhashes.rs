@@ -11,7 +11,7 @@ use crate::{
         TableEncode,
     },
     models::{Account, BlockNumber, RlpAccount, EMPTY_ROOT},
-    stagedsync::stage::{ExecOutput, Stage, StageInput, UnwindInput, *},
+    stagedsync::stage::{ExecOutput, Stage, StageInput, UnwindInput},
     stages::stage_util::should_do_clean_promotion,
     MutableTransaction, StageId,
 };
@@ -634,10 +634,16 @@ where
                 .with_context(|| "Failed to update interhashes")?
             };
 
-            let block_state_root = accessors::chain::header::read(tx, max_block)
-                .await?
-                .ok_or_else(|| format_err!("No header for block {}", max_block))?
-                .state_root;
+            let block_state_root = accessors::chain::header::read(
+                tx,
+                accessors::chain::canonical_hash::read(tx, max_block)
+                    .await?
+                    .ok_or_else(|| format_err!("No canonical hash for block {}", max_block))?,
+                max_block,
+            )
+            .await?
+            .ok_or_else(|| format_err!("No header for block {}", max_block))?
+            .state_root;
 
             if block_state_root == trie_root {
                 info!("Block #{} state root OK: {:?}", max_block, trie_root)
@@ -663,23 +669,13 @@ where
         })
     }
 
-    async fn unwind<'tx>(
-        &self,
-        tx: &'tx mut RwTx,
-        input: UnwindInput,
-    ) -> anyhow::Result<UnwindOutput>
+    async fn unwind<'tx>(&self, tx: &'tx mut RwTx, input: UnwindInput) -> anyhow::Result<()>
     where
         'db: 'tx,
     {
+        let _ = tx;
         let _ = input;
-        // TODO: proper unwind
-        tx.clear_table(&tables::TrieAccount).await?;
-        tx.clear_table(&tables::TrieStorage).await?;
-
-        Ok(UnwindOutput {
-            stage_progress: BlockNumber(0),
-            must_commit: true,
-        })
+        todo!()
     }
 }
 

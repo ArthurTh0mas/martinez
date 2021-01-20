@@ -2,16 +2,18 @@ use crate::{
     accessors,
     consensus::engine_factory,
     execution::{analysis_cache::AnalysisCache, processor::ExecutionProcessor},
-    h256_to_u256,
-    kv::{tables, traits::*},
+    kv::tables,
     models::*,
-    stagedsync::{format_duration, stage::*, stages::EXECUTION},
-    upsert_storage_value, Buffer,
+    stagedsync::{
+        format_duration,
+        stage::{ExecOutput, Stage, StageInput},
+        stages::EXECUTION,
+    },
+    Buffer, Cursor, MutableTransaction,
 };
 use anyhow::{format_err, Context};
 use async_trait::async_trait;
 use std::time::{Duration, Instant};
-use tokio_stream::StreamExt;
 use tracing::*;
 
 #[derive(Debug)]
@@ -57,17 +59,22 @@ async fn execute_batch_of_blocks<'db, Tx: MutableTransaction<'db>>(
     let mut last_message = Instant::now();
     let mut printed_at_least_once = false;
     loop {
-        let header = accessors::chain::header::read(tx, block_number)
+        let block_hash = accessors::chain::canonical_hash::read(tx, block_number)
             .await?
-            .ok_or_else(|| format_err!("Header not found: {}", block_number))?
+            .ok_or_else(|| format_err!("No canonical hash found for block {}", block_number))?;
+        let header = accessors::chain::header::read(tx, block_hash, block_number)
+            .await?
+            .ok_or_else(|| format_err!("Header not found: {}/{:?}", block_number, block_hash))?
             .into();
-        let block = accessors::chain::block_body::read_with_senders(tx, block_number)
+        let block = accessors::chain::block_body::read_with_senders(tx, block_hash, block_number)
             .await?
-            .ok_or_else(|| format_err!("Block body not found: {}", block_number))?;
+            .ok_or_else(|| {
+                format_err!("Block body not found: {}/{:?}", block_number, block_hash)
+            })?;
 
         let block_spec = chain_config.collect_block_spec(block_number);
 
-        if let Err(e) = ExecutionProcessor::new(
+        ExecutionProcessor::new(
             &mut buffer,
             &mut analysis_cache,
             &mut *consensus_engine,
@@ -77,15 +84,12 @@ async fn execute_batch_of_blocks<'db, Tx: MutableTransaction<'db>>(
         )
         .execute_and_write_block()
         .await
-        {
-            let block_hash = accessors::chain::canonical_hash::read(tx, block_number)
-                .await?
-                .ok_or_else(|| format_err!("No canonical hash found for block {}", block_number))?;
-            return Err(e.context(format!(
+        .with_context(|| {
+            format!(
                 "Failed to execute block #{} ({:?})",
                 block_number, block_hash
-            )));
-        };
+            )
+        })?;
 
         gas_since_start += header.gas_used;
         gas_since_last_message += header.gas_used;
@@ -233,54 +237,12 @@ impl<'db, RwTx: MutableTransaction<'db>> Stage<'db, RwTx> for Execution {
         &self,
         tx: &'tx mut RwTx,
         input: crate::stagedsync::stage::UnwindInput,
-    ) -> anyhow::Result<UnwindOutput>
+    ) -> anyhow::Result<()>
     where
         'db: 'tx,
     {
-        info!("Unwinding accounts");
-        let mut account_cursor = tx.mutable_cursor(&tables::Account).await?;
-
-        let mut account_cs_cursor = tx.mutable_cursor(&tables::AccountChangeSet).await?;
-        let mut account_walker = account_cs_cursor.walk_back(None);
-        while let Some((block_number, tables::AccountChange { address, account })) =
-            account_walker.try_next().await?
-        {
-            if block_number == input.unwind_to {
-                break;
-            }
-
-            if let Some(account) = account {
-                account_cursor.put(address, account).await?;
-            } else if account_cursor.seek(address).await?.is_some() {
-                account_cursor.delete_current().await?;
-            }
-        }
-
-        info!("Unwinding storage");
-        let mut storage_cursor = tx.mutable_cursor_dupsort(&tables::Storage).await?;
-
-        let mut storage_cs_cursor = tx.mutable_cursor(&tables::StorageChangeSet).await?;
-        let mut storage_walker = storage_cs_cursor.walk_back(None);
-
-        while let Some((
-            tables::StorageChangeKey {
-                block_number,
-                address,
-            },
-            tables::StorageChange { location, value },
-        )) = storage_walker.try_next().await?
-        {
-            if block_number == input.unwind_to {
-                break;
-            }
-
-            upsert_storage_value(&mut storage_cursor, address, h256_to_u256(location), value)
-                .await?;
-        }
-
-        Ok(UnwindOutput {
-            stage_progress: input.unwind_to,
-            must_commit: true,
-        })
+        let _ = tx;
+        let _ = input;
+        todo!()
     }
 }
