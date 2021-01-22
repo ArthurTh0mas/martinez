@@ -252,7 +252,7 @@ where
 
         let started_at = Instant::now();
         let done = loop {
-            let mut no_more_bodies = true;
+            let mut no_more_bodies = false;
             let mut accum_txs = 0;
             while let Some((block_num, block_hash)) = canonical_header_walker.try_next().await? {
                 if let Some((_, body)) = erigon_body_cur.seek_exact((block_num, block_hash)).await?
@@ -292,12 +292,16 @@ where
                     batch.push((block_num, block_hash, body, txs));
 
                     if accum_txs > MAX_TXS_PER_BATCH {
-                        no_more_bodies = false;
                         break;
                     }
                 } else {
+                    no_more_bodies = true;
                     break;
                 }
+            }
+
+            if batch.is_empty() {
+                break true;
             }
 
             extracted_blocks_num += batch.len();
