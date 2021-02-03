@@ -11,7 +11,7 @@ use crate::{
         TableEncode,
     },
     models::{Account, BlockNumber, RlpAccount, EMPTY_ROOT},
-    stagedsync::stage::{ExecOutput, Stage, StageInput, UnwindInput, *},
+    stagedsync::stage::{ExecOutput, Stage, StageInput, UnwindInput},
     stages::stage_util::should_do_clean_promotion,
     MutableTransaction, StageId,
 };
@@ -669,23 +669,13 @@ where
         })
     }
 
-    async fn unwind<'tx>(
-        &self,
-        tx: &'tx mut RwTx,
-        input: UnwindInput,
-    ) -> anyhow::Result<UnwindOutput>
+    async fn unwind<'tx>(&self, tx: &'tx mut RwTx, input: UnwindInput) -> anyhow::Result<()>
     where
         'db: 'tx,
     {
+        let _ = tx;
         let _ = input;
-        // TODO: proper unwind
-        tx.clear_table(&tables::TrieAccount).await?;
-        tx.clear_table(&tables::TrieStorage).await?;
-
-        Ok(UnwindOutput {
-            stage_progress: BlockNumber(0),
-            must_commit: true,
-        })
+        todo!()
     }
 }
 

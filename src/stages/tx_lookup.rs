@@ -4,7 +4,7 @@ use crate::{
         data_provider::Entry,
     },
     kv::tables,
-    stagedsync::stage::*,
+    stagedsync::stage::{ExecOutput, Stage, StageInput, UnwindInput},
     Cursor, MutableCursor, MutableTransaction, StageId,
 };
 use async_trait::async_trait;
@@ -77,14 +77,14 @@ where
         })
     }
 
-    async fn unwind<'tx>(
-        &self,
-        tx: &'tx mut RwTx,
-        input: UnwindInput,
-    ) -> anyhow::Result<UnwindOutput>
+    async fn unwind<'tx>(&self, tx: &'tx mut RwTx, input: UnwindInput) -> anyhow::Result<()>
     where
         'db: 'tx,
     {
+        if input.unwind_to >= input.stage_progress {
+            return Ok(());
+        }
+
         let mut bodies_cursor = tx.mutable_cursor(&tables::BlockBody).await?;
         let mut tx_hash_cursor = tx.mutable_cursor(&tables::BlockTransactionLookup).await?;
         let mut block_txs_cursor = tx.cursor(&tables::BlockTransaction).await?;
@@ -118,10 +118,7 @@ where
                 num_txs += 1;
             }
         }
-        Ok(UnwindOutput {
-            stage_progress: input.unwind_to,
-            must_commit: true,
-        })
+        Ok(())
     }
 }
 

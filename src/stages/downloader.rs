@@ -4,7 +4,7 @@ use crate::{
     },
     models::BlockNumber,
     sentry::{chain_config::ChainConfig, sentry_client_reactor::SentryClientReactorShared},
-    stagedsync::stage::*,
+    stagedsync::stage::{ExecOutput, Stage, StageInput},
     MutableTransaction, StageId,
 };
 use async_trait::async_trait;
@@ -94,7 +94,7 @@ where
         &self,
         tx: &'tx mut RwTx,
         input: crate::stagedsync::stage::UnwindInput,
-    ) -> anyhow::Result<UnwindOutput>
+    ) -> anyhow::Result<()>
     where
         'db: 'tx,
     {

@@ -16,12 +16,6 @@ pub enum ExecOutput {
     },
 }
 
-#[derive(Debug, PartialEq)]
-pub struct UnwindOutput {
-    pub stage_progress: BlockNumber,
-    pub must_commit: bool,
-}
-
 #[async_trait]
 #[auto_impl(&, Box, Arc)]
 pub trait Stage<'db, RwTx: MutableTransaction<'db>>: Send + Sync + Debug {
@@ -38,11 +32,7 @@ pub trait Stage<'db, RwTx: MutableTransaction<'db>>: Send + Sync + Debug {
     where
         'db: 'tx;
     /// Called when the stage should be unwound. The unwind logic should be there.
-    async fn unwind<'tx>(
-        &self,
-        tx: &'tx mut RwTx,
-        input: UnwindInput,
-    ) -> anyhow::Result<UnwindOutput>
+    async fn unwind<'tx>(&self, tx: &'tx mut RwTx, input: UnwindInput) -> anyhow::Result<()>
     where
         'db: 'tx;
 }
