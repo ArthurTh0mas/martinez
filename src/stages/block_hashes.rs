@@ -1,8 +1,5 @@
 use crate::{
-    etl::{
-        collector::{Collector, OPTIMAL_BUFFER_CAPACITY},
-        data_provider::Entry,
-    },
+    etl::collector::*,
     kv::{tables, traits::*},
     models::*,
     stagedsync::stage::*,
@@ -36,11 +33,11 @@ where
         let original_highest_block = input.stage_progress.unwrap_or(BlockNumber(0));
         let mut highest_block = original_highest_block;
 
-        let mut bodies_cursor = tx.mutable_cursor(&tables::CanonicalHeader).await?;
-        let mut blockhashes_cursor = tx.mutable_cursor(&tables::HeaderNumber.erased()).await?;
+        let mut bodies_cursor = tx.mutable_cursor(tables::CanonicalHeader).await?;
+        let mut blockhashes_cursor = tx.mutable_cursor(tables::HeaderNumber.erased()).await?;
 
-        let mut collector = Collector::new(OPTIMAL_BUFFER_CAPACITY);
-        let walker = bodies_cursor.walk(Some(highest_block + 1));
+        let mut collector = TableCollector::new(OPTIMAL_BUFFER_CAPACITY);
+        let walker = walk(&mut bodies_cursor, Some(highest_block + 1));
         pin!(walker);
 
         while let Some((block_number, block_hash)) = walker.try_next().await? {
@@ -48,7 +45,7 @@ where
                 info!("Processing block {}", block_number);
             }
             // BlockBody Key is block_number + hash, so we just separate and collect
-            collector.collect(Entry::new(block_hash, block_number));
+            collector.push(block_hash, block_number);
 
             highest_block = block_number;
         }
@@ -56,7 +53,6 @@ where
         Ok(ExecOutput::Progress {
             stage_progress: highest_block,
             done: true,
-            must_commit: highest_block > original_highest_block,
         })
     }
 
@@ -68,10 +64,11 @@ where
     where
         'db: 'tx,
     {
-        let mut header_number_cur = tx.mutable_cursor(&tables::HeaderNumber).await?;
-        let mut body_cur = tx.mutable_cursor(&tables::CanonicalHeader).await?;
+        let mut header_number_cur = tx.mutable_cursor(tables::HeaderNumber).await?;
+        let mut body_cur = tx.mutable_cursor(tables::CanonicalHeader).await?;
 
-        let mut walker = body_cur.walk_back(None);
+        let walker = walk_back(&mut body_cur, None);
+        pin!(walker);
 
         while let Some((block_num, block_hash)) = walker.try_next().await? {
             if block_num > input.unwind_to {
@@ -85,7 +82,6 @@ where
 
         Ok(UnwindOutput {
             stage_progress: input.unwind_to,
-            must_commit: true,
         })
     }
 }

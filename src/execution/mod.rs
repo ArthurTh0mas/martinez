@@ -6,6 +6,7 @@ pub mod analysis_cache;
 pub mod evm;
 pub mod precompiled;
 pub mod processor;
+pub mod tracer;
 
 pub async fn execute_block<S: State>(
     state: &mut S,
@@ -18,6 +19,7 @@ pub async fn execute_block<S: State>(
     let config = config.collect_block_spec(header.number);
     ExecutionProcessor::new(
         state,
+        None,
         &mut analysis_cache,
         &mut *engine,
         header,
@@ -105,8 +107,8 @@ mod tests {
 
             let sender = hex!("b685342b8c54347aad148e1f22eff3eb3eb29391").into();
 
-            let t = |action, input, nonce, max_priority_fee_per_gas| TransactionWithSender {
-                message: TransactionMessage::EIP1559 {
+            let t = |action, input, nonce, max_priority_fee_per_gas| MessageWithSender {
+                message: Message::EIP1559 {
                     input,
                     max_priority_fee_per_gas,
                     action,

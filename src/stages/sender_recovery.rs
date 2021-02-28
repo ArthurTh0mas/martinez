@@ -1,15 +1,16 @@
 use crate::{
     kv::{
         tables::{self, ErasedTable},
-        traits::{Cursor, MutableCursor, TableEncode},
+        traits::*,
     },
     models::*,
     stagedsync::{format_duration, stage::*},
-    MutableTransaction, StageId,
+    StageId,
 };
 use async_trait::async_trait;
 use rayon::prelude::*;
 use std::time::{Duration, Instant};
+use tokio::pin;
 use tokio_stream::StreamExt as _;
 use tracing::*;
 
@@ -37,25 +38,26 @@ where
         let mut highest_block = original_highest_block;
 
         const BUFFERING_FACTOR: usize = 5000;
-        let mut body_cur = tx.cursor(&tables::BlockBody).await?;
-        let mut tx_cur = tx.cursor(&tables::BlockTransaction.erased()).await?;
-        let mut senders_cur = tx.mutable_cursor(&tables::TxSender.erased()).await?;
+        let mut body_cur = tx.cursor(tables::BlockBody).await?;
+        let mut tx_cur = tx.cursor(tables::BlockTransaction.erased()).await?;
+        let mut senders_cur = tx.mutable_cursor(tables::TxSender.erased()).await?;
         senders_cur.last().await?;
 
-        let mut walker = body_cur.walk(Some(BlockNumber(highest_block.0 + 1)));
+        let walker = walk(&mut body_cur, Some(BlockNumber(highest_block.0 + 1)));
+        pin!(walker);
         let mut batch = Vec::with_capacity(BUFFERING_FACTOR);
         let started_at = Instant::now();
         let started_at_txnum = tx
             .get(
-                &tables::CumulativeIndex,
+                tables::CumulativeIndex,
                 input.first_started_at.1.unwrap_or(BlockNumber(0)),
             )
             .await?
             .map(|v| v.tx_num);
         let done = loop {
+            let mut read_again = false;
             while let Some(((block_number, hash), body)) = walker.try_next().await? {
-                let txs = tx_cur
-                    .walk(Some(body.base_tx_id.encode().to_vec()))
+                let txs = walk(&mut tx_cur, Some(body.base_tx_id.encode().to_vec()))
                     .take(body.tx_amount)
                     .map(|res| res.map(|(_, tx)| tx))
                     .collect::<anyhow::Result<Vec<_>>>()
@@ -65,12 +67,9 @@ where
                 highest_block = block_number;
 
                 if batch.len() > BUFFERING_FACTOR {
+                    read_again = true;
                     break;
                 }
-            }
-
-            if batch.is_empty() {
-                break true;
             }
 
             let mut recovered_senders = batch
@@ -105,6 +104,10 @@ where
                 senders_cur.append(db_key, db_value).await?;
             }
 
+            if !read_again {
+                break true;
+            }
+
             let now = Instant::now();
             let elapsed = now - started_at;
             if elapsed > Duration::from_secs(30) {
@@ -112,11 +115,11 @@ where
 
                 if let Some(started_at_txnum) = started_at_txnum {
                     let current_txnum = tx
-                        .get(&tables::CumulativeIndex, highest_block)
+                        .get(tables::CumulativeIndex, highest_block)
                         .await?
                         .map(|v| v.tx_num);
                     let total_txnum = tx
-                        .cursor(&tables::CumulativeIndex)
+                        .cursor(tables::CumulativeIndex)
                         .await?
                         .last()
                         .await?
@@ -152,7 +155,6 @@ where
         Ok(ExecOutput::Progress {
             stage_progress: highest_block,
             done,
-            must_commit: highest_block > original_highest_block,
         })
     }
 
@@ -164,7 +166,7 @@ where
     where
         'db: 'tx,
     {
-        let mut senders_cur = tx.mutable_cursor(&tables::TxSender).await?;
+        let mut senders_cur = tx.mutable_cursor(tables::TxSender).await?;
 
         while let Some(((block_number, _), _)) = senders_cur.last().await? {
             if block_number > input.unwind_to {
@@ -176,7 +178,6 @@ where
 
         Ok(UnwindOutput {
             stage_progress: input.unwind_to,
-            must_commit: true,
         })
     }
 }
@@ -184,7 +185,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{accessors::*, kv::traits::MutableKV, new_mem_database};
+    use crate::{accessors::*, kv::new_mem_database};
     use bytes::Bytes;
     use ethereum_types::*;
     use hex_literal::hex;
@@ -208,8 +209,8 @@ mod tests {
             uncles: vec![],
         };
 
-        let tx1_1 = Transaction {
-            message: TransactionMessage::Legacy {
+        let tx1_1 = MessageWithSignature {
+            message: Message::Legacy {
                 chain_id: CHAIN_ID,
                 nonce: 1,
                 gas_price: 1_000_000.into(),
@@ -218,7 +219,7 @@ mod tests {
                 value: 1.into(),
                 input: Bytes::new(),
             },
-            signature: TransactionSignature::new(
+            signature: MessageSignature::new(
                 false,
                 H256::from(hex!(
                     "11d244ae19e3bb96d1bb864aa761d48e957984a154329f0de757cd105f9c7ac4"
@@ -230,8 +231,8 @@ mod tests {
             .unwrap(),
         };
 
-        let tx1_2 = Transaction {
-            message: TransactionMessage::Legacy {
+        let tx1_2 = MessageWithSignature {
+            message: Message::Legacy {
                 chain_id: CHAIN_ID,
                 nonce: 2,
                 gas_price: 1_000_000.into(),
@@ -240,7 +241,7 @@ mod tests {
                 value: 0x100.into(),
                 input: Bytes::new(),
             },
-            signature: TransactionSignature::new(
+            signature: MessageSignature::new(
                 true,
                 H256::from(hex!(
                     "9e8c555909921d359bfb0c2734841c87691eb257cb5f0597ac47501abd8ba0de"
@@ -258,8 +259,8 @@ mod tests {
             uncles: vec![],
         };
 
-        let tx2_1 = Transaction {
-            message: TransactionMessage::Legacy {
+        let tx2_1 = MessageWithSignature {
+            message: Message::Legacy {
                 chain_id: CHAIN_ID,
                 nonce: 3,
                 gas_price: 1_000_000.into(),
@@ -268,7 +269,7 @@ mod tests {
                 value: 0x10000.into(),
                 input: Bytes::new(),
             },
-            signature: TransactionSignature::new(
+            signature: MessageSignature::new(
                 true,
                 H256::from(hex!(
                     "2450fdbf8fbc1dee15022bfa7392eb15f04277782343258e185972b5b2b8bf79"
@@ -280,8 +281,8 @@ mod tests {
             .unwrap(),
         };
 
-        let tx2_2 = Transaction {
-            message: TransactionMessage::Legacy {
+        let tx2_2 = MessageWithSignature {
+            message: Message::Legacy {
                 chain_id: CHAIN_ID,
                 nonce: 6,
                 gas_price: 1_000_000.into(),
@@ -290,7 +291,7 @@ mod tests {
                 value: 0x10.into(),
                 input: Bytes::new(),
             },
-            signature: TransactionSignature::new(
+            signature: MessageSignature::new(
                 false,
                 H256::from(hex!(
                     "ac0222c1258eada1f828729186b723eaf3dd7f535c5de7271ea02470cbb1029f"
@@ -302,8 +303,8 @@ mod tests {
             .unwrap(),
         };
 
-        let tx2_3 = Transaction {
-            message: TransactionMessage::Legacy {
+        let tx2_3 = MessageWithSignature {
+            message: Message::Legacy {
                 chain_id: CHAIN_ID,
                 nonce: 2,
                 gas_price: 1_000_000.into(),
@@ -312,7 +313,7 @@ mod tests {
                 value: 2.into(),
                 input: Bytes::new(),
             },
-            signature: TransactionSignature::new(
+            signature: MessageSignature::new(
                 true,
                 H256::from(hex!(
                     "e41df92d64612590f72cae9e8895cd34ce0a545109f060879add106336bb5055"
@@ -371,7 +372,6 @@ mod tests {
             ExecOutput::Progress {
                 stage_progress: 3.into(),
                 done: true,
-                must_commit: true,
             }
         );
 

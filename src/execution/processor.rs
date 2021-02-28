@@ -1,4 +1,4 @@
-use super::{analysis_cache::AnalysisCache, root_hash};
+use super::{analysis_cache::AnalysisCache, root_hash, tracer::Tracer};
 use crate::{
     chain::{
         intrinsic_gas::*,
@@ -17,11 +17,12 @@ use evmodin::{Revision, StatusCode};
 use std::cmp::min;
 use TransactionAction;
 
-pub struct ExecutionProcessor<'r, 'analysis, 'e, 'h, 'b, 'c, S>
+pub struct ExecutionProcessor<'r, 'tracer, 'analysis, 'e, 'h, 'b, 'c, S>
 where
     S: State,
 {
     state: IntraBlockState<'r, S>,
+    tracer: Option<&'tracer mut dyn Tracer>,
     analysis_cache: &'analysis mut AnalysisCache,
     engine: &'e mut dyn Consensus,
     header: &'h PartialHeader,
@@ -30,12 +31,14 @@ where
     cumulative_gas_used: u64,
 }
 
-impl<'r, 'analysis, 'e, 'h, 'b, 'c, S> ExecutionProcessor<'r, 'analysis, 'e, 'h, 'b, 'c, S>
+impl<'r, 'tracer, 'analysis, 'e, 'h, 'b, 'c, S>
+    ExecutionProcessor<'r, 'tracer, 'analysis, 'e, 'h, 'b, 'c, S>
 where
     S: State,
 {
     pub fn new(
         state: &'r mut S,
+        tracer: Option<&'tracer mut dyn Tracer>,
         analysis_cache: &'analysis mut AnalysisCache,
         engine: &'e mut dyn Consensus,
         header: &'h PartialHeader,
@@ -44,6 +47,7 @@ where
     ) -> Self {
         Self {
             state: IntraBlockState::new(state),
+            tracer,
             analysis_cache,
             engine,
             header,
@@ -65,7 +69,7 @@ where
         self.state
     }
 
-    pub async fn validate_transaction(&mut self, tx: &TransactionWithSender) -> anyhow::Result<()> {
+    pub async fn validate_transaction(&mut self, tx: &MessageWithSender) -> anyhow::Result<()> {
         pre_validate_transaction(
             tx,
             self.block_spec.params.chain_id,
@@ -116,10 +120,7 @@ where
         Ok(())
     }
 
-    async fn execute_transaction(
-        &mut self,
-        txn: &TransactionWithSender,
-    ) -> anyhow::Result<Receipt> {
+    async fn execute_transaction(&mut self, txn: &MessageWithSender) -> anyhow::Result<Receipt> {
         let rev = self.block_spec.revision;
 
         self.state.clear_journal_and_substate();
@@ -151,10 +152,15 @@ where
         let g0 = intrinsic_gas(txn, rev >= Revision::Homestead, rev >= Revision::Istanbul);
         let gas = u128::from(txn.gas_limit())
             .checked_sub(g0)
-            .ok_or(ValidationError::IntrinsicGas)? as u64;
+            .ok_or(ValidationError::IntrinsicGas)?
+            .try_into()
+            .unwrap();
 
         let vm_res = evm::execute(
             &mut self.state,
+            // https://github.com/rust-lang/rust-clippy/issues/7846
+            #[allow(clippy::needless_option_as_deref)]
+            self.tracer.as_deref_mut(),
             self.analysis_cache,
             self.header,
             self.block_spec,
@@ -279,7 +285,7 @@ where
 
     async fn refund_gas(
         &mut self,
-        txn: &TransactionWithSender,
+        txn: &MessageWithSender,
         mut gas_left: u64,
     ) -> anyhow::Result<u64> {
         let mut refund = self.state.get_refund();
@@ -330,8 +336,8 @@ mod tests {
             // The sender does not exist
             let sender = hex!("004512399a230565b99be5c3b0030a56f3ace68c").into();
 
-            let txn = TransactionWithSender {
-                message: TransactionMessage::Legacy {
+            let txn = MessageWithSender {
+                message: Message::Legacy {
                     chain_id: None,
                     nonce: 0,
                     gas_price: U256::zero(),
@@ -349,6 +355,7 @@ mod tests {
             let block_spec = MAINNET.collect_block_spec(header.number);
             let mut processor = ExecutionProcessor::new(
                 &mut state,
+                None,
                 &mut analysis_cache,
                 &mut *engine,
                 &header,
@@ -372,9 +379,9 @@ mod tests {
 
             let sender = hex!("71562b71999873DB5b286dF957af199Ec94617F7").into();
 
-            let tx = TransactionWithSender {
+            let tx = MessageWithSender {
                 sender,
-                message: TransactionMessage::Legacy {
+                message: Message::Legacy {
                     chain_id: None,
                     nonce: 0,
                     gas_price: U256::from(50) * GIGA,
@@ -395,6 +402,7 @@ mod tests {
             let block_spec = MAINNET.collect_block_spec(header.number);
             let mut processor = ExecutionProcessor::new(
                 &mut state,
+                None,
                 &mut analysis_cache,
                 &mut *engine,
                 &header,
@@ -458,6 +466,7 @@ mod tests {
             let block_spec = MAINNET.collect_block_spec(header.number);
             let mut processor = ExecutionProcessor::new(
                 &mut state,
+                None,
                 &mut analysis_cache,
                 &mut *engine,
                 &header,
@@ -465,8 +474,8 @@ mod tests {
                 &block_spec,
             );
 
-            let t = |action, input, nonce, gas_limit| TransactionWithSender {
-                message: TransactionMessage::EIP1559 {
+            let t = |action, input, nonce, gas_limit| MessageWithSender {
+                message: Message::EIP1559 {
                     chain_id: MAINNET.params.chain_id,
                     nonce,
                     max_priority_fee_per_gas: U256::zero(),
@@ -582,6 +591,7 @@ mod tests {
             let block_spec = MAINNET.collect_block_spec(header.number);
             let mut processor = ExecutionProcessor::new(
                 &mut state,
+                None,
                 &mut analysis_cache,
                 &mut *engine,
                 &header,
@@ -605,8 +615,8 @@ mod tests {
                 .await
                 .unwrap();
 
-            let t = |action, input, nonce| TransactionWithSender {
-                message: TransactionMessage::EIP1559 {
+            let t = |action, input, nonce| MessageWithSender {
+                message: Message::EIP1559 {
                     chain_id: MAINNET.params.chain_id,
                     nonce,
                     max_priority_fee_per_gas: U256::from(20 * GIGA),
@@ -680,8 +690,8 @@ mod tests {
             };
             state.update_account(address, None, Some(account));
 
-            let txn = TransactionWithSender{
-                message: TransactionMessage::EIP1559 {
+            let txn = MessageWithSender{
+                message: Message::EIP1559 {
                     chain_id: MAINNET.params.chain_id,
                     nonce,
                     max_priority_fee_per_gas: 0.into(),
@@ -702,6 +712,7 @@ mod tests {
             let block_spec = MAINNET.collect_block_spec(header.number);
             let mut processor = ExecutionProcessor::new(
                 &mut state,
+                None,
                 &mut analysis_cache,
                 &mut *engine,
                 &header,
@@ -743,8 +754,8 @@ mod tests {
             let caller = hex!("5ed8cee6b63b1c6afce3ad7c92f4fd7e1b8fad9f").into();
             let suicide_beneficiary = hex!("ee098e6c2a43d9e2c04f08f0c3a87b0ba59079d5").into();
 
-            let txn = TransactionWithSender {
-                message: TransactionMessage::EIP1559 {
+            let txn = MessageWithSender {
+                message: Message::EIP1559 {
                     chain_id: MAINNET.params.chain_id,
                     nonce: 0,
                     max_priority_fee_per_gas: U256::zero(),
@@ -766,6 +777,7 @@ mod tests {
             let block_spec = MAINNET.collect_block_spec(header.number);
             let mut processor = ExecutionProcessor::new(
                 &mut state,
+                None,
                 &mut analysis_cache,
                 &mut *engine,
                 &header,

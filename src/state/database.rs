@@ -1,5 +1,7 @@
 use crate::{
-    kv::tables, models::*, u256_to_h256, CursorDupSort, MutableCursorDupSort, Transaction,
+    kv::{tables, traits::*},
+    models::*,
+    u256_to_h256,
 };
 use bytes::Bytes;
 use ethereum_types::*;
@@ -80,7 +82,7 @@ pub async fn read_account_storage<'db, Tx: Transaction<'db>>(
     location: H256,
 ) -> anyhow::Result<Option<U256>> {
     Ok(tx
-        .cursor_dup_sort(&tables::Storage)
+        .cursor_dup_sort(tables::Storage)
         .await?
         .seek_both_range(address, location)
         .await?
@@ -93,7 +95,7 @@ pub async fn read_account_code<'db: 'tx, 'tx, Tx: Transaction<'db>>(
     _: Address,
     code_hash: H256,
 ) -> anyhow::Result<Option<Bytes>> {
-    tx.get(&tables::Code, code_hash).await
+    tx.get(tables::Code, code_hash).await
 }
 
 pub async fn read_account_code_size<'db: 'tx, 'tx, Tx: Transaction<'db>>(

@@ -1,5 +1,5 @@
 use super::stages::StageId;
-use crate::{models::*, MutableTransaction};
+use crate::{kv::traits::*, models::*};
 use async_trait::async_trait;
 use auto_impl::auto_impl;
 use std::{fmt::Debug, time::Instant};
@@ -12,14 +12,12 @@ pub enum ExecOutput {
     Progress {
         stage_progress: BlockNumber,
         done: bool,
-        must_commit: bool,
     },
 }
 
 #[derive(Debug, PartialEq)]
 pub struct UnwindOutput {
     pub stage_progress: BlockNumber,
-    pub must_commit: bool,
 }
 
 #[async_trait]

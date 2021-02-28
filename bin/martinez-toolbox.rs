@@ -6,61 +6,61 @@ use martinez::{
         traits::*,
     },
     models::*,
-    stagedsync::{self},
+    stagedsync,
     stages::*,
 };
 use anyhow::{bail, ensure, format_err, Context};
 use bytes::Bytes;
+use clap::Parser;
 use itertools::Itertools;
 use std::{borrow::Cow, path::PathBuf};
-use structopt::StructOpt;
 use tracing::*;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
-#[derive(StructOpt)]
-#[structopt(name = "Martinez Toolbox", about = "Utilities for Martinez Ethereum client")]
+#[derive(Parser)]
+#[clap(name = "Martinez Toolbox", about = "Utilities for Martinez Ethereum client")]
 struct Opt {
-    #[structopt(long = "datadir", help = "Database directory path", default_value)]
+    #[clap(long = "datadir", help = "Database directory path", default_value_t)]
     pub data_dir: MartinezDataDir,
 
-    #[structopt(subcommand)]
+    #[clap(subcommand)]
     pub command: OptCommand,
 }
 
-#[derive(StructOpt)]
+#[derive(Parser)]
 pub enum OptCommand {
     /// Print database statistics
     DbStats {
         /// Whether to print CSV
-        #[structopt(long)]
+        #[clap(long)]
         csv: bool,
     },
 
     /// Query database
     DbQuery {
-        #[structopt(long)]
+        #[clap(long)]
         table: String,
-        #[structopt(long, parse(try_from_str = hex_to_bytes))]
+        #[clap(long, parse(try_from_str = hex_to_bytes))]
         key: Bytes,
     },
 
     /// Walk over table entries
     DbWalk {
-        #[structopt(long)]
+        #[clap(long)]
         table: String,
-        #[structopt(long, parse(try_from_str = hex_to_bytes))]
+        #[clap(long, parse(try_from_str = hex_to_bytes))]
         starting_key: Option<Bytes>,
-        #[structopt(long)]
+        #[clap(long)]
         max_entries: Option<usize>,
     },
 
     /// Check table equality in two databases
     CheckEqual {
-        #[structopt(long, parse(from_os_str))]
+        #[clap(long, parse(from_os_str))]
         db1: PathBuf,
-        #[structopt(long, parse(from_os_str))]
+        #[clap(long, parse(from_os_str))]
         db2: PathBuf,
-        #[structopt(long)]
+        #[clap(long)]
         table: String,
     },
 
@@ -68,9 +68,9 @@ pub enum OptCommand {
     Blockhashes,
 
     /// Execute HeaderDownload stage
-    #[structopt(name = "download-headers", about = "Run block headers downloader")]
+    #[clap(name = "download-headers", about = "Run block headers downloader")]
     HeaderDownload {
-        #[structopt(flatten)]
+        #[clap(flatten)]
         opts: HeaderDownloadOpts,
     },
 
@@ -79,29 +79,29 @@ pub enum OptCommand {
     },
 }
 
-#[derive(StructOpt)]
+#[derive(Parser)]
 pub struct HeaderDownloadOpts {
-    #[structopt(
+    #[clap(
         long = "chain",
         help = "Name of the testnet to join",
         default_value = "mainnet"
     )]
     pub chain_name: String,
 
-    #[structopt(
+    #[clap(
         long = "sentry.api.addr",
         help = "Sentry GRPC service URL as 'http://host:port'",
         default_value = "http://localhost:8000"
     )]
     pub sentry_api_addr: martinez::sentry::sentry_address::SentryAddress,
 
-    #[structopt(flatten)]
+    #[clap(flatten)]
     pub downloader_opts: martinez::downloader::opts::Opts,
 }
 
 async fn blockhashes(data_dir: MartinezDataDir) -> anyhow::Result<()> {
     std::fs::create_dir_all(&data_dir.0)?;
-    let env = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_rw(
+    let env = martinez::kv::mdbx::Environment::<mdbx::NoWriteMap>::open_rw(
         mdbx::Environment::new(),
         &data_dir.chain_data_dir(),
         martinez::kv::tables::CHAINDATA_TABLES.clone(),
@@ -149,7 +149,7 @@ async fn header_download(data_dir: MartinezDataDir, opts: HeaderDownloadOpts) ->
 }
 
 async fn table_sizes(data_dir: MartinezDataDir, csv: bool) -> anyhow::Result<()> {
-    let env = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
+    let env = martinez::kv::mdbx::Environment::<mdbx::NoWriteMap>::open_ro(
         mdbx::Environment::new(),
         &data_dir.chain_data_dir(),
         Default::default(),
@@ -185,7 +185,7 @@ async fn table_sizes(data_dir: MartinezDataDir, csv: bool) -> anyhow::Result<()>
 }
 
 async fn db_query(data_dir: MartinezDataDir, table: String, key: Bytes) -> anyhow::Result<()> {
-    let env = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
+    let env = martinez::kv::mdbx::Environment::<mdbx::NoWriteMap>::open_ro(
         mdbx::Environment::new(),
         &data_dir.chain_data_dir(),
         Default::default(),
@@ -202,7 +202,7 @@ async fn db_query(data_dir: MartinezDataDir, table: String, key: Bytes) -> anyho
     if let Some(v) = value {
         println!(
             "{:?}",
-            rlp::decode::<martinez::models::Transaction>(&v)?.hash()
+            rlp::decode::<martinez::models::MessageWithSignature>(&v)?.hash()
         );
     }
 
@@ -215,7 +215,7 @@ async fn db_walk(
     starting_key: Option<Bytes>,
     max_entries: Option<usize>,
 ) -> anyhow::Result<()> {
-    let env = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
+    let env = martinez::kv::mdbx::Environment::<mdbx::NoWriteMap>::open_ro(
         mdbx::Environment::new(),
         &data_dir.chain_data_dir(),
         Default::default(),
@@ -249,12 +249,12 @@ async fn db_walk(
 }
 
 async fn check_table_eq(db1_path: PathBuf, db2_path: PathBuf, table: String) -> anyhow::Result<()> {
-    let env1 = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
+    let env1 = martinez::kv::mdbx::Environment::<mdbx::NoWriteMap>::open_ro(
         mdbx::Environment::new(),
         &db1_path,
         Default::default(),
     )?;
-    let env2 = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
+    let env2 = martinez::kv::mdbx::Environment::<mdbx::NoWriteMap>::open_ro(
         mdbx::Environment::new(),
         &db2_path,
         Default::default(),
@@ -318,7 +318,7 @@ async fn check_table_eq(db1_path: PathBuf, db2_path: PathBuf, table: String) -> 
 }
 
 async fn read_block(data_dir: MartinezDataDir, block_num: BlockNumber) -> anyhow::Result<()> {
-    let env = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
+    let env = martinez::kv::mdbx::Environment::<mdbx::NoWriteMap>::open_ro(
         mdbx::Environment::new(),
         &data_dir.chain_data_dir(),
         CHAINDATA_TABLES.clone(),
@@ -327,11 +327,11 @@ async fn read_block(data_dir: MartinezDataDir, block_num: BlockNumber) -> anyhow
     let tx = env.begin().await?;
 
     let canonical_hash = tx
-        .get(&tables::CanonicalHeader, block_num)
+        .get(tables::CanonicalHeader, block_num)
         .await?
         .ok_or_else(|| format_err!("no such canonical block"))?;
     let header = tx
-        .get(&tables::Header, (block_num, canonical_hash))
+        .get(tables::Header, (block_num, canonical_hash))
         .await?
         .ok_or_else(|| format_err!("header not found"))?;
     let body =
@@ -372,7 +372,7 @@ async fn read_block(data_dir: MartinezDataDir, block_num: BlockNumber) -> anyhow
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let opt: Opt = Opt::from_args();
+    let opt: Opt = Opt::parse();
 
     let filter = if std::env::var(EnvFilter::DEFAULT_ENV)
         .unwrap_or_default()

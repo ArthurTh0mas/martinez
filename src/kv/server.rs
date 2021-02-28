@@ -1,5 +1,4 @@
-use super::traits::KV;
-use crate::{kv::CustomTable, Cursor, CursorDupSort, Transaction};
+use super::{traits::*, CustomTable};
 use async_trait::async_trait;
 use ethereum_interfaces::{
     remotekv::{Op, Pair, StateChangeBatch, StateChangeRequest},
@@ -112,11 +111,11 @@ impl<DB: KV + Send + Sync> ethereum_interfaces::remotekv::kv_server::Kv for KvSe
                                             .await
                                             .map_err(|e| tonic::Status::internal(e.to_string()))?
                                     }
-                                    Op::LastDup => {
-                                        return Err(tonic::Status::unimplemented(
-                                            "not implemented",
-                                        ));
-                                    }
+                                    Op::LastDup => get_cursor::<DB>(&mut cursors, cid)?
+                                        .last_dup()
+                                        .await
+                                        .map_err(|e| tonic::Status::internal(e.to_string()))?
+                                        .map(|v| (vec![], v)),
                                     Op::Next => {
                                         get_cursor::<DB>(&mut cursors, cid)?
                                             .next()
@@ -137,11 +136,10 @@ impl<DB: KV + Send + Sync> ethereum_interfaces::remotekv::kv_server::Kv for KvSe
                                             .await
                                             .map_err(|e| tonic::Status::internal(e.to_string()))?
                                     }
-                                    Op::PrevDup => {
-                                        return Err(tonic::Status::unimplemented(
-                                            "not implemented",
-                                        ));
-                                    }
+                                    Op::PrevDup => get_cursor::<DB>(&mut cursors, cid)?
+                                        .prev_dup()
+                                        .await
+                                        .map_err(|e| tonic::Status::internal(e.to_string()))?,
                                     Op::PrevNoDup => {
                                         return Err(tonic::Status::unimplemented(
                                             "not implemented",
@@ -158,7 +156,7 @@ impl<DB: KV + Send + Sync> ethereum_interfaces::remotekv::kv_server::Kv for KvSe
                                     }
                                     Op::Open => {
                                         let cursor = dbtx
-                                            .cursor_dup_sort(&CustomTable::from(c.bucket_name))
+                                            .cursor_dup_sort(CustomTable::from(c.bucket_name))
                                             .await
                                             .map_err(|e| tonic::Status::internal(e.to_string()))?;
                                         cursors.push(Some(cursor));

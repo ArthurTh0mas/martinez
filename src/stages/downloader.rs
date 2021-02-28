@@ -2,10 +2,11 @@ use crate::{
     downloader::{
         sentry_status_provider::SentryStatusProvider, Downloader, HeaderDownloaderRunState,
     },
+    kv::traits::*,
     models::BlockNumber,
     sentry::{chain_config::ChainConfig, sentry_client_reactor::SentryClientReactorShared},
     stagedsync::stage::*,
-    MutableTransaction, StageId,
+    StageId,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -86,7 +87,6 @@ where
         Ok(ExecOutput::Progress {
             stage_progress,
             done,
-            must_commit: true,
         })
     }
 

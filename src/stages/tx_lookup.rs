@@ -1,8 +1,5 @@
 use crate::{
-    etl::{
-        collector::{Collector, OPTIMAL_BUFFER_CAPACITY},
-        data_provider::Entry,
-    },
+    etl::collector::*,
     kv::{tables, traits::*},
     models::BodyForStorage,
     stagedsync::stage::*,
@@ -33,17 +30,17 @@ where
     where
         'db: 'tx,
     {
-        let mut bodies_cursor = tx.mutable_cursor(&tables::BlockBody).await?;
+        let mut bodies_cursor = tx.mutable_cursor(tables::BlockBody).await?;
         let mut tx_hash_cursor = tx
-            .mutable_cursor(&tables::BlockTransactionLookup.erased())
+            .mutable_cursor(tables::BlockTransactionLookup.erased())
             .await?;
 
-        let mut block_txs_cursor = tx.cursor(&tables::BlockTransaction).await?;
+        let mut block_txs_cursor = tx.cursor(tables::BlockTransaction).await?;
 
-        let mut collector = Collector::new(OPTIMAL_BUFFER_CAPACITY);
+        let mut collector = TableCollector::new(OPTIMAL_BUFFER_CAPACITY);
 
         let last_processed_block_number = tx
-            .mutable_cursor(&tables::BlockTransactionLookup)
+            .mutable_cursor(tables::BlockTransactionLookup)
             .await?
             .last()
             .await?
@@ -52,17 +49,17 @@ where
 
         let start_block_number = last_processed_block_number + 1;
 
-        let walker_block_body = bodies_cursor.walk(Some(start_block_number));
+        let walker_block_body = walk(&mut bodies_cursor, Some(start_block_number));
         pin!(walker_block_body);
 
         while let Some(((block_number, _), ref body_rpl)) = walker_block_body.try_next().await? {
             let (tx_count, tx_base_id) = (body_rpl.tx_amount, body_rpl.base_tx_id);
 
-            let walker_block_txs = block_txs_cursor.walk(Some(tx_base_id)).take(tx_count);
+            let walker_block_txs = walk(&mut block_txs_cursor, Some(tx_base_id)).take(tx_count);
             pin!(walker_block_txs);
 
             while let Some((_, tx)) = walker_block_txs.try_next().await? {
-                collector.collect(Entry::new(tx.hash(), tables::TruncateStart(block_number)));
+                collector.push(tx.hash(), tables::TruncateStart(block_number));
             }
         }
 
@@ -74,7 +71,6 @@ where
                 .map(|(_, stage)| stage)
                 .unwrap_or_default(),
             done: false,
-            must_commit: true,
         })
     }
 
@@ -86,9 +82,9 @@ where
     where
         'db: 'tx,
     {
-        let mut bodies_cursor = tx.mutable_cursor(&tables::BlockBody).await?;
-        let mut tx_hash_cursor = tx.mutable_cursor(&tables::BlockTransactionLookup).await?;
-        let mut block_txs_cursor = tx.cursor(&tables::BlockTransaction).await?;
+        let mut bodies_cursor = tx.mutable_cursor(tables::BlockBody).await?;
+        let mut tx_hash_cursor = tx.mutable_cursor(tables::BlockTransactionLookup).await?;
+        let mut block_txs_cursor = tx.cursor(tables::BlockTransaction).await?;
 
         let start_block_number = input.unwind_to + 1;
 
@@ -97,7 +93,7 @@ where
             input.stage_progress, input.unwind_to
         );
 
-        let walker_block_body = bodies_cursor.walk(Some(start_block_number));
+        let walker_block_body = walk(&mut bodies_cursor, Some(start_block_number));
         pin!(walker_block_body);
 
         while let Some((
@@ -109,7 +105,7 @@ where
             },
         )) = walker_block_body.try_next().await?
         {
-            let walker_block_txs = block_txs_cursor.walk(Some(base_tx_id));
+            let walker_block_txs = walk(&mut block_txs_cursor, Some(base_tx_id));
             pin!(walker_block_txs);
 
             let mut num_txs = 1;
@@ -127,7 +123,6 @@ where
         }
         Ok(UnwindOutput {
             stage_progress: input.unwind_to,
-            must_commit: true,
         })
     }
 }
@@ -137,9 +132,8 @@ mod tests {
     use super::*;
     use crate::{
         accessors::chain,
-        kv::traits::MutableKV,
-        models::{Transaction, *},
-        new_mem_database,
+        kv::new_mem_database,
+        models::{MessageWithSignature, *},
     };
     use bytes::Bytes;
     use ethereum_types::*;
@@ -162,8 +156,8 @@ mod tests {
             uncles: vec![],
         };
 
-        let tx1_1 = Transaction {
-            message: TransactionMessage::Legacy {
+        let tx1_1 = MessageWithSignature {
+            message: Message::Legacy {
                 chain_id: CHAIN_ID,
                 nonce: 1,
                 gas_price: 1_000_000.into(),
@@ -172,7 +166,7 @@ mod tests {
                 value: 1.into(),
                 input: Bytes::new(),
             },
-            signature: TransactionSignature::new(
+            signature: MessageSignature::new(
                 false,
                 H256::from(hex!(
                     "11d244ae19e3bb96d1bb864aa761d48e957984a154329f0de757cd105f9c7ac4"
@@ -185,8 +179,8 @@ mod tests {
         };
         let hash1_1 = tx1_1.hash();
 
-        let tx1_2 = Transaction {
-            message: TransactionMessage::Legacy {
+        let tx1_2 = MessageWithSignature {
+            message: Message::Legacy {
                 chain_id: CHAIN_ID,
                 nonce: 2,
                 gas_price: 1_000_000.into(),
@@ -195,7 +189,7 @@ mod tests {
                 value: 0x100.into(),
                 input: Bytes::new(),
             },
-            signature: TransactionSignature::new(
+            signature: MessageSignature::new(
                 true,
                 H256::from(hex!(
                     "9e8c555909921d359bfb0c2734841c87691eb257cb5f0597ac47501abd8ba0de"
@@ -214,8 +208,8 @@ mod tests {
             uncles: vec![],
         };
 
-        let tx2_1 = Transaction {
-            message: TransactionMessage::Legacy {
+        let tx2_1 = MessageWithSignature {
+            message: Message::Legacy {
                 chain_id: CHAIN_ID,
                 nonce: 3,
                 gas_price: 1_000_000.into(),
@@ -224,7 +218,7 @@ mod tests {
                 value: 0x10000.into(),
                 input: Bytes::new(),
             },
-            signature: TransactionSignature::new(
+            signature: MessageSignature::new(
                 true,
                 H256::from(hex!(
                     "2450fdbf8fbc1dee15022bfa7392eb15f04277782343258e185972b5b2b8bf79"
@@ -238,8 +232,8 @@ mod tests {
 
         let hash2_1 = tx2_1.hash();
 
-        let tx2_2 = Transaction {
-            message: TransactionMessage::Legacy {
+        let tx2_2 = MessageWithSignature {
+            message: Message::Legacy {
                 chain_id: CHAIN_ID,
                 nonce: 6,
                 gas_price: 1_000_000.into(),
@@ -248,7 +242,7 @@ mod tests {
                 value: 0x10.into(),
                 input: Bytes::new(),
             },
-            signature: TransactionSignature::new(
+            signature: MessageSignature::new(
                 false,
                 H256::from(hex!(
                     "ac0222c1258eada1f828729186b723eaf3dd7f535c5de7271ea02470cbb1029f"
@@ -262,8 +256,8 @@ mod tests {
 
         let hash2_2 = tx2_2.hash();
 
-        let tx2_3 = Transaction {
-            message: TransactionMessage::Legacy {
+        let tx2_3 = MessageWithSignature {
+            message: Message::Legacy {
                 chain_id: CHAIN_ID,
                 nonce: 2,
                 gas_price: 1_000_000.into(),
@@ -272,7 +266,7 @@ mod tests {
                 value: 2.into(),
                 input: Bytes::new(),
             },
-            signature: TransactionSignature::new(
+            signature: MessageSignature::new(
                 true,
                 H256::from(hex!(
                     "e41df92d64612590f72cae9e8895cd34ce0a545109f060879add106336bb5055"
@@ -329,7 +323,6 @@ mod tests {
             ExecOutput::Progress {
                 stage_progress: 3.into(),
                 done: false,
-                must_commit: true,
             }
         );
 
@@ -367,7 +360,6 @@ mod tests {
             ExecOutput::Progress {
                 stage_progress: 3.into(),
                 done: false,
-                must_commit: true,
             }
         );
     }
@@ -386,8 +378,8 @@ mod tests {
             uncles: vec![],
         };
 
-        let tx1_1 = Transaction {
-            message: TransactionMessage::Legacy {
+        let tx1_1 = MessageWithSignature {
+            message: Message::Legacy {
                 chain_id: CHAIN_ID,
                 nonce: 1,
                 gas_price: 1_000_000.into(),
@@ -396,7 +388,7 @@ mod tests {
                 value: 1.into(),
                 input: Bytes::new(),
             },
-            signature: TransactionSignature::new(
+            signature: MessageSignature::new(
                 false,
                 H256::from(hex!(
                     "11d244ae19e3bb96d1bb864aa761d48e957984a154329f0de757cd105f9c7ac4"
@@ -409,8 +401,8 @@ mod tests {
         };
         let hash1_1 = tx1_1.hash();
 
-        let tx1_2 = Transaction {
-            message: TransactionMessage::Legacy {
+        let tx1_2 = MessageWithSignature {
+            message: Message::Legacy {
                 chain_id: CHAIN_ID,
                 nonce: 2,
                 gas_price: 1_000_000.into(),
@@ -419,7 +411,7 @@ mod tests {
                 value: 0x100.into(),
                 input: Bytes::new(),
             },
-            signature: TransactionSignature::new(
+            signature: MessageSignature::new(
                 true,
                 H256::from(hex!(
                     "9e8c555909921d359bfb0c2734841c87691eb257cb5f0597ac47501abd8ba0de"
@@ -438,8 +430,8 @@ mod tests {
             uncles: vec![],
         };
 
-        let tx2_1 = Transaction {
-            message: TransactionMessage::Legacy {
+        let tx2_1 = MessageWithSignature {
+            message: Message::Legacy {
                 chain_id: CHAIN_ID,
                 nonce: 3,
                 gas_price: 1_000_000.into(),
@@ -448,7 +440,7 @@ mod tests {
                 value: 0x10000.into(),
                 input: Bytes::new(),
             },
-            signature: TransactionSignature::new(
+            signature: MessageSignature::new(
                 true,
                 H256::from(hex!(
                     "2450fdbf8fbc1dee15022bfa7392eb15f04277782343258e185972b5b2b8bf79"
@@ -462,8 +454,8 @@ mod tests {
 
         let hash2_1 = tx2_1.hash();
 
-        let tx2_2 = Transaction {
-            message: TransactionMessage::Legacy {
+        let tx2_2 = MessageWithSignature {
+            message: Message::Legacy {
                 chain_id: CHAIN_ID,
                 nonce: 6,
                 gas_price: 1_000_000.into(),
@@ -472,7 +464,7 @@ mod tests {
                 value: 0x10.into(),
                 input: Bytes::new(),
             },
-            signature: TransactionSignature::new(
+            signature: MessageSignature::new(
                 false,
                 H256::from(hex!(
                     "ac0222c1258eada1f828729186b723eaf3dd7f535c5de7271ea02470cbb1029f"
@@ -486,8 +478,8 @@ mod tests {
 
         let hash2_2 = tx2_2.hash();
 
-        let tx2_3 = Transaction {
-            message: TransactionMessage::Legacy {
+        let tx2_3 = MessageWithSignature {
+            message: Message::Legacy {
                 chain_id: CHAIN_ID,
                 nonce: 2,
                 gas_price: 1_000_000.into(),
@@ -496,7 +488,7 @@ mod tests {
                 value: 2.into(),
                 input: Bytes::new(),
             },
-            signature: TransactionSignature::new(
+            signature: MessageSignature::new(
                 true,
                 H256::from(hex!(
                     "e41df92d64612590f72cae9e8895cd34ce0a545109f060879add106336bb5055"

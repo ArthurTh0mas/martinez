@@ -1,10 +1,7 @@
 use super::*;
-use arrayref::array_ref;
 use async_stream::try_stream;
 use async_trait::async_trait;
-use bytes::Bytes;
-use ethereum_types::Address;
-use futures_core::stream::{BoxStream, LocalBoxStream};
+use futures_core::Stream;
 use std::fmt::Debug;
 
 #[async_trait]
@@ -22,7 +19,7 @@ pub trait MutableKV: KV + 'static {
 }
 
 pub trait TableEncode: Send + Sync + Sized {
-    type Encoded: AsRef<[u8]> + Send + Sync + Default;
+    type Encoded: AsRef<[u8]> + Send + Sync;
 
     fn encode(self) -> Self::Encoded;
 }
@@ -48,99 +45,69 @@ pub trait DupSort: Table {
 
 #[async_trait]
 pub trait Transaction<'db>: Send + Sync + Debug + Sized {
-    type Cursor<'tx, T: Table>: Cursor<'tx, T>;
-    type CursorDupSort<'tx, T: DupSort>: CursorDupSort<'tx, T>;
+    type Cursor<'tx, T: Table>: Cursor<'tx, T>
+    where
+        'db: 'tx,
+        Self: 'tx;
+    type CursorDupSort<'tx, T: DupSort>: CursorDupSort<'tx, T>
+    where
+        'db: 'tx,
+        Self: 'tx;
 
     fn id(&self) -> u64;
 
-    async fn cursor<'tx, T>(&'tx self, table: &T) -> anyhow::Result<Self::Cursor<'tx, T>>
+    async fn cursor<'tx, T>(&'tx self, table: T) -> anyhow::Result<Self::Cursor<'tx, T>>
     where
         'db: 'tx,
         T: Table;
     async fn cursor_dup_sort<'tx, T>(
         &'tx self,
-        table: &T,
+        table: T,
     ) -> anyhow::Result<Self::CursorDupSort<'tx, T>>
     where
         'db: 'tx,
         T: DupSort;
 
-    async fn get<'tx, T>(&'tx self, table: &T, key: T::Key) -> anyhow::Result<Option<T::Value>>
+    async fn get<'tx, T>(&'tx self, table: T, key: T::Key) -> anyhow::Result<Option<T::Value>>
     where
         'db: 'tx,
         T: Table;
-
-    async fn read_sequence<'tx, T>(&'tx self, table: &T) -> anyhow::Result<u64>
-    where
-        T: Table,
-    {
-        Ok(self
-            .cursor(&CustomTable(table.db_name()))
-            .await?
-            .seek_exact(table.db_name().as_bytes().to_vec())
-            .await?
-            .map(|(_, v)| u64::from_be_bytes(*array_ref!(v, 0, 8)))
-            .unwrap_or(0))
-    }
 }
 
 #[async_trait]
 pub trait MutableTransaction<'db>: Transaction<'db> {
-    type MutableCursor<'tx, T: Table>: MutableCursor<'tx, T>;
-    type MutableCursorDupSort<'tx, T: DupSort>: MutableCursorDupSort<'tx, T>;
+    type MutableCursor<'tx, T: Table>: MutableCursor<'tx, T>
+    where
+        'db: 'tx,
+        Self: 'tx;
+    type MutableCursorDupSort<'tx, T: DupSort>: MutableCursorDupSort<'tx, T>
+    where
+        'db: 'tx,
+        Self: 'tx;
 
     async fn mutable_cursor<'tx, T>(
         &'tx self,
-        table: &T,
+        table: T,
     ) -> anyhow::Result<Self::MutableCursor<'tx, T>>
     where
         'db: 'tx,
         T: Table;
     async fn mutable_cursor_dupsort<'tx, T>(
         &'tx self,
-        table: &T,
+        table: T,
     ) -> anyhow::Result<Self::MutableCursorDupSort<'tx, T>>
     where
         'db: 'tx,
         T: DupSort;
 
-    async fn set<T: Table>(&self, table: &T, k: T::Key, v: T::Value) -> anyhow::Result<()>;
+    async fn set<T: Table>(&self, table: T, k: T::Key, v: T::Value) -> anyhow::Result<()>;
 
-    async fn del<T: Table>(
-        &self,
-        table: &T,
-        k: T::Key,
-        v: Option<T::Value>,
-    ) -> anyhow::Result<bool>;
+    async fn del<T: Table>(&self, table: T, k: T::Key, v: Option<T::Value>)
+        -> anyhow::Result<bool>;
 
-    async fn clear_table<T: Table>(&self, table: &T) -> anyhow::Result<()>;
+    async fn clear_table<T: Table>(&self, table: T) -> anyhow::Result<()>;
 
     async fn commit(self) -> anyhow::Result<()>;
-
-    /// Allows to create a linear sequence of unique positive integers for each table.
-    /// Can be called for a read transaction to retrieve the current sequence value, and the increment must be zero.
-    /// Sequence changes become visible outside the current write transaction after it is committed, and discarded on abort.
-    /// Starts from 0.
-    async fn increment_sequence<T>(&self, table: &T, amount: u64) -> anyhow::Result<u64>
-    where
-        T: Table,
-    {
-        let mut c = self.mutable_cursor(&CustomTable(table.db_name())).await?;
-
-        let current_v = c
-            .seek_exact(table.db_name().as_bytes().to_vec())
-            .await?
-            .map(|(_, v)| u64::from_be_bytes(*array_ref!(v, 0, 8)))
-            .unwrap_or(0);
-
-        c.put(
-            table.db_name().as_bytes().to_vec(),
-            (current_v + amount).to_be_bytes().to_vec(),
-        )
-        .await?;
-
-        Ok(current_v)
-    }
 }
 
 #[async_trait]
@@ -169,63 +136,124 @@ where
     async fn current(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>>
     where
         T::Key: TableDecode;
+}
 
-    fn walk<'cur>(
-        &'cur mut self,
-        start_key: Option<T::SeekKey>,
-    ) -> BoxStream<'cur, anyhow::Result<(T::Key, T::Value)>>
-    where
-        T::Key: TableDecode,
-        'tx: 'cur,
-    {
-        Box::pin(try_stream! {
-            let start = if let Some(start_key) = start_key {
-                self.seek(start_key).await?
-            } else {
-                self.first().await?
-            };
-            if let Some(mut fv) = start {
-                loop {
-                    yield fv;
+pub fn walk<'tx: 'cur, 'cur, C, T>(
+    cursor: &'cur mut C,
+    start_key: Option<T::SeekKey>,
+) -> impl Stream<Item = anyhow::Result<(T::Key, T::Value)>> + 'cur
+where
+    C: Cursor<'tx, T>,
+    T: Table,
+    T::Key: TableDecode,
+    'tx: 'cur,
+{
+    try_stream! {
+        let start = if let Some(start_key) = start_key {
+            cursor.seek(start_key).await?
+        } else {
+            cursor.first().await?
+        };
+        if let Some(mut fv) = start {
+            loop {
+                yield fv;
 
-                    match self.next().await? {
-                        Some(fv1) => {
-                            fv = fv1;
-                        }
-                        None => break,
+                match cursor.next().await? {
+                    Some(fv1) => {
+                        fv = fv1;
                     }
+                    None => break,
                 }
             }
-        })
+        }
     }
+}
 
-    fn walk_back<'cur>(
-        &'cur mut self,
-        start_key: Option<T::SeekKey>,
-    ) -> BoxStream<'cur, anyhow::Result<(T::Key, T::Value)>>
-    where
-        T::Key: TableDecode,
-        'tx: 'cur,
-    {
-        Box::pin(try_stream! {
-            let start = if let Some(start_key) = start_key {
-                self.seek(start_key).await?
-            } else {
-                self.last().await?
-            };
-            if let Some(mut fv) = start {
+pub fn walk_back<'tx: 'cur, 'cur, C, T>(
+    cursor: &'cur mut C,
+    start_key: Option<T::SeekKey>,
+) -> impl Stream<Item = anyhow::Result<(T::Key, T::Value)>> + 'cur
+where
+    C: Cursor<'tx, T>,
+    T: Table,
+    T::Key: TableDecode,
+    'tx: 'cur,
+{
+    try_stream! {
+        let start = if let Some(start_key) = start_key {
+            cursor.seek(start_key).await?
+        } else {
+            cursor.last().await?
+        };
+        if let Some(mut fv) = start {
+            loop {
+                yield fv;
+
+                match cursor.prev().await? {
+                    Some(fv1) => {
+                        fv = fv1;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+}
+
+/// Walk over duplicates for some specific key.
+pub fn walk_dup<'tx: 'cur, 'cur, C, T>(
+    cursor: &'cur mut C,
+    start_key: T::Key,
+) -> impl Stream<Item = anyhow::Result<T::Value>> + 'cur
+where
+    C: CursorDupSort<'tx, T>,
+    T: DupSort,
+    T::Key: TableDecode,
+    'tx: 'cur,
+{
+    try_stream! {
+        let start = cursor.seek_exact(start_key).await?.map(|(_, v)| v);
+        if let Some(mut value) = start {
+            loop {
+                yield value;
+
+                match cursor.next_dup().await? {
+                    Some((_, v)) => {
+                        value = v;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+}
+
+/// Walk over duplicates for some specific key.
+pub fn walk_back_dup<'tx: 'cur, 'cur, C, T>(
+    cursor: &'cur mut C,
+    start_key: T::Key,
+) -> impl Stream<Item = anyhow::Result<T::Value>> + 'cur
+where
+    C: CursorDupSort<'tx, T>,
+    T: DupSort,
+    T::Key: TableDecode,
+    'tx: 'cur,
+{
+    try_stream! {
+        if cursor.seek_exact(start_key).await?.is_some() {
+            if let Some(mut value) = cursor.last_dup().await? {
                 loop {
-                    yield fv;
+                    yield value;
 
-                    match self.prev().await? {
-                        Some(fv1) => {
-                            fv = fv1;
+                    match cursor.prev_dup().await? {
+                        Some((_, v)) => {
+                            value = v;
                         }
                         None => break,
                     }
                 }
             }
-        })
+        }
     }
 }
 
@@ -255,9 +283,6 @@ where
     /// Both MDB_NEXT and MDB_GET_CURRENT will return the same record after
     /// this operation.
     async fn delete_current(&mut self) -> anyhow::Result<()>;
-
-    /// Fast way to calculate amount of keys in table. It counts all keys even if prefix was set.
-    async fn count(&mut self) -> anyhow::Result<usize>;
 }
 
 #[async_trait]
@@ -272,12 +297,18 @@ where
     ) -> anyhow::Result<Option<T::Value>>
     where
         T::Key: Clone;
+    async fn last_dup(&mut self) -> anyhow::Result<Option<T::Value>>
+    where
+        T::Key: TableDecode;
     /// Position at next data item of current key
     async fn next_dup(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>>
     where
         T::Key: TableDecode;
     /// Position at first data item of next key
     async fn next_no_dup(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>>
+    where
+        T::Key: TableDecode;
+    async fn prev_dup(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>>
     where
         T::Key: TableDecode;
 }
@@ -291,21 +322,4 @@ where
     async fn delete_current_duplicates(&mut self) -> anyhow::Result<()>;
     /// Same as `Cursor::append`, but for sorted dup data
     async fn append_dup(&mut self, key: T::Key, value: T::Value) -> anyhow::Result<()>;
-}
-
-#[async_trait]
-pub trait HasStats: Send {
-    /// DB size
-    async fn disk_size(&self) -> anyhow::Result<u64>;
-}
-
-#[allow(dead_code)]
-pub struct SubscribeReply;
-
-#[async_trait]
-pub trait Backend: Send {
-    async fn add_local(&self, v: Bytes) -> anyhow::Result<Bytes>;
-    async fn etherbase(&self) -> anyhow::Result<Address>;
-    async fn net_version(&self) -> anyhow::Result<u64>;
-    async fn subscribe(&self) -> anyhow::Result<LocalBoxStream<'static, SubscribeReply>>;
 }

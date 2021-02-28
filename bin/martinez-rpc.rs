@@ -5,19 +5,19 @@ use martinez::{
     stagedsync::stages::*,
 };
 use async_trait::async_trait;
+use clap::Parser;
 use ethereum_types::{Address, U256};
 use jsonrpsee::{core::RpcResult, http_server::HttpServerBuilder, proc_macros::rpc};
 use std::{future::pending, net::SocketAddr, sync::Arc};
-use structopt::StructOpt;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
-#[derive(StructOpt)]
-#[structopt(name = "Martinez RPC", about = "RPC server for Martinez")]
+#[derive(Parser)]
+#[clap(name = "Martinez RPC", about = "RPC server for Martinez")]
 pub struct Opt {
-    #[structopt(long, env)]
+    #[clap(long)]
     pub datadir: MartinezDataDir,
 
-    #[structopt(long, env)]
+    #[clap(long)]
     pub listen_address: SocketAddr,
 }
 
@@ -46,24 +46,26 @@ where
             .db
             .begin()
             .await?
-            .get(&tables::SyncStage, FINISH)
+            .get(tables::SyncStage, FINISH)
             .await?
             .unwrap_or(BlockNumber(0)))
     }
 
     async fn get_balance(&self, address: Address, block_number: BlockNumber) -> RpcResult<U256> {
-        Ok(
-            martinez::get_account_data_as_of(&self.db.begin().await?, address, block_number)
-                .await?
-                .map(|acc| acc.balance)
-                .unwrap_or_else(U256::zero),
+        Ok(martinez::accessors::state::account::read(
+            &self.db.begin().await?,
+            address,
+            Some(block_number),
         )
+        .await?
+        .map(|acc| acc.balance)
+        .unwrap_or_else(U256::zero))
     }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let opt = Opt::from_args();
+    let opt = Opt::parse();
 
     let env_filter = if std::env::var(EnvFilter::DEFAULT_ENV)
         .unwrap_or_default()
@@ -78,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
         .with(env_filter)
         .init();
 
-    let db = Arc::new(martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
+    let db = Arc::new(martinez::kv::mdbx::Environment::<mdbx::NoWriteMap>::open_ro(
         mdbx::Environment::new(),
         &opt.datadir,
         martinez::kv::tables::CHAINDATA_TABLES.clone(),
