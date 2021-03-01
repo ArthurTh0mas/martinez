@@ -2,8 +2,6 @@
     bool_to_option,
     destructuring_assignment,
     entry_insert,
-    generator_trait,
-    generators,
     generic_associated_types,
     let_else,
     map_first_last,
@@ -39,6 +37,14 @@ pub mod stages;
 mod state;
 pub(crate) mod util;
 
+pub use kv::{
+    mdbx::Environment as MdbxEnvironment,
+    new_mem_database,
+    remote::{kv_client::KvClient as RemoteKvClient, RemoteCursor, RemoteTransaction},
+    traits::{
+        Cursor, CursorDupSort, MutableCursor, MutableCursorDupSort, MutableTransaction, Transaction,
+    },
+};
 pub use stagedsync::stages::StageId;
 pub use state::*;
 pub use util::*;

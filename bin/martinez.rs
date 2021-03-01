@@ -3,7 +3,8 @@ use martinez::{
     downloader::sentry_status_provider::SentryStatusProvider,
     kv::{
         tables::{self, ErasedTable},
-        traits::*,
+        traits::{MutableKV, KV},
+        TableEncode,
     },
     models::*,
     sentry::{
@@ -12,35 +13,34 @@ use martinez::{
     },
     stagedsync::{self, stage::*, stages::FINISH},
     stages::*,
-    version_string, StageId,
+    version_string, Cursor, MutableCursor, MutableTransaction, StageId, Transaction,
 };
 use anyhow::bail;
 use async_trait::async_trait;
-use clap::Parser;
 use rayon::prelude::*;
 use std::{
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::pin;
+use structopt::StructOpt;
 use tokio_stream::StreamExt;
 use tracing::*;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
-#[derive(Parser)]
-#[clap(name = "Martinez", about = "Next-generation Ethereum implementation.")]
+#[derive(StructOpt)]
+#[structopt(name = "Martinez", about = "Next-generation Ethereum implementation.")]
 pub struct Opt {
     /// Path to Erigon database directory, where to get blocks from.
-    #[clap(long = "erigon-datadir", parse(from_os_str))]
+    #[structopt(long = "erigon-datadir", parse(from_os_str))]
     pub erigon_data_dir: Option<PathBuf>,
 
     /// Path to Martinez database directory.
-    #[clap(long = "datadir", help = "Database directory path", default_value_t)]
+    #[structopt(long = "datadir", help = "Database directory path", default_value)]
     pub data_dir: MartinezDataDir,
 
     /// Name of the testnet to join
-    #[clap(
+    #[structopt(
         long = "chain",
         help = "Name of the testnet to join",
         default_value = "mainnet"
@@ -48,7 +48,7 @@ pub struct Opt {
     pub chain_name: String,
 
     /// Sentry GRPC service URL
-    #[clap(
+    #[structopt(
         long = "sentry.api.addr",
         help = "Sentry GRPC service URL as 'http://host:port'",
         default_value = "http://localhost:8000"
@@ -56,32 +56,24 @@ pub struct Opt {
     pub sentry_api_addr: martinez::sentry::sentry_address::SentryAddress,
 
     /// Last block where to sync to.
-    #[clap(long)]
+    #[structopt(long)]
     pub max_block: Option<BlockNumber>,
 
     /// Downloader options.
-    #[clap(flatten)]
+    #[structopt(flatten)]
     pub downloader_opts: martinez::downloader::opts::Opts,
 
     /// Execution batch size (Ggas).
-    #[clap(long, default_value = "5000")]
+    #[structopt(long, default_value = "5000")]
     pub execution_batch_size: u64,
 
     /// Execution history batch size (Ggas).
-    #[clap(long, default_value = "250")]
+    #[structopt(long, default_value = "250")]
     pub execution_history_batch_size: u64,
 
     /// Exit execution stage after batch.
-    #[clap(long)]
+    #[structopt(long, env)]
     pub execution_exit_after_batch: bool,
-
-    /// Exit Martinez after sync is complete and there's no progress.
-    #[clap(long)]
-    pub exit_after_sync: bool,
-
-    /// Delay applied at the terminating stage.
-    #[clap(long, default_value = "2000")]
-    pub delay_after_sync: u64,
 }
 
 #[derive(Debug)]
@@ -114,25 +106,24 @@ where
 
         let erigon_tx = self.db.begin().await?;
 
-        let mut erigon_canonical_cur = erigon_tx.cursor(tables::CanonicalHeader).await?;
-        let mut canonical_cur = tx.mutable_cursor(tables::CanonicalHeader).await?;
-        let mut erigon_header_cur = erigon_tx.cursor(tables::Header).await?;
-        let mut header_cur = tx.mutable_cursor(tables::Header).await?;
-        let mut erigon_td_cur = erigon_tx.cursor(tables::HeadersTotalDifficulty).await?;
-        let mut td_cur = tx.mutable_cursor(tables::HeadersTotalDifficulty).await?;
+        let mut erigon_canonical_cur = erigon_tx.cursor(&tables::CanonicalHeader).await?;
+        let mut canonical_cur = tx.mutable_cursor(&tables::CanonicalHeader).await?;
+        let mut erigon_header_cur = erigon_tx.cursor(&tables::Header).await?;
+        let mut header_cur = tx.mutable_cursor(&tables::Header).await?;
+        let mut erigon_td_cur = erigon_tx.cursor(&tables::HeadersTotalDifficulty).await?;
+        let mut td_cur = tx.mutable_cursor(&tables::HeadersTotalDifficulty).await?;
 
         if erigon_tx
-            .get(tables::CanonicalHeader, highest_block)
+            .get(&tables::CanonicalHeader, highest_block)
             .await?
-            != tx.get(tables::CanonicalHeader, highest_block).await?
+            != tx.get(&tables::CanonicalHeader, highest_block).await?
         {
             return Ok(ExecOutput::Unwind {
                 unwind_to: BlockNumber(highest_block.0 - 1),
             });
         }
 
-        let walker = walk(&mut erigon_canonical_cur, Some(highest_block + 1));
-        pin!(walker);
+        let mut walker = erigon_canonical_cur.walk(Some(highest_block + 1));
         while let Some((block_number, canonical_hash)) = walker.try_next().await? {
             if block_number > self.max_block.unwrap_or(BlockNumber(u64::MAX)) {
                 break;
@@ -170,6 +161,7 @@ where
         Ok(ExecOutput::Progress {
             stage_progress: highest_block,
             done: true,
+            must_commit: highest_block > original_highest_block,
         })
     }
 
@@ -181,7 +173,7 @@ where
     where
         'db: 'tx,
     {
-        let mut canonical_cur = tx.mutable_cursor(tables::CanonicalHeader).await?;
+        let mut canonical_cur = tx.mutable_cursor(&tables::CanonicalHeader).await?;
 
         while let Some((block_num, _)) = canonical_cur.last().await? {
             if block_num <= input.unwind_to {
@@ -191,7 +183,7 @@ where
             canonical_cur.delete_current().await?;
         }
 
-        let mut header_cur = tx.mutable_cursor(tables::Header).await?;
+        let mut header_cur = tx.mutable_cursor(&tables::Header).await?;
         while let Some(((block_num, _), _)) = header_cur.last().await? {
             if block_num <= input.unwind_to {
                 break;
@@ -200,7 +192,7 @@ where
             header_cur.delete_current().await?;
         }
 
-        let mut td_cur = tx.mutable_cursor(tables::HeadersTotalDifficulty).await?;
+        let mut td_cur = tx.mutable_cursor(&tables::HeadersTotalDifficulty).await?;
         while let Some(((block_num, _), _)) = td_cur.last().await? {
             if block_num <= input.unwind_to {
                 break;
@@ -211,6 +203,7 @@ where
 
         Ok(UnwindOutput {
             stage_progress: input.unwind_to,
+            must_commit: true,
         })
     }
 }
@@ -248,29 +241,31 @@ where
         let erigon_tx = self.db.begin().await?;
 
         if erigon_tx
-            .get(tables::CanonicalHeader, highest_block)
+            .get(&tables::CanonicalHeader, highest_block)
             .await?
-            != tx.get(tables::CanonicalHeader, highest_block).await?
+            != tx.get(&tables::CanonicalHeader, highest_block).await?
         {
             return Ok(ExecOutput::Unwind {
                 unwind_to: BlockNumber(highest_block.0 - 1),
             });
         }
 
-        let mut canonical_header_cur = tx.cursor(tables::CanonicalHeader).await?;
+        let mut canonical_header_cur = tx.cursor(&tables::CanonicalHeader).await?;
 
-        let mut erigon_body_cur = erigon_tx.cursor(tables::BlockBody).await?;
-        let mut body_cur = tx.mutable_cursor(tables::BlockBody).await?;
+        let mut erigon_body_cur = erigon_tx.cursor(&tables::BlockBody).await?;
+        let mut body_cur = tx.mutable_cursor(&tables::BlockBody).await?;
 
-        let mut erigon_tx_cur = erigon_tx.cursor(tables::BlockTransaction.erased()).await?;
-        let mut tx_cur = tx.mutable_cursor(tables::BlockTransaction.erased()).await?;
+        let mut erigon_tx_cur = erigon_tx.cursor(&tables::BlockTransaction.erased()).await?;
+        let mut tx_cur = tx
+            .mutable_cursor(&tables::BlockTransaction.erased())
+            .await?;
 
         let prev_body = tx
             .get(
-                tables::BlockBody,
+                &tables::BlockBody,
                 (
                     highest_block,
-                    tx.get(tables::CanonicalHeader, highest_block)
+                    tx.get(&tables::CanonicalHeader, highest_block)
                         .await?
                         .unwrap(),
                 ),
@@ -279,8 +274,7 @@ where
             .unwrap();
 
         let mut starting_index = prev_body.base_tx_id + prev_body.tx_amount as u64;
-        let canonical_header_walker = walk(&mut canonical_header_cur, Some(highest_block + 1));
-        pin!(canonical_header_walker);
+        let mut canonical_header_walker = canonical_header_cur.walk(Some(highest_block + 1));
         let mut batch = Vec::with_capacity(BUFFERING_FACTOR);
         let mut converted = Vec::with_capacity(BUFFERING_FACTOR);
 
@@ -296,7 +290,8 @@ where
                 {
                     let base_tx_id = body.base_tx_id;
 
-                    let txs = walk(&mut erigon_tx_cur, Some(base_tx_id.encode().to_vec()))
+                    let txs = erigon_tx_cur
+                        .walk(Some(base_tx_id.encode().to_vec()))
                         .map(|res| res.map(|(_, tx)| tx))
                         .take(body.tx_amount)
                         .collect::<anyhow::Result<Vec<_>>>()
@@ -391,6 +386,7 @@ where
         Ok(ExecOutput::Progress {
             stage_progress: highest_block,
             done,
+            must_commit: highest_block > original_highest_block,
         })
     }
     async fn unwind<'tx>(
@@ -401,8 +397,8 @@ where
     where
         'db: 'tx,
     {
-        let mut block_body_cur = tx.mutable_cursor(tables::BlockBody).await?;
-        let mut block_tx_cur = tx.mutable_cursor(tables::BlockTransaction).await?;
+        let mut block_body_cur = tx.mutable_cursor(&tables::BlockBody).await?;
+        let mut block_tx_cur = tx.mutable_cursor(&tables::BlockTransaction).await?;
         while let Some(((block_num, _), body)) = block_body_cur.last().await? {
             if block_num <= input.unwind_to {
                 break;
@@ -423,6 +419,7 @@ where
 
         Ok(UnwindOutput {
             stage_progress: input.unwind_to,
+            must_commit: true,
         })
     }
 }
@@ -430,8 +427,6 @@ where
 #[derive(Debug)]
 struct TerminatingStage {
     max_block: Option<BlockNumber>,
-    exit_after_sync: bool,
-    delay_after_sync: Duration,
 }
 
 #[async_trait]
@@ -461,19 +456,11 @@ where
                 ExecOutput::Progress {
                     stage_progress: prev_stage,
                     done: true,
+                    must_commit: true,
                 }
             } else {
-                if self.exit_after_sync {
-                    info!("Sync complete, exiting.");
-                    std::process::exit(0)
-                }
-
-                tokio::time::sleep(self.delay_after_sync).await;
-
-                ExecOutput::Progress {
-                    stage_progress: prev_stage,
-                    done: true,
-                }
+                info!("Sync complete, exiting.");
+                std::process::exit(0)
             },
         )
     }
@@ -487,6 +474,7 @@ where
     {
         Ok(UnwindOutput {
             stage_progress: input.unwind_to,
+            must_commit: true,
         })
     }
 }
@@ -494,7 +482,7 @@ where
 #[allow(unreachable_code)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let opt: Opt = Opt::parse();
+    let opt: Opt = Opt::from_args();
 
     // tracing setup
     let env_filter = if std::env::var(EnvFilter::DEFAULT_ENV)
@@ -518,7 +506,7 @@ async fn main() -> anyhow::Result<()> {
     // database setup
     let erigon_db = if let Some(erigon_data_dir) = opt.erigon_data_dir {
         let erigon_chain_data_dir = erigon_data_dir.join("chaindata");
-        let erigon_db = martinez::kv::mdbx::Environment::<mdbx::NoWriteMap>::open_ro(
+        let erigon_db = martinez::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
             mdbx::Environment::new(),
             &erigon_chain_data_dir,
             martinez::kv::tables::CHAINDATA_TABLES.clone(),
@@ -545,7 +533,7 @@ async fn main() -> anyhow::Result<()> {
     let sentry_status_provider = SentryStatusProvider::new(chain_config.clone());
     // staged sync setup
     let mut staged_sync = stagedsync::StagedSync::new();
-    staged_sync.set_min_progress_to_commit_after_stage(1024);
+    // staged_sync.set_min_progress_to_commit_after_stage(2);
     if let Some(erigon_db) = erigon_db.clone() {
         staged_sync.push(ConvertHeaders {
             db: erigon_db,
@@ -589,8 +577,6 @@ async fn main() -> anyhow::Result<()> {
     staged_sync.push(Interhashes::new(None));
     staged_sync.push(TerminatingStage {
         max_block: opt.max_block,
-        exit_after_sync: opt.exit_after_sync,
-        delay_after_sync: Duration::from_millis(opt.delay_after_sync),
     });
 
     info!("Running staged sync");

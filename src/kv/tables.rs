@@ -509,15 +509,31 @@ impl TableDecode for BitmapKey<Address> {
     }
 }
 
+/// https://github.com/rust-lang/rust/issues/61415
+#[derive(Debug, Deref, DerefMut)]
+pub struct Array60(pub [u8; ADDRESS_LENGTH + KECCAK_LENGTH + BLOCK_NUMBER_LENGTH]);
+
+impl AsRef<[u8]> for Array60 {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+
+impl Default for Array60 {
+    fn default() -> Self {
+        Self([0_u8; 60])
+    }
+}
+
 impl TableEncode for BitmapKey<(Address, H256)> {
-    type Encoded = [u8; ADDRESS_LENGTH + KECCAK_LENGTH + BLOCK_NUMBER_LENGTH];
+    type Encoded = Array60;
 
     fn encode(self) -> Self::Encoded {
         let mut out = [0; ADDRESS_LENGTH + KECCAK_LENGTH + BLOCK_NUMBER_LENGTH];
         out[..ADDRESS_LENGTH].copy_from_slice(&self.inner.0.encode());
         out[ADDRESS_LENGTH..ADDRESS_LENGTH + KECCAK_LENGTH].copy_from_slice(&self.inner.1.encode());
         out[ADDRESS_LENGTH + KECCAK_LENGTH..].copy_from_slice(&self.block_number.encode());
-        out
+        Array60(out)
     }
 }
 
@@ -758,9 +774,9 @@ struct CallTraceSetFlags {
 
 #[derive(Clone, Copy, Debug)]
 pub struct CallTraceSetEntry {
-    pub address: Address,
-    pub from: bool,
-    pub to: bool,
+    address: Address,
+    from: bool,
+    to: bool,
 }
 
 impl TableEncode for CallTraceSetEntry {
@@ -818,8 +834,8 @@ decl_table!(CumulativeIndex => BlockNumber => CumulativeData);
 decl_table!(LogTopicIndex => Vec<u8> => RoaringTreemap);
 decl_table!(LogAddressIndex => Vec<u8> => RoaringTreemap);
 decl_table!(CallTraceSet => BlockNumber => CallTraceSetEntry);
-decl_table!(CallFromIndex => BitmapKey<Address> => RoaringTreemap);
-decl_table!(CallToIndex => BitmapKey<Address> => RoaringTreemap);
+decl_table!(CallFromIndex => Vec<u8> => RoaringTreemap);
+decl_table!(CallToIndex => Vec<u8> => RoaringTreemap);
 decl_table!(BlockTransactionLookup => H256 => TruncateStart<BlockNumber>);
 decl_table!(Config => H256 => ChainSpec);
 decl_table!(SyncStage => StageId => BlockNumber);

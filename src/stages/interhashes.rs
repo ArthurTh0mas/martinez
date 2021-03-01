@@ -1,21 +1,25 @@
 use crate::{
     accessors,
     crypto::keccak256,
-    etl::collector::*,
-    kv::{tables, traits::*},
+    etl::{
+        collector::{Collector, OPTIMAL_BUFFER_CAPACITY},
+        data_provider::Entry,
+    },
+    kv::{
+        tables,
+        traits::{Cursor, CursorDupSort},
+        TableEncode,
+    },
     models::{Account, BlockNumber, RlpAccount, EMPTY_ROOT},
     stagedsync::stage::{ExecOutput, Stage, StageInput, UnwindInput, *},
     stages::stage_util::should_do_clean_promotion,
-    StageId,
+    MutableTransaction, StageId,
 };
 use anyhow::{bail, format_err, Context};
 use async_trait::async_trait;
 use ethereum_types::*;
-use futures_core::Stream;
 use rlp::RlpStream;
 use std::{cmp, collections::BTreeMap};
-use tokio::pin;
-use tokio_stream::StreamExt;
 use tracing::*;
 
 fn hex_prefix(nibbles: &[u8], user_flag: bool) -> Vec<u8> {
@@ -227,22 +231,22 @@ trait CollectToTrie {
 }
 
 struct StateTrieCollector<'co> {
-    collector: &'co mut TableCollector<tables::TrieAccount>,
+    collector: &'co mut Collector<tables::TrieAccount>,
 }
 
 impl<'co> CollectToTrie for StateTrieCollector<'co> {
     fn collect(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        self.collector.push(key, value);
+        self.collector.collect(Entry::new(key, value));
     }
 }
 
 struct StorageTrieCollector<'co> {
-    collector: &'co mut TableCollector<tables::TrieStorage>,
+    collector: &'co mut Collector<tables::TrieStorage>,
     path_prefix: Vec<u8>,
 }
 
 impl<'co> StorageTrieCollector<'co> {
-    fn new(collector: &'co mut TableCollector<tables::TrieStorage>, hashed_address: H256) -> Self {
+    fn new(collector: &'co mut Collector<tables::TrieStorage>, hashed_address: H256) -> Self {
         Self {
             collector,
             path_prefix: TableEncode::encode(hashed_address).to_vec(),
@@ -254,7 +258,7 @@ impl<'co> CollectToTrie for StorageTrieCollector<'co> {
     fn collect(&mut self, key: Vec<u8>, value: Vec<u8>) {
         let mut full_key = self.path_prefix.clone();
         full_key.extend_from_slice(&key);
-        self.collector.push(full_key, value);
+        self.collector.collect(Entry::new(full_key, value));
     }
 }
 
@@ -383,40 +387,46 @@ where
     }
 }
 
-async fn build_storage_trie(
-    collector: &mut TableCollector<tables::TrieStorage>,
+fn build_storage_trie(
+    collector: &mut Collector<tables::TrieStorage>,
     address_hash: H256,
-    storage_stream: impl Stream<Item = anyhow::Result<(H256, U256)>>,
-) -> anyhow::Result<H256> {
-    pin!(storage_stream);
+    storage: &[(H256, U256)],
+) -> H256 {
+    if storage.is_empty() {
+        return EMPTY_ROOT;
+    }
+
     let wrapped_collector = StorageTrieCollector::new(collector, address_hash);
     let mut builder = TrieBuilder::new(wrapped_collector);
 
-    let mut current = storage_stream.try_next().await?;
+    let mut storage_iter = storage.iter().rev();
+    let mut current = storage_iter.next();
 
-    while let Some((location, value)) = current {
-        let prev = storage_stream.try_next().await?;
+    while let Some(&(location, value)) = &mut current {
+        let current_value = value.encode();
+        let current_key = location.into();
+        let prev = storage_iter.next();
 
-        builder.handle_range(
-            location.into(),
-            rlp::encode(&value.encode().as_slice()).to_vec(),
-            prev.map(|(v, _)| v.into()),
-        );
+        let prev_key = prev.map(|&(v, _)| v.into());
+
+        let data = rlp::encode(&current_value.as_slice()).to_vec();
+
+        builder.handle_range(current_key, data, prev_key);
 
         current = prev;
     }
 
-    Ok(builder.get_root())
+    builder.get_root()
 }
 
-/// Walker over accounts that computes account storage root.
 struct GenerateWalker<'db: 'tx, 'tx: 'co, 'co, RwTx>
 where
-    RwTx: MutableTransaction<'db> + 'tx,
+    RwTx: MutableTransaction<'db>,
 {
     cursor: RwTx::Cursor<'tx, tables::HashedAccount>,
     storage_cursor: RwTx::CursorDupSort<'tx, tables::HashedStorage>,
-    storage_collector: &'co mut TableCollector<tables::TrieStorage>,
+    trie_builder: TrieBuilder<StateTrieCollector<'co>>,
+    storage_collector: &'co mut Collector<tables::TrieStorage>,
 }
 
 impl<'db: 'tx, 'tx: 'co, 'co, RwTx> GenerateWalker<'db, 'tx, 'co, RwTx>
@@ -425,18 +435,21 @@ where
 {
     async fn new(
         tx: &'tx RwTx,
-        storage_collector: &'co mut TableCollector<tables::TrieStorage>,
+        collector: &'co mut Collector<tables::TrieAccount>,
+        storage_collector: &'co mut Collector<tables::TrieStorage>,
     ) -> anyhow::Result<GenerateWalker<'db, 'tx, 'co, RwTx>>
     where
         RwTx: MutableTransaction<'db>,
     {
-        let mut cursor = tx.cursor(tables::HashedAccount).await?;
-        let storage_cursor = tx.cursor_dup_sort(tables::HashedStorage).await?;
+        let mut cursor = tx.cursor(&tables::HashedAccount).await?;
+        let storage_cursor = tx.cursor_dup_sort(&tables::HashedStorage).await?;
         cursor.last().await?;
+        let trie_builder = TrieBuilder::new(StateTrieCollector { collector });
 
         Ok(GenerateWalker {
             cursor,
             storage_cursor,
+            trie_builder,
             storage_collector,
         })
     }
@@ -446,12 +459,7 @@ where
         value: Option<(H256, Account)>,
     ) -> anyhow::Result<Option<(H256, RlpAccount)>> {
         if let Some((address_hash, account)) = value {
-            let storage_root = build_storage_trie(
-                self.storage_collector,
-                address_hash,
-                walk_back_dup(&mut self.storage_cursor, address_hash),
-            )
-            .await?;
+            let storage_root = self.visit_storage(address_hash).await?;
             Ok(Some((address_hash, account.to_rlp(storage_root))))
         } else {
             Ok(None)
@@ -467,21 +475,54 @@ where
         let init_value = self.cursor.last().await?;
         self.do_get_prev_account(init_value).await
     }
+
+    async fn storage_for_account(
+        &mut self,
+        address_hash: H256,
+    ) -> anyhow::Result<Vec<(H256, U256)>> {
+        let mut storage = Vec::<(H256, U256)>::new();
+        let mut found = self.storage_cursor.seek_exact(address_hash).await?;
+        while let Some((_, storage_entry)) = found {
+            storage.push((storage_entry.0, storage_entry.1));
+            found = self.storage_cursor.next_dup().await?;
+        }
+        Ok(storage)
+    }
+
+    async fn visit_storage(&mut self, address_hash: H256) -> anyhow::Result<H256> {
+        let storage = self.storage_for_account(address_hash).await?;
+        let storage_root = build_storage_trie(self.storage_collector, address_hash, &storage);
+        Ok(storage_root)
+    }
+
+    fn handle_range(
+        &mut self,
+        current_key: Nibbles,
+        account: &RlpAccount,
+        prev_key: Option<Nibbles>,
+    ) {
+        self.trie_builder
+            .handle_range(current_key, rlp::encode(account).to_vec(), prev_key);
+    }
+
+    fn get_root(&mut self) -> H256 {
+        self.trie_builder.get_root()
+    }
 }
 
 pub async fn generate_interhashes<'db: 'tx, 'tx, RwTx>(tx: &RwTx) -> anyhow::Result<H256>
 where
     RwTx: MutableTransaction<'db>,
 {
-    let mut collector = TableCollector::new(OPTIMAL_BUFFER_CAPACITY);
-    let mut storage_collector = TableCollector::new(OPTIMAL_BUFFER_CAPACITY);
+    let mut collector = Collector::new(OPTIMAL_BUFFER_CAPACITY);
+    let mut storage_collector = Collector::new(OPTIMAL_BUFFER_CAPACITY);
 
     let state_root =
         generate_interhashes_with_collectors(tx, &mut collector, &mut storage_collector).await?;
 
-    let mut write_cursor = tx.mutable_cursor(tables::TrieAccount.erased()).await?;
+    let mut write_cursor = tx.mutable_cursor(&tables::TrieAccount.erased()).await?;
     collector.load(&mut write_cursor).await?;
-    let mut storage_write_cursor = tx.mutable_cursor(tables::TrieStorage.erased()).await?;
+    let mut storage_write_cursor = tx.mutable_cursor(&tables::TrieStorage.erased()).await?;
     storage_collector.load(&mut storage_write_cursor).await?;
 
     Ok(state_root)
@@ -489,37 +530,33 @@ where
 
 async fn generate_interhashes_with_collectors<'db: 'tx, 'tx, RwTx>(
     tx: &RwTx,
-    collector: &mut TableCollector<tables::TrieAccount>,
-    storage_collector: &mut TableCollector<tables::TrieStorage>,
+    collector: &mut Collector<tables::TrieAccount>,
+    storage_collector: &mut Collector<tables::TrieStorage>,
 ) -> anyhow::Result<H256>
 where
     RwTx: MutableTransaction<'db>,
 {
-    tx.clear_table(tables::TrieAccount).await?;
-    tx.clear_table(tables::TrieStorage).await?;
+    tx.clear_table(&tables::TrieAccount).await?;
+    tx.clear_table(&tables::TrieStorage).await?;
 
-    let mut account_trie_builder = TrieBuilder::new(StateTrieCollector { collector });
-
-    let mut walker = GenerateWalker::new(tx, storage_collector).await?;
+    let mut walker = GenerateWalker::new(tx, collector, storage_collector).await?;
     let mut current = walker.get_last_account().await?;
 
-    while let Some((hashed_account_key, account)) = current {
+    while let Some((hashed_account_key, account_data)) = current {
         let upcoming = walker.get_prev_account().await?;
-        account_trie_builder.handle_range(
-            hashed_account_key.into(),
-            rlp::encode(&account).to_vec(),
-            upcoming.as_ref().map(|&(key, _)| key.into()),
-        );
+        let current_key = hashed_account_key.into();
+        let upcoming_key = upcoming.as_ref().map(|&(key, _)| key.into());
+        walker.handle_range(current_key, &account_data, upcoming_key);
         current = upcoming;
     }
 
-    Ok(account_trie_builder.get_root())
+    Ok(walker.get_root())
 }
 
 async fn update_interhashes<'db: 'tx, 'tx, RwTx>(
     tx: &RwTx,
-    collector: &mut TableCollector<tables::TrieAccount>,
-    storage_collector: &mut TableCollector<tables::TrieStorage>,
+    collector: &mut Collector<tables::TrieAccount>,
+    storage_collector: &mut Collector<tables::TrieStorage>,
     from: BlockNumber,
     to: BlockNumber,
 ) -> anyhow::Result<H256>
@@ -570,8 +607,8 @@ where
         let past_progress = input.stage_progress.unwrap_or(genesis);
 
         if max_block > past_progress {
-            let mut collector = TableCollector::new(OPTIMAL_BUFFER_CAPACITY);
-            let mut storage_collector = TableCollector::new(OPTIMAL_BUFFER_CAPACITY);
+            let mut collector = Collector::new(OPTIMAL_BUFFER_CAPACITY);
+            let mut storage_collector = Collector::new(OPTIMAL_BUFFER_CAPACITY);
 
             let trie_root = if should_do_clean_promotion(
                 tx,
@@ -619,15 +656,16 @@ where
                 )
             }
 
-            let mut write_cursor = tx.mutable_cursor(tables::TrieAccount.erased()).await?;
+            let mut write_cursor = tx.mutable_cursor(&tables::TrieAccount.erased()).await?;
             collector.load(&mut write_cursor).await?;
-            let mut storage_write_cursor = tx.mutable_cursor(tables::TrieStorage.erased()).await?;
+            let mut storage_write_cursor = tx.mutable_cursor(&tables::TrieStorage.erased()).await?;
             storage_collector.load(&mut storage_write_cursor).await?
         };
 
         Ok(ExecOutput::Progress {
             stage_progress: cmp::max(max_block, past_progress),
             done: true,
+            must_commit: true,
         })
     }
 
@@ -641,11 +679,12 @@ where
     {
         let _ = input;
         // TODO: proper unwind
-        tx.clear_table(tables::TrieAccount).await?;
-        tx.clear_table(tables::TrieStorage).await?;
+        tx.clear_table(&tables::TrieAccount).await?;
+        tx.clear_table(&tables::TrieStorage).await?;
 
         Ok(UnwindOutput {
             stage_progress: BlockNumber(0),
+            must_commit: true,
         })
     }
 }
@@ -654,8 +693,11 @@ where
 mod tests {
     use super::*;
     use crate::{
-        crypto::trie_root, h256_to_u256, kv::new_mem_database, models::EMPTY_HASH, u256_to_h256,
-        zeroless_view,
+        crypto::trie_root,
+        h256_to_u256,
+        kv::traits::{MutableCursor, MutableKV},
+        models::EMPTY_HASH,
+        new_mem_database, u256_to_h256, zeroless_view,
     };
     use ethereum_types::{H256, U256};
     use hex_literal::hex;
@@ -716,7 +758,7 @@ mod tests {
         let expected = expected_root(&accounts);
 
         {
-            let mut cursor = tx.mutable_cursor(tables::HashedAccount).await.unwrap();
+            let mut cursor = tx.mutable_cursor(&tables::HashedAccount).await.unwrap();
             for (address_hash, account) in accounts {
                 cursor.append(address_hash, account).await.unwrap();
             }
@@ -726,9 +768,8 @@ mod tests {
 
         let tx = db.begin_mutable().await.unwrap();
 
-        let mut _collector = TableCollector::<tables::TrieAccount>::new(OPTIMAL_BUFFER_CAPACITY);
-        let mut _storage_collector =
-            TableCollector::<tables::TrieStorage>::new(OPTIMAL_BUFFER_CAPACITY);
+        let mut _collector = Collector::<tables::TrieAccount>::new(OPTIMAL_BUFFER_CAPACITY);
+        let mut _storage_collector = Collector::<tables::TrieStorage>::new(OPTIMAL_BUFFER_CAPACITY);
         let root =
             generate_interhashes_with_collectors(&tx, &mut _collector, &mut _storage_collector)
                 .await
@@ -820,23 +861,11 @@ mod tests {
     }
 
     fn do_storage_root_matches(storage: Storage, hashed_address: H256) {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(async move {
-                let mut _collector =
-                    TableCollector::<tables::TrieStorage>::new(OPTIMAL_BUFFER_CAPACITY);
-                let vec_storage = storage.clone().into_iter().map(Ok).collect::<Vec<_>>();
-                let actual = build_storage_trie(
-                    &mut _collector,
-                    hashed_address,
-                    tokio_stream::iter(vec_storage),
-                )
-                .await
-                .unwrap();
-                let expected = expected_storage_root(storage);
-                assert_eq!(expected, actual);
-            })
+        let mut _collector = Collector::<tables::TrieStorage>::new(OPTIMAL_BUFFER_CAPACITY);
+        let vec_storage = storage.iter().map(|(&k, &v)| (k, v)).collect::<Vec<_>>();
+        let actual = build_storage_trie(&mut _collector, hashed_address, &vec_storage);
+        let expected = expected_storage_root(storage);
+        assert_eq!(expected, actual);
     }
 
     proptest! {

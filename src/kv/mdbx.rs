@@ -1,4 +1,7 @@
-use crate::kv::{traits::*, *};
+use crate::{
+    kv::{traits, *},
+    Cursor, CursorDupSort, MutableCursor, MutableCursorDupSort, Transaction,
+};
 use ::mdbx::{DatabaseFlags, EnvironmentKind, TransactionKind, WriteFlags, RO, RW};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -10,7 +13,7 @@ struct TableObjectWrapper<T>(T);
 
 impl<'tx, T> ::mdbx::TableObject<'tx> for TableObjectWrapper<T>
 where
-    T: TableDecode,
+    T: traits::TableDecode,
 {
     fn decode(data_val: &[u8]) -> Result<Self, ::mdbx::Error>
     where
@@ -97,7 +100,7 @@ impl<E: EnvironmentKind> Deref for Environment<E> {
 }
 
 #[async_trait]
-impl<E: EnvironmentKind> KV for Environment<E> {
+impl<E: EnvironmentKind> traits::KV for Environment<E> {
     type Tx<'tx> = MdbxTransaction<'tx, RO, E>;
 
     async fn begin(&self) -> anyhow::Result<Self::Tx<'_>> {
@@ -108,7 +111,7 @@ impl<E: EnvironmentKind> KV for Environment<E> {
 }
 
 #[async_trait]
-impl<E: EnvironmentKind> MutableKV for Environment<E> {
+impl<E: EnvironmentKind> traits::MutableKV for Environment<E> {
     type MutableTx<'tx> = MdbxTransaction<'tx, RW, E>;
 
     async fn begin_mutable(&self) -> anyhow::Result<Self::MutableTx<'_>> {
@@ -162,25 +165,19 @@ where
 }
 
 #[async_trait]
-impl<'env, K, E> Transaction<'env> for MdbxTransaction<'env, K, E>
+impl<'env, K, E> traits::Transaction<'env> for MdbxTransaction<'env, K, E>
 where
     K: TransactionKind,
     E: EnvironmentKind,
 {
-    type Cursor<'tx, T: Table>
-    where
-        'env: 'tx,
-    = MdbxCursor<'tx, K>;
-    type CursorDupSort<'tx, T: DupSort>
-    where
-        'env: 'tx,
-    = MdbxCursor<'tx, K>;
+    type Cursor<'tx, T: Table> = MdbxCursor<'tx, K>;
+    type CursorDupSort<'tx, T: DupSort> = MdbxCursor<'tx, K>;
 
     fn id(&self) -> u64 {
         self.inner.id()
     }
 
-    async fn cursor<'tx, T>(&'tx self, table: T) -> anyhow::Result<Self::Cursor<'tx, T>>
+    async fn cursor<'tx, T>(&'tx self, table: &T) -> anyhow::Result<Self::Cursor<'tx, T>>
     where
         'env: 'tx,
         T: Table,
@@ -194,7 +191,7 @@ where
         })
     }
 
-    async fn cursor_dup_sort<'tx, T>(&'tx self, table: T) -> anyhow::Result<Self::Cursor<'tx, T>>
+    async fn cursor_dup_sort<'tx, T>(&'tx self, table: &T) -> anyhow::Result<Self::Cursor<'tx, T>>
     where
         'env: 'tx,
         T: DupSort,
@@ -204,7 +201,7 @@ where
 
     async fn get<'tx, T: Table>(
         &'tx self,
-        table: T,
+        table: &T,
         key: T::Key,
     ) -> anyhow::Result<Option<T::Value>> {
         Ok(self
@@ -218,19 +215,13 @@ where
 }
 
 #[async_trait]
-impl<'env, E: EnvironmentKind> MutableTransaction<'env> for MdbxTransaction<'env, RW, E> {
-    type MutableCursor<'tx, T: Table>
-    where
-        'env: 'tx,
-    = MdbxCursor<'tx, RW>;
-    type MutableCursorDupSort<'tx, T: DupSort>
-    where
-        'env: 'tx,
-    = MdbxCursor<'tx, RW>;
+impl<'env, E: EnvironmentKind> traits::MutableTransaction<'env> for MdbxTransaction<'env, RW, E> {
+    type MutableCursor<'tx, T: Table> = MdbxCursor<'tx, RW>;
+    type MutableCursorDupSort<'tx, T: DupSort> = MdbxCursor<'tx, RW>;
 
     async fn mutable_cursor<'tx, T>(
         &'tx self,
-        table: T,
+        table: &T,
     ) -> anyhow::Result<Self::MutableCursor<'tx, T>>
     where
         'env: 'tx,
@@ -241,7 +232,7 @@ impl<'env, E: EnvironmentKind> MutableTransaction<'env> for MdbxTransaction<'env
 
     async fn mutable_cursor_dupsort<'tx, T>(
         &'tx self,
-        table: T,
+        table: &T,
     ) -> anyhow::Result<Self::MutableCursorDupSort<'tx, T>>
     where
         'env: 'tx,
@@ -250,7 +241,7 @@ impl<'env, E: EnvironmentKind> MutableTransaction<'env> for MdbxTransaction<'env
         self.mutable_cursor(table).await
     }
 
-    async fn set<T>(&self, table: T, k: T::Key, v: T::Value) -> anyhow::Result<()>
+    async fn set<T>(&self, table: &T, k: T::Key, v: T::Value) -> anyhow::Result<()>
     where
         T: Table,
     {
@@ -262,7 +253,7 @@ impl<'env, E: EnvironmentKind> MutableTransaction<'env> for MdbxTransaction<'env
         )?)
     }
 
-    async fn del<T>(&self, table: T, key: T::Key, value: Option<T::Value>) -> anyhow::Result<bool>
+    async fn del<T>(&self, table: &T, key: T::Key, value: Option<T::Value>) -> anyhow::Result<bool>
     where
         T: Table,
     {
@@ -279,7 +270,7 @@ impl<'env, E: EnvironmentKind> MutableTransaction<'env> for MdbxTransaction<'env
         )?)
     }
 
-    async fn clear_table<T>(&self, table: T) -> anyhow::Result<()>
+    async fn clear_table<T>(&self, table: &T) -> anyhow::Result<()>
     where
         T: Table,
     {
@@ -406,16 +397,6 @@ where
         Ok(None)
     }
 
-    async fn last_dup(&mut self) -> anyhow::Result<Option<T::Value>>
-    where
-        T::Key: TableDecode,
-    {
-        Ok(self
-            .inner
-            .last_dup::<TableObjectWrapper<T::Value>>()?
-            .map(|v| v.0))
-    }
-
     async fn next_dup(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>>
     where
         T::Key: TableDecode,
@@ -428,13 +409,6 @@ where
         T::Key: TableDecode,
     {
         Ok(map_res_inner::<T, _>(self.inner.next_nodup())?)
-    }
-
-    async fn prev_dup(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>>
-    where
-        T::Key: TableDecode,
-    {
-        Ok(map_res_inner::<T, _>(self.inner.prev_dup())?)
     }
 }
 
@@ -471,6 +445,10 @@ where
         self.inner.del(WriteFlags::CURRENT)?;
 
         Ok(())
+    }
+
+    async fn count(&mut self) -> anyhow::Result<usize> {
+        todo!()
     }
 }
 

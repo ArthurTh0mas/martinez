@@ -4,7 +4,8 @@ pub mod server;
 pub mod tables;
 pub mod traits;
 
-use self::traits::*;
+pub use traits::{DupSort, Table, TableDecode, TableEncode, TableObject};
+
 use crate::kv::tables::CHAINDATA_TABLES;
 use ::mdbx::{Geometry, WriteMap};
 use async_trait::async_trait;

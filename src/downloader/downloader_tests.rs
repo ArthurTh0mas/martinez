@@ -4,7 +4,7 @@ use crate::{
         Downloader,
     },
     kv,
-    kv::traits::*,
+    kv::traits::{MutableKV, MutableTransaction},
     models::BlockNumber,
     sentry::{
         chain_config, sentry_client_connector,

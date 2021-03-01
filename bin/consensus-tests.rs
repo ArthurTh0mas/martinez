@@ -12,7 +12,6 @@ use martinez::{
 };
 use anyhow::{bail, ensure, format_err};
 use bytes::Bytes;
-use clap::Parser;
 use educe::Educe;
 use ethereum_types::*;
 use maplit::*;
@@ -27,10 +26,8 @@ use std::{
     ops::AddAssign,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::Arc,
-    time::Instant,
 };
-use tokio::runtime::Builder;
+use structopt::StructOpt;
 use tracing::*;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
@@ -55,10 +52,6 @@ pub static EXCLUDED_TESTS: Lazy<Vec<PathBuf>> = Lazy::new(|| {
         BLOCKCHAIN_DIR
             .join("GeneralStateTests")
             .join("stTimeConsuming"),
-        BLOCKCHAIN_DIR
-            .join("GeneralStateTests")
-            .join("VMTests")
-            .join("vmPerformance"),
         // We do not have extra data check
         BLOCKCHAIN_DIR
             .join("TransitionTests")
@@ -862,13 +855,13 @@ where
     out
 }
 
-#[derive(Parser)]
-#[clap(name = "Consensus tests", about = "Run consensus tests against Martinez.")]
+#[derive(StructOpt)]
+#[structopt(name = "Consensus tests", about = "Run consensus tests against Martinez.")]
 pub struct Opt {
     /// Path to consensus tests
-    #[clap(long)]
+    #[structopt(long, env)]
     pub tests: PathBuf,
-    #[clap(long)]
+    #[structopt(long, env)]
     pub test_names: Vec<String>,
 }
 
@@ -910,10 +903,9 @@ fn exclude_test(p: &Path, root: &Path) -> bool {
     false
 }
 
-async fn run() {
-    let now = Instant::now();
-
-    let opt = Opt::parse();
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let opt = Opt::from_args();
 
     let env_filter = if std::env::var(EnvFilter::DEFAULT_ENV)
         .unwrap_or_default()
@@ -929,9 +921,8 @@ async fn run() {
         .init();
 
     let root_dir = opt.tests;
-    let test_names = Arc::new(opt.test_names.into_iter().collect());
+    let test_names = opt.test_names.into_iter().collect();
 
-    let mut tasks = Vec::new();
     let mut res = RunResults::default();
 
     let mut skipped = 0;
@@ -949,11 +940,7 @@ async fn run() {
         let e = entry.unwrap();
 
         if e.file_type().is_file() {
-            let p = e.into_path();
-            let test_names = Arc::clone(&test_names);
-            tasks.push(tokio::spawn(async move {
-                run_test_file(p.as_path(), &test_names, difficulty_test).await
-            }));
+            res += run_test_file(e.path(), &test_names, difficulty_test).await;
         }
     }
 
@@ -971,11 +958,7 @@ async fn run() {
         let e = entry.unwrap();
 
         if e.file_type().is_file() {
-            let p = e.into_path();
-            let test_names = Arc::clone(&test_names);
-            tasks.push(tokio::spawn(async move {
-                run_test_file(p.as_path(), &test_names, blockchain_test).await
-            }));
+            res += run_test_file(e.path(), &test_names, blockchain_test).await;
         }
     }
 
@@ -993,35 +976,16 @@ async fn run() {
         let e = entry.unwrap();
 
         if e.file_type().is_file() {
-            let p = e.into_path();
-            let test_names = Arc::clone(&test_names);
-            tasks.push(tokio::spawn(async move {
-                run_test_file(p.as_path(), &test_names, transaction_test).await
-            }));
+            res += run_test_file(e.path(), &test_names, transaction_test).await;
         }
     }
 
-    for task in tasks {
-        res += task.await.unwrap();
-    }
-
     res.skipped += skipped;
-    println!(
-        "Ethereum Consensus Tests:\n{:?}\nElapsed {:?}",
-        res,
-        now.elapsed()
-    );
+    println!("Ethereum Consensus Tests:\n{:?}", res);
 
     if res.failed > 0 {
         std::process::exit(1);
     }
-}
 
-fn main() {
-    Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(32 * 1024 * 1024)
-        .build()
-        .unwrap()
-        .block_on(run());
+    Ok(())
 }

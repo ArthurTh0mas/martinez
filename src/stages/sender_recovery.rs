@@ -1,16 +1,15 @@
 use crate::{
     kv::{
         tables::{self, ErasedTable},
-        traits::*,
+        traits::{Cursor, MutableCursor, TableEncode},
     },
     models::*,
     stagedsync::{format_duration, stage::*},
-    StageId,
+    MutableTransaction, StageId,
 };
 use async_trait::async_trait;
 use rayon::prelude::*;
 use std::time::{Duration, Instant};
-use tokio::pin;
 use tokio_stream::StreamExt as _;
 use tracing::*;
 
@@ -38,26 +37,25 @@ where
         let mut highest_block = original_highest_block;
 
         const BUFFERING_FACTOR: usize = 5000;
-        let mut body_cur = tx.cursor(tables::BlockBody).await?;
-        let mut tx_cur = tx.cursor(tables::BlockTransaction.erased()).await?;
-        let mut senders_cur = tx.mutable_cursor(tables::TxSender.erased()).await?;
+        let mut body_cur = tx.cursor(&tables::BlockBody).await?;
+        let mut tx_cur = tx.cursor(&tables::BlockTransaction.erased()).await?;
+        let mut senders_cur = tx.mutable_cursor(&tables::TxSender.erased()).await?;
         senders_cur.last().await?;
 
-        let walker = walk(&mut body_cur, Some(BlockNumber(highest_block.0 + 1)));
-        pin!(walker);
+        let mut walker = body_cur.walk(Some(BlockNumber(highest_block.0 + 1)));
         let mut batch = Vec::with_capacity(BUFFERING_FACTOR);
         let started_at = Instant::now();
         let started_at_txnum = tx
             .get(
-                tables::CumulativeIndex,
+                &tables::CumulativeIndex,
                 input.first_started_at.1.unwrap_or(BlockNumber(0)),
             )
             .await?
             .map(|v| v.tx_num);
         let done = loop {
-            let mut read_again = false;
             while let Some(((block_number, hash), body)) = walker.try_next().await? {
-                let txs = walk(&mut tx_cur, Some(body.base_tx_id.encode().to_vec()))
+                let txs = tx_cur
+                    .walk(Some(body.base_tx_id.encode().to_vec()))
                     .take(body.tx_amount)
                     .map(|res| res.map(|(_, tx)| tx))
                     .collect::<anyhow::Result<Vec<_>>>()
@@ -67,9 +65,12 @@ where
                 highest_block = block_number;
 
                 if batch.len() > BUFFERING_FACTOR {
-                    read_again = true;
                     break;
                 }
+            }
+
+            if batch.is_empty() {
+                break true;
             }
 
             let mut recovered_senders = batch
@@ -104,10 +105,6 @@ where
                 senders_cur.append(db_key, db_value).await?;
             }
 
-            if !read_again {
-                break true;
-            }
-
             let now = Instant::now();
             let elapsed = now - started_at;
             if elapsed > Duration::from_secs(30) {
@@ -115,11 +112,11 @@ where
 
                 if let Some(started_at_txnum) = started_at_txnum {
                     let current_txnum = tx
-                        .get(tables::CumulativeIndex, highest_block)
+                        .get(&tables::CumulativeIndex, highest_block)
                         .await?
                         .map(|v| v.tx_num);
                     let total_txnum = tx
-                        .cursor(tables::CumulativeIndex)
+                        .cursor(&tables::CumulativeIndex)
                         .await?
                         .last()
                         .await?
@@ -155,6 +152,7 @@ where
         Ok(ExecOutput::Progress {
             stage_progress: highest_block,
             done,
+            must_commit: highest_block > original_highest_block,
         })
     }
 
@@ -166,7 +164,7 @@ where
     where
         'db: 'tx,
     {
-        let mut senders_cur = tx.mutable_cursor(tables::TxSender).await?;
+        let mut senders_cur = tx.mutable_cursor(&tables::TxSender).await?;
 
         while let Some(((block_number, _), _)) = senders_cur.last().await? {
             if block_number > input.unwind_to {
@@ -178,6 +176,7 @@ where
 
         Ok(UnwindOutput {
             stage_progress: input.unwind_to,
+            must_commit: true,
         })
     }
 }
@@ -185,7 +184,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{accessors::*, kv::new_mem_database};
+    use crate::{accessors::*, kv::traits::MutableKV, new_mem_database};
     use bytes::Bytes;
     use ethereum_types::*;
     use hex_literal::hex;
@@ -372,6 +371,7 @@ mod tests {
             ExecOutput::Progress {
                 stage_progress: 3.into(),
                 done: true,
+                must_commit: true,
             }
         );
 

@@ -1,9 +1,9 @@
 use self::kv_client::*;
 use super::*;
-use crate::kv::traits::*;
+use crate::kv::traits;
 use anyhow::Context;
 use async_trait::async_trait;
-pub use ethereum_interfaces::remotekv::{Cursor as GrpcCursor, *};
+pub use ethereum_interfaces::remotekv::*;
 use std::{marker::PhantomData, sync::Arc};
 use tokio::sync::{
     mpsc::{channel, Sender},
@@ -19,7 +19,7 @@ use tracing::*;
 pub struct RemoteTransaction {
     // Invariant: cannot send new message until we process response to it.
     id: u64,
-    io: Arc<AsyncMutex<(Sender<GrpcCursor>, Streaming<Pair>)>>,
+    io: Arc<AsyncMutex<(Sender<Cursor>, Streaming<Pair>)>>,
 }
 
 /// Cursor opened by `RemoteTransaction`.
@@ -34,21 +34,15 @@ pub struct RemoteCursor<'tx, B> {
 }
 
 #[async_trait]
-impl<'env> Transaction<'env> for RemoteTransaction {
-    type Cursor<'tx, T: Table>
-    where
-        'env: 'tx,
-    = RemoteCursor<'tx, T>;
-    type CursorDupSort<'tx, T: DupSort>
-    where
-        'env: 'tx,
-    = RemoteCursor<'tx, T>;
+impl<'env> crate::Transaction<'env> for RemoteTransaction {
+    type Cursor<'tx, T: Table> = RemoteCursor<'tx, T>;
+    type CursorDupSort<'tx, T: DupSort> = RemoteCursor<'tx, T>;
 
     fn id(&self) -> u64 {
         self.id
     }
 
-    async fn cursor<'tx, T>(&'tx self, table: T) -> anyhow::Result<Self::Cursor<'tx, T>>
+    async fn cursor<'tx, T>(&'tx self, table: &T) -> anyhow::Result<Self::Cursor<'tx, T>>
     where
         'env: 'tx,
         T: Table,
@@ -61,7 +55,7 @@ impl<'env> Transaction<'env> for RemoteTransaction {
 
         trace!("Sending request to open cursor");
 
-        s.0.send(GrpcCursor {
+        s.0.send(Cursor {
             op: Op::Open as i32,
             bucket_name,
             cursor: Default::default(),
@@ -86,7 +80,7 @@ impl<'env> Transaction<'env> for RemoteTransaction {
 
                 trace!("Closing cursor {}", id);
                 let _ =
-                    io.0.send(GrpcCursor {
+                    io.0.send(Cursor {
                         op: Op::Close as i32,
                         cursor: id,
                         bucket_name: Default::default(),
@@ -106,15 +100,14 @@ impl<'env> Transaction<'env> for RemoteTransaction {
         })
     }
 
-    async fn cursor_dup_sort<'tx, T>(&'tx self, table: T) -> anyhow::Result<Self::Cursor<'tx, T>>
+    async fn cursor_dup_sort<'tx, T>(&'tx self, table: &T) -> anyhow::Result<Self::Cursor<'tx, T>>
     where
-        'env: 'tx,
         T: DupSort,
     {
         self.cursor(table).await
     }
 
-    async fn get<'tx, T>(&'tx self, table: T, key: T::Key) -> anyhow::Result<Option<T::Value>>
+    async fn get<'tx, T>(&'tx self, table: &T, key: T::Key) -> anyhow::Result<Option<T::Value>>
     where
         'env: 'tx,
         T: Table,
@@ -135,7 +128,7 @@ impl<'tx, T: Table> RemoteCursor<'tx, T> {
     ) -> anyhow::Result<Option<Pair>> {
         let mut io = self.transaction.io.lock().await;
 
-        io.0.send(GrpcCursor {
+        io.0.send(Cursor {
             op: op as i32,
             cursor: self.id,
             k: key.map(|v| v.to_vec().into()).unwrap_or_default(),
@@ -255,19 +248,13 @@ impl<'tx, T: DupSort> traits::CursorDupSort<'tx, T> for RemoteCursor<'tx, T> {
     where
         T::Key: Clone,
     {
-        self.op_value(
-            Op::SeekBoth,
-            Some(key.clone().encode().as_ref()),
-            Some(value.encode().as_ref()),
-        )
-        .await
-    }
-
-    async fn last_dup(&mut self) -> anyhow::Result<Option<T::Value>>
-    where
-        T::Key: TableDecode,
-    {
-        self.op_value(Op::LastDup, None, None).await
+        Ok(self
+            .op_value(
+                Op::SeekBoth,
+                Some(key.clone().encode().as_ref()),
+                Some(value.encode().as_ref()),
+            )
+            .await?)
     }
 
     async fn next_dup(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>>
@@ -281,13 +268,6 @@ impl<'tx, T: DupSort> traits::CursorDupSort<'tx, T> for RemoteCursor<'tx, T> {
         T::Key: TableDecode,
     {
         self.op_kv(Op::NextNoDup, None, None).await
-    }
-
-    async fn prev_dup(&mut self) -> anyhow::Result<Option<(T::Key, T::Value)>>
-    where
-        T::Key: TableDecode,
-    {
-        self.op_kv(Op::PrevDup, None, None).await
     }
 }
 

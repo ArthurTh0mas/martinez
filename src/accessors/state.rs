@@ -1,42 +1,5 @@
-use crate::{
-    kv::{tables, traits::*},
-    models::*,
-};
+use crate::{models::*, Transaction};
 use ethereum_types::*;
-
-pub mod account {
-    use super::*;
-
-    pub async fn read<'db, Tx: Transaction<'db>>(
-        tx: &Tx,
-        address_to_find: Address,
-        block_number: Option<BlockNumber>,
-    ) -> anyhow::Result<Option<Account>> {
-        if let Some(block_number) = block_number {
-            if let Some(block_number) = super::history_index::find_next_block(
-                tx,
-                tables::AccountHistory,
-                address_to_find,
-                block_number,
-            )
-            .await?
-            {
-                if let Some(tables::AccountChange { address, account }) = tx
-                    .cursor_dup_sort(tables::AccountChangeSet)
-                    .await?
-                    .seek_both_range(block_number, address_to_find)
-                    .await?
-                {
-                    if address == address_to_find {
-                        return Ok(account);
-                    }
-                }
-            }
-        }
-
-        tx.get(tables::Account, address_to_find).await
-    }
-}
 
 pub mod storage {
     use super::*;
@@ -45,77 +8,21 @@ pub mod storage {
     pub async fn read<'db, Tx: Transaction<'db>>(
         tx: &Tx,
         address: Address,
-        location_to_find: U256,
+        location: U256,
         block_number: Option<BlockNumber>,
     ) -> anyhow::Result<U256> {
-        let location_to_find = u256_to_h256(location_to_find);
+        let location = u256_to_h256(location);
         if let Some(block_number) = block_number {
-            if let Some(block_number) = super::history_index::find_next_block(
-                tx,
-                tables::StorageHistory,
-                (address, location_to_find),
-                block_number,
-            )
-            .await?
-            {
-                if let Some(tables::StorageChange { location, value }) = tx
-                    .cursor_dup_sort(tables::StorageChangeSet)
+            return Ok(
+                crate::find_storage_by_history(tx, address, location, block_number)
                     .await?
-                    .seek_both_range(
-                        tables::StorageChangeKey {
-                            block_number,
-                            address,
-                        },
-                        location_to_find,
-                    )
-                    .await?
-                {
-                    if location == location_to_find {
-                        return Ok(value);
-                    }
-                }
-            }
+                    .unwrap_or_default(),
+            );
         }
 
-        Ok(crate::read_account_storage(tx, address, location_to_find)
+        Ok(crate::read_account_storage(tx, address, location)
             .await?
             .unwrap_or_default())
-    }
-}
-
-pub mod history_index {
-    use super::*;
-    use crate::kv::tables::BitmapKey;
-    use croaring::Treemap as RoaringTreemap;
-
-    pub async fn find_next_block<'db: 'tx, 'tx, Tx: Transaction<'db>, K, H>(
-        tx: &'tx Tx,
-        table: H,
-        needle: K,
-        block_number: BlockNumber,
-    ) -> anyhow::Result<Option<BlockNumber>>
-    where
-        H: Table<Key = BitmapKey<K>, Value = RoaringTreemap, SeekKey = BitmapKey<K>>,
-        BitmapKey<K>: TableObject,
-        K: Copy + PartialEq,
-    {
-        let mut ch = tx.cursor(table).await?;
-        if let Some((index_key, change_blocks)) = ch
-            .seek(BitmapKey {
-                inner: needle,
-                block_number,
-            })
-            .await?
-        {
-            if index_key.inner == needle {
-                return Ok(change_blocks
-                    .iter()
-                    .find(|&change_block| *block_number < change_block)
-                    .map(BlockNumber));
-            }
-        }
-
-        Ok(None)
     }
 }
 
@@ -124,7 +31,11 @@ pub mod tests {
     use super::*;
     use crate::{
         h256_to_u256,
-        kv::{new_mem_database, tables},
+        kv::{
+            tables,
+            traits::{MutableKV, MutableTransaction},
+        },
+        new_mem_database,
     };
     use hex_literal::hex;
 
@@ -147,13 +58,13 @@ pub mod tests {
             "4400000000000000000000000000000000000000000000000000000000000000"
         )));
 
-        txn.set(tables::Storage, address, (loc1, val1))
+        txn.set(&tables::Storage, address, (loc1, val1))
             .await
             .unwrap();
-        txn.set(tables::Storage, address, (loc2, val2))
+        txn.set(&tables::Storage, address, (loc2, val2))
             .await
             .unwrap();
-        txn.set(tables::Storage, address, (loc3, val3))
+        txn.set(&tables::Storage, address, (loc3, val3))
             .await
             .unwrap();
 
