@@ -18,8 +18,14 @@ pub trait MutableKV: KV + 'static {
     async fn begin_mutable(&self) -> anyhow::Result<Self::MutableTx<'_>>;
 }
 
+pub trait NewWithSize: AsMut<[u8]> + Default + Sized {
+    fn new_with_size(size: usize) -> Self {
+        Self::default()
+    }
+}
+
 pub trait TableEncode: Send + Sync + Sized {
-    type Encoded: AsRef<[u8]> + Send + Sync;
+    type Encoded: AsRef<[u8]> + Send + Sync + Default + Clone + Ord + TableEncode;
 
     fn encode(self) -> Self::Encoded;
 }
