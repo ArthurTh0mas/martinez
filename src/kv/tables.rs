@@ -16,21 +16,15 @@ use std::{collections::HashMap, fmt::Display, mem::size_of, sync::Arc};
 #[derive(Debug)]
 pub struct ErasedTable<T>(pub T)
 where
-    T: Table,
-    <T::Key as TableEncode>::Encoded: TableEncode,
-    <T::Value as TableEncode>::Encoded: TableEncode,
-    <T::SeekKey as TableEncode>::Encoded: TableEncode;
+    T: Table;
 
 impl<T> Table for ErasedTable<T>
 where
     T: Table,
-    <T::Key as TableEncode>::Encoded: TableEncode,
-    <T::Value as TableEncode>::Encoded: TableEncode,
-    <T::SeekKey as TableEncode>::Encoded: TableEncode,
 {
-    type Key = <T::Key as TableEncode>::Encoded;
-    type Value = <T::Value as TableEncode>::Encoded;
-    type SeekKey = <T::SeekKey as TableEncode>::Encoded;
+    type Key = Vec<u8>;
+    type Value = Vec<u8>;
+    type SeekKey = Vec<u8>;
 
     fn db_name(&self) -> string::String<StaticBytes> {
         self.0.db_name()
@@ -40,9 +34,6 @@ where
 impl<T> ErasedTable<T>
 where
     T: Table,
-    <T::Key as TableEncode>::Encoded: TableEncode,
-    <T::Value as TableEncode>::Encoded: TableEncode,
-    <T::SeekKey as TableEncode>::Encoded: TableEncode,
 {
     pub fn encode_key(object: T::Key) -> <<T as Table>::Key as TableEncode>::Encoded {
         object.encode()
@@ -128,12 +119,6 @@ impl traits::TableDecode for Vec<u8> {
     }
 }
 
-impl traits::NewWithSize for Vec<u8> {
-    fn new_with_size(size: usize) -> Self {
-        vec![0; size]
-    }
-}
-
 impl traits::TableEncode for Bytes {
     type Encoded = Self;
 
@@ -145,14 +130,6 @@ impl traits::TableEncode for Bytes {
 impl traits::TableDecode for Bytes {
     fn decode(b: &[u8]) -> anyhow::Result<Self> {
         Ok(b.to_vec().into())
-    }
-}
-
-impl traits::TableEncode for BytesMut {
-    type Encoded = BytesMut;
-
-    fn encode(self) -> Self::Encoded {
-        self
     }
 }
 
@@ -175,22 +152,6 @@ impl<const LEN: usize> AsRef<[u8]> for VariableVec<LEN> {
     }
 }
 
-impl<const LEN: usize> AsMut<[u8]> for VariableVec<LEN> {
-    fn as_mut(&mut self) -> &mut [u8] {
-        self.inner.as_mut()
-    }
-}
-
-impl<const LEN: usize> traits::NewWithSize for VariableVec<LEN> {
-    fn new_with_size(size: usize) -> Self {
-        let mut inner = ArrayVec::new();
-        while inner.len() < size {
-            inner.push(0);
-        }
-        Self { inner }
-    }
-}
-
 impl<const LEN: usize> traits::TableEncode for VariableVec<LEN> {
     type Encoded = Self;
 
@@ -210,30 +171,6 @@ impl<const LEN: usize> traits::TableDecode for VariableVec<LEN> {
 impl<const LEN: usize> From<VariableVec<LEN>> for Vec<u8> {
     fn from(v: VariableVec<LEN>) -> Self {
         v.to_vec()
-    }
-}
-
-impl<const LEN: usize> TableEncode for [u8; LEN] {
-    type Encoded = Self;
-
-    fn encode(self) -> Self::Encoded {
-        self
-    }
-}
-
-impl TableEncode for &'static str {
-    type Encoded = Self;
-
-    fn encode(self) -> Self::Encoded {
-        self
-    }
-}
-
-impl TableEncode for String {
-    type Encoded = Self;
-
-    fn encode(self) -> Self::Encoded {
-        self
     }
 }
 
@@ -572,39 +509,15 @@ impl TableDecode for BitmapKey<Address> {
     }
 }
 
-/// https://github.com/rust-lang/rust/issues/61415
-#[derive(Clone, Copy, Debug, Deref, DerefMut)]
-pub struct Array60(pub [u8; ADDRESS_LENGTH + KECCAK_LENGTH + BLOCK_NUMBER_LENGTH]);
-
-impl AsRef<[u8]> for Array60 {
-    fn as_ref(&self) -> &[u8] {
-        self.0.as_ref()
-    }
-}
-
-impl Default for Array60 {
-    fn default() -> Self {
-        Self([0_u8; 60])
-    }
-}
-
-impl TableEncode for Array60 {
-    type Encoded = Self;
-
-    fn encode(self) -> Self::Encoded {
-        self
-    }
-}
-
 impl TableEncode for BitmapKey<(Address, H256)> {
-    type Encoded = Array60;
+    type Encoded = [u8; ADDRESS_LENGTH + KECCAK_LENGTH + BLOCK_NUMBER_LENGTH];
 
     fn encode(self) -> Self::Encoded {
         let mut out = [0; ADDRESS_LENGTH + KECCAK_LENGTH + BLOCK_NUMBER_LENGTH];
         out[..ADDRESS_LENGTH].copy_from_slice(&self.inner.0.encode());
         out[ADDRESS_LENGTH..ADDRESS_LENGTH + KECCAK_LENGTH].copy_from_slice(&self.inner.1.encode());
         out[ADDRESS_LENGTH + KECCAK_LENGTH..].copy_from_slice(&self.block_number.encode());
-        Array60(out)
+        out
     }
 }
 

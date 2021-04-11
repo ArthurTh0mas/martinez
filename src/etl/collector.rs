@@ -5,13 +5,20 @@ use std::{cmp::Reverse, collections::BinaryHeap, marker::PhantomData};
 pub struct Collector<T>
 where
     T: Table,
-    <<T as Table>::Key as TableEncode>::Encoded: NewWithSize,
-    <<T as Table>::Value as TableEncode>::Encoded: NewWithSize,
+    <<T as Table>::Key as TableEncode>::Encoded: Ord,
+    <<T as Table>::Value as TableEncode>::Encoded: Ord,
+    Vec<u8>: From<<<T as Table>::Key as TableEncode>::Encoded>,
+    Vec<u8>: From<<<T as Table>::Value as TableEncode>::Encoded>,
 {
     buffer_size: usize,
-    data_providers: Vec<DataProvider<T>>,
+    data_providers: Vec<DataProvider>,
     buffer_capacity: usize,
-    buffer: Vec<Entry<T>>,
+    buffer: Vec<
+        Entry<
+            <<T as Table>::Key as TableEncode>::Encoded,
+            <<T as Table>::Value as TableEncode>::Encoded,
+        >,
+    >,
     _marker: PhantomData<T>,
 }
 
@@ -20,9 +27,10 @@ pub const OPTIMAL_BUFFER_CAPACITY: usize = 512000000; // 512 Megabytes
 impl<T> Collector<T>
 where
     T: Table,
-    Entry<T>: Ord,
-    <<T as Table>::Key as TableEncode>::Encoded: NewWithSize,
-    <<T as Table>::Value as TableEncode>::Encoded: NewWithSize,
+    <<T as Table>::Key as TableEncode>::Encoded: Ord,
+    <<T as Table>::Value as TableEncode>::Encoded: Ord,
+    Vec<u8>: From<<<T as Table>::Key as TableEncode>::Encoded>,
+    Vec<u8>: From<<<T as Table>::Value as TableEncode>::Encoded>,
 {
     pub fn new(buffer_capacity: usize) -> Self {
         Self {
@@ -42,9 +50,9 @@ where
         self.data_providers.push(DataProvider::new(buf).unwrap());
     }
 
-    pub fn collect(&mut self, entry: Entry<T>) {
-        let key = entry.key;
-        let value = entry.value;
+    pub fn collect(&mut self, entry: Entry<T::Key, T::Value>) {
+        let key = entry.key.encode();
+        let value = entry.value.encode();
         self.buffer_size += key.as_ref().len() + value.as_ref().len();
         self.buffer.push(Entry { key, value });
         if self.buffer_size > self.buffer_capacity {
@@ -96,8 +104,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use ethereum_types::H256;
-
     use super::*;
     use crate::{
         kv::{new_mem_database, tables},
@@ -107,13 +113,8 @@ mod tests {
     #[tokio::test]
     async fn collect_all_at_once() {
         // generate random entries
-        let mut entries: Vec<Entry<tables::HeaderNumber>> = (0..10000)
-            .map(|_| {
-                Entry::new(
-                    H256::random().encode(),
-                    BlockNumber(rand::random()).encode(),
-                )
-            })
+        let mut entries: Vec<Entry<_, _>> = (0..10000)
+            .map(|_| Entry::new(rand::random(), BlockNumber(rand::random())))
             .collect();
         let db = new_mem_database().unwrap();
         let tx = db.begin_mutable().await.unwrap();
