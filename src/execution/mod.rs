@@ -6,7 +6,6 @@ pub mod analysis_cache;
 pub mod evm;
 pub mod precompiled;
 pub mod processor;
-pub mod tracer;
 
 pub async fn execute_block<S: State>(
     state: &mut S,
@@ -19,7 +18,6 @@ pub async fn execute_block<S: State>(
     let config = config.collect_block_spec(header.number);
     ExecutionProcessor::new(
         state,
-        None,
         &mut analysis_cache,
         &mut *engine,
         header,

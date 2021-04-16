@@ -1,4 +1,4 @@
-use super::{analysis_cache::AnalysisCache, root_hash, tracer::Tracer};
+use super::{analysis_cache::AnalysisCache, root_hash};
 use crate::{
     chain::{
         intrinsic_gas::*,
@@ -17,12 +17,11 @@ use evmodin::{Revision, StatusCode};
 use std::cmp::min;
 use TransactionAction;
 
-pub struct ExecutionProcessor<'r, 'tracer, 'analysis, 'e, 'h, 'b, 'c, S>
+pub struct ExecutionProcessor<'r, 'analysis, 'e, 'h, 'b, 'c, S>
 where
     S: State,
 {
     state: IntraBlockState<'r, S>,
-    tracer: Option<&'tracer mut dyn Tracer>,
     analysis_cache: &'analysis mut AnalysisCache,
     engine: &'e mut dyn Consensus,
     header: &'h PartialHeader,
@@ -31,14 +30,12 @@ where
     cumulative_gas_used: u64,
 }
 
-impl<'r, 'tracer, 'analysis, 'e, 'h, 'b, 'c, S>
-    ExecutionProcessor<'r, 'tracer, 'analysis, 'e, 'h, 'b, 'c, S>
+impl<'r, 'analysis, 'e, 'h, 'b, 'c, S> ExecutionProcessor<'r, 'analysis, 'e, 'h, 'b, 'c, S>
 where
     S: State,
 {
     pub fn new(
         state: &'r mut S,
-        tracer: Option<&'tracer mut dyn Tracer>,
         analysis_cache: &'analysis mut AnalysisCache,
         engine: &'e mut dyn Consensus,
         header: &'h PartialHeader,
@@ -47,7 +44,6 @@ where
     ) -> Self {
         Self {
             state: IntraBlockState::new(state),
-            tracer,
             analysis_cache,
             engine,
             header,
@@ -152,15 +148,10 @@ where
         let g0 = intrinsic_gas(txn, rev >= Revision::Homestead, rev >= Revision::Istanbul);
         let gas = u128::from(txn.gas_limit())
             .checked_sub(g0)
-            .ok_or(ValidationError::IntrinsicGas)?
-            .try_into()
-            .unwrap();
+            .ok_or(ValidationError::IntrinsicGas)? as u64;
 
         let vm_res = evm::execute(
             &mut self.state,
-            // https://github.com/rust-lang/rust-clippy/issues/7846
-            #[allow(clippy::needless_option_as_deref)]
-            self.tracer.as_deref_mut(),
             self.analysis_cache,
             self.header,
             self.block_spec,
@@ -355,7 +346,6 @@ mod tests {
             let block_spec = MAINNET.collect_block_spec(header.number);
             let mut processor = ExecutionProcessor::new(
                 &mut state,
-                None,
                 &mut analysis_cache,
                 &mut *engine,
                 &header,
@@ -402,7 +392,6 @@ mod tests {
             let block_spec = MAINNET.collect_block_spec(header.number);
             let mut processor = ExecutionProcessor::new(
                 &mut state,
-                None,
                 &mut analysis_cache,
                 &mut *engine,
                 &header,
@@ -466,7 +455,6 @@ mod tests {
             let block_spec = MAINNET.collect_block_spec(header.number);
             let mut processor = ExecutionProcessor::new(
                 &mut state,
-                None,
                 &mut analysis_cache,
                 &mut *engine,
                 &header,
@@ -591,7 +579,6 @@ mod tests {
             let block_spec = MAINNET.collect_block_spec(header.number);
             let mut processor = ExecutionProcessor::new(
                 &mut state,
-                None,
                 &mut analysis_cache,
                 &mut *engine,
                 &header,
@@ -712,7 +699,6 @@ mod tests {
             let block_spec = MAINNET.collect_block_spec(header.number);
             let mut processor = ExecutionProcessor::new(
                 &mut state,
-                None,
                 &mut analysis_cache,
                 &mut *engine,
                 &header,
@@ -777,7 +763,6 @@ mod tests {
             let block_spec = MAINNET.collect_block_spec(header.number);
             let mut processor = ExecutionProcessor::new(
                 &mut state,
-                None,
                 &mut analysis_cache,
                 &mut *engine,
                 &header,

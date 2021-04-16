@@ -12,12 +12,14 @@ pub enum ExecOutput {
     Progress {
         stage_progress: BlockNumber,
         done: bool,
+        must_commit: bool,
     },
 }
 
 #[derive(Debug, PartialEq)]
 pub struct UnwindOutput {
     pub stage_progress: BlockNumber,
+    pub must_commit: bool,
 }
 
 #[async_trait]

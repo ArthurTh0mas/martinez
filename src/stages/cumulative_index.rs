@@ -77,6 +77,7 @@ where
         Ok(ExecOutput::Progress {
             stage_progress: max_block,
             done: true,
+            must_commit: max_block > prev_progress,
         })
     }
 
@@ -100,6 +101,7 @@ where
 
         Ok(UnwindOutput {
             stage_progress: input.unwind_to,
+            must_commit: true,
         })
     }
 }

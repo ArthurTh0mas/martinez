@@ -162,7 +162,6 @@ impl<'state> Blockchain<'state> {
         let mut analysis_cache = AnalysisCache::default();
         let processor = ExecutionProcessor::new(
             self.state,
-            None,
             &mut analysis_cache,
             &mut *self.engine,
             &block.header,

@@ -758,9 +758,9 @@ struct CallTraceSetFlags {
 
 #[derive(Clone, Copy, Debug)]
 pub struct CallTraceSetEntry {
-    pub address: Address,
-    pub from: bool,
-    pub to: bool,
+    address: Address,
+    from: bool,
+    to: bool,
 }
 
 impl TableEncode for CallTraceSetEntry {

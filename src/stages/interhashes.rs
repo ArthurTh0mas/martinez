@@ -631,6 +631,7 @@ where
         Ok(ExecOutput::Progress {
             stage_progress: cmp::max(max_block, past_progress),
             done: true,
+            must_commit: true,
         })
     }
 
@@ -649,6 +650,7 @@ where
 
         Ok(UnwindOutput {
             stage_progress: BlockNumber(0),
+            must_commit: true,
         })
     }
 }
