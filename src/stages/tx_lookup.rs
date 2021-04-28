@@ -74,6 +74,7 @@ where
                 .map(|(_, stage)| stage)
                 .unwrap_or_default(),
             done: false,
+            must_commit: true,
         })
     }
 
@@ -126,6 +127,7 @@ where
         }
         Ok(UnwindOutput {
             stage_progress: input.unwind_to,
+            must_commit: true,
         })
     }
 }
@@ -326,6 +328,7 @@ mod tests {
             ExecOutput::Progress {
                 stage_progress: 3.into(),
                 done: false,
+                must_commit: true,
             }
         );
 
@@ -363,6 +366,7 @@ mod tests {
             ExecOutput::Progress {
                 stage_progress: 3.into(),
                 done: false,
+                must_commit: true,
             }
         );
     }
