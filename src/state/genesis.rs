@@ -7,7 +7,6 @@ use crate::{
     state::*,
 };
 use ethereum_types::*;
-use tempfile::TempDir;
 
 #[derive(Clone, Debug)]
 pub struct GenesisState {
@@ -63,11 +62,7 @@ impl GenesisState {
     }
 }
 
-pub async fn initialize_genesis<'db, Tx>(
-    txn: &Tx,
-    etl_temp_dir: &TempDir,
-    chainspec: ChainSpec,
-) -> anyhow::Result<bool>
+pub async fn initialize_genesis<'db, Tx>(txn: &Tx, chainspec: ChainSpec) -> anyhow::Result<bool>
 where
     Tx: MutableTransaction<'db>,
 {
@@ -94,9 +89,9 @@ where
 
     state_buffer.write_to_db().await?;
 
-    crate::stages::promote_clean_accounts(txn, etl_temp_dir).await?;
-    crate::stages::promote_clean_storage(txn, etl_temp_dir).await?;
-    let state_root = crate::stages::generate_interhashes(txn, etl_temp_dir).await?;
+    crate::stages::promote_clean_accounts(txn).await?;
+    crate::stages::promote_clean_storage(txn).await?;
+    let state_root = crate::stages::generate_interhashes(txn).await?;
 
     let header = BlockHeader {
         parent_hash: H256::zero(),
@@ -191,9 +186,8 @@ mod tests {
         let db = new_mem_database().unwrap();
         let tx = db.begin_mutable().await.unwrap();
 
-        let temp_dir = TempDir::new().unwrap();
         assert!(
-            initialize_genesis(&tx, &temp_dir, crate::res::chainspec::MAINNET.clone())
+            initialize_genesis(&tx, crate::res::chainspec::MAINNET.clone())
                 .await
                 .unwrap()
         );

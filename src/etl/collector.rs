@@ -7,9 +7,8 @@ use std::{
     ops::{Generator, GeneratorState},
     pin::Pin,
 };
-use tempfile::TempDir;
 
-pub struct Collector<'tmp, Key, Value>
+pub struct Collector<Key, Value>
 where
     Key: TableEncode,
     Value: TableEncode,
@@ -18,7 +17,6 @@ where
     Vec<u8>: From<<Key as TableEncode>::Encoded>,
     Vec<u8>: From<<Value as TableEncode>::Encoded>,
 {
-    tempdir: &'tmp TempDir,
     buffer_size: usize,
     data_providers: Vec<DataProvider>,
     buffer_capacity: usize,
@@ -27,7 +25,7 @@ where
 
 pub const OPTIMAL_BUFFER_CAPACITY: usize = 512000000; // 512 Megabytes
 
-impl<'tmp, Key, Value> Collector<'tmp, Key, Value>
+impl<Key, Value> Collector<Key, Value>
 where
     Key: TableEncode,
     Value: TableEncode,
@@ -36,9 +34,8 @@ where
     Vec<u8>: From<<Key as TableEncode>::Encoded>,
     Vec<u8>: From<<Value as TableEncode>::Encoded>,
 {
-    pub fn new(tempdir: &'tmp TempDir, buffer_capacity: usize) -> Self {
+    pub fn new(buffer_capacity: usize) -> Self {
         Self {
-            tempdir,
             buffer_size: 0,
             buffer_capacity,
             data_providers: Vec::new(),
@@ -51,8 +48,7 @@ where
         self.buffer.sort_unstable();
         let mut buf = Vec::with_capacity(self.buffer.len());
         std::mem::swap(&mut buf, &mut self.buffer);
-        self.data_providers
-            .push(DataProvider::new(self.tempdir.path(), buf).unwrap());
+        self.data_providers.push(DataProvider::new(buf).unwrap());
     }
 
     pub fn push(&mut self, key: Key, value: Value) {
@@ -141,7 +137,7 @@ impl<'a> Iterator for CollectorIter<'a> {
 }
 
 #[derive(Deref, DerefMut, From)]
-pub struct TableCollector<'tmp, T>(Collector<'tmp, T::Key, T::Value>)
+pub struct TableCollector<T>(Collector<T::Key, T::Value>)
 where
     T: Table,
     T::Key: TableEncode,
@@ -151,7 +147,7 @@ where
     Vec<u8>: From<<<T as Table>::Key as TableEncode>::Encoded>,
     Vec<u8>: From<<<T as Table>::Value as TableEncode>::Encoded>;
 
-impl<'tmp, T> TableCollector<'tmp, T>
+impl<T> TableCollector<T>
 where
     T: Table,
     T::Key: TableEncode,
@@ -161,11 +157,11 @@ where
     Vec<u8>: From<<<T as Table>::Key as TableEncode>::Encoded>,
     Vec<u8>: From<<<T as Table>::Value as TableEncode>::Encoded>,
 {
-    pub fn new(tempdir: &'tmp TempDir, buffer_capacity: usize) -> Self {
-        Self(Collector::new(tempdir, buffer_capacity))
+    pub fn new(buffer_capacity: usize) -> Self {
+        Self(Collector::new(buffer_capacity))
     }
 
-    pub fn into_inner(self) -> Collector<'tmp, T::Key, T::Value> {
+    pub fn into_inner(self) -> Collector<T::Key, T::Value> {
         self.0
     }
 
@@ -200,8 +196,7 @@ mod tests {
             .collect();
         let db = new_mem_database().unwrap();
         let tx = db.begin_mutable().await.unwrap();
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut collector = TableCollector::new(&temp_dir, OPTIMAL_BUFFER_CAPACITY);
+        let mut collector = TableCollector::new(OPTIMAL_BUFFER_CAPACITY);
 
         for (key, value) in entries.clone() {
             collector.push(key, value);
@@ -231,8 +226,7 @@ mod tests {
             .collect();
         let db = new_mem_database().unwrap();
         let tx = db.begin_mutable().await.unwrap();
-        let temp_dir = tempfile::tempdir().unwrap();
-        let mut collector = TableCollector::new(&temp_dir, 1000);
+        let mut collector = TableCollector::new(1000);
 
         for (key, value) in entries.clone() {
             collector.push(key, value);
