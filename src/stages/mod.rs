@@ -1,5 +1,4 @@
 mod block_hashes;
-mod call_traces;
 mod cumulative_index;
 mod downloader;
 mod execution;

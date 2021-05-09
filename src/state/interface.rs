@@ -28,6 +28,12 @@ pub trait State: Debug + Send + Sync {
         block_hash: H256,
     ) -> anyhow::Result<Option<BlockBody>>;
 
+    async fn read_body_with_senders(
+        &self,
+        block_number: BlockNumber,
+        block_hash: H256,
+    ) -> anyhow::Result<Option<BlockBodyWithSenders>>;
+
     async fn total_difficulty(
         &self,
         block_number: BlockNumber,

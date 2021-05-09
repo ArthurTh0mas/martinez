@@ -12,7 +12,6 @@ use martinez::{
 };
 use anyhow::{bail, ensure, format_err};
 use bytes::Bytes;
-use clap::Parser;
 use educe::Educe;
 use ethereum_types::*;
 use maplit::*;
@@ -30,6 +29,7 @@ use std::{
     sync::Arc,
     time::Instant,
 };
+use structopt::StructOpt;
 use tokio::runtime::Builder;
 use tracing::*;
 use tracing_subscriber::{prelude::*, EnvFilter};
@@ -862,13 +862,13 @@ where
     out
 }
 
-#[derive(Parser)]
-#[clap(name = "Consensus tests", about = "Run consensus tests against Martinez.")]
+#[derive(StructOpt)]
+#[structopt(name = "Consensus tests", about = "Run consensus tests against Martinez.")]
 pub struct Opt {
     /// Path to consensus tests
-    #[clap(long)]
+    #[structopt(long, env)]
     pub tests: PathBuf,
-    #[clap(long)]
+    #[structopt(long, env)]
     pub test_names: Vec<String>,
 }
 
@@ -913,7 +913,7 @@ fn exclude_test(p: &Path, root: &Path) -> bool {
 async fn run() {
     let now = Instant::now();
 
-    let opt = Opt::parse();
+    let opt = Opt::from_args();
 
     let env_filter = if std::env::var(EnvFilter::DEFAULT_ENV)
         .unwrap_or_default()

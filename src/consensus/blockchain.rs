@@ -199,7 +199,8 @@ impl<'state> Blockchain<'state> {
             let hash = self.state.canonical_hash(block_number).unwrap();
             let body = self
                 .state
-                .read_body_with_senders(block_number, hash)?
+                .read_body_with_senders(block_number, hash)
+                .await?
                 .unwrap();
             let header = self.state.read_header(block_number, hash).await?.unwrap();
 
@@ -243,7 +244,8 @@ impl<'state> Blockchain<'state> {
         for block_number in (canonical_ancestor + 1..=block_number).rev() {
             let body = self
                 .state
-                .read_body_with_senders(block_number, hash)?
+                .read_body_with_senders(block_number, hash)
+                .await?
                 .unwrap();
             let header = self
                 .state

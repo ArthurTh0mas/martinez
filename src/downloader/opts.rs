@@ -1,14 +1,14 @@
-use clap::Parser;
+use structopt::StructOpt;
 
-#[derive(Parser, Debug)]
+#[derive(StructOpt, Debug)]
 pub struct Opts {
-    #[clap(
+    #[structopt(
         long = "downloader.headers-mem-limit",
         help = "How much memory in Mb to allocate for the active parallel download window.",
         default_value = "50"
     )]
     pub headers_mem_limit_mb: u32,
-    #[clap(
+    #[structopt(
         long = "downloader.headers-batch-size",
         help = "How many headers to download per stage run.",
         default_value = "100000"

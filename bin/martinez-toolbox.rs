@@ -6,61 +6,61 @@ use martinez::{
         traits::*,
     },
     models::*,
-    stagedsync,
+    stagedsync::{self},
     stages::*,
 };
 use anyhow::{bail, ensure, format_err, Context};
 use bytes::Bytes;
-use clap::Parser;
 use itertools::Itertools;
 use std::{borrow::Cow, path::PathBuf};
+use structopt::StructOpt;
 use tracing::*;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
-#[derive(Parser)]
-#[clap(name = "Martinez Toolbox", about = "Utilities for Martinez Ethereum client")]
+#[derive(StructOpt)]
+#[structopt(name = "Martinez Toolbox", about = "Utilities for Martinez Ethereum client")]
 struct Opt {
-    #[clap(long = "datadir", help = "Database directory path", default_value_t)]
+    #[structopt(long = "datadir", help = "Database directory path", default_value)]
     pub data_dir: MartinezDataDir,
 
-    #[clap(subcommand)]
+    #[structopt(subcommand)]
     pub command: OptCommand,
 }
 
-#[derive(Parser)]
+#[derive(StructOpt)]
 pub enum OptCommand {
     /// Print database statistics
     DbStats {
         /// Whether to print CSV
-        #[clap(long)]
+        #[structopt(long)]
         csv: bool,
     },
 
     /// Query database
     DbQuery {
-        #[clap(long)]
+        #[structopt(long)]
         table: String,
-        #[clap(long, parse(try_from_str = hex_to_bytes))]
+        #[structopt(long, parse(try_from_str = hex_to_bytes))]
         key: Bytes,
     },
 
     /// Walk over table entries
     DbWalk {
-        #[clap(long)]
+        #[structopt(long)]
         table: String,
-        #[clap(long, parse(try_from_str = hex_to_bytes))]
+        #[structopt(long, parse(try_from_str = hex_to_bytes))]
         starting_key: Option<Bytes>,
-        #[clap(long)]
+        #[structopt(long)]
         max_entries: Option<usize>,
     },
 
     /// Check table equality in two databases
     CheckEqual {
-        #[clap(long, parse(from_os_str))]
+        #[structopt(long, parse(from_os_str))]
         db1: PathBuf,
-        #[clap(long, parse(from_os_str))]
+        #[structopt(long, parse(from_os_str))]
         db2: PathBuf,
-        #[clap(long)]
+        #[structopt(long)]
         table: String,
     },
 
@@ -68,9 +68,9 @@ pub enum OptCommand {
     Blockhashes,
 
     /// Execute HeaderDownload stage
-    #[clap(name = "download-headers", about = "Run block headers downloader")]
+    #[structopt(name = "download-headers", about = "Run block headers downloader")]
     HeaderDownload {
-        #[clap(flatten)]
+        #[structopt(flatten)]
         opts: HeaderDownloadOpts,
     },
 
@@ -79,23 +79,23 @@ pub enum OptCommand {
     },
 }
 
-#[derive(Parser)]
+#[derive(StructOpt)]
 pub struct HeaderDownloadOpts {
-    #[clap(
+    #[structopt(
         long = "chain",
         help = "Name of the testnet to join",
         default_value = "mainnet"
     )]
     pub chain_name: String,
 
-    #[clap(
+    #[structopt(
         long = "sentry.api.addr",
         help = "Sentry GRPC service URL as 'http://host:port'",
         default_value = "http://localhost:8000"
     )]
     pub sentry_api_addr: martinez::sentry::sentry_address::SentryAddress,
 
-    #[clap(flatten)]
+    #[structopt(flatten)]
     pub downloader_opts: martinez::downloader::opts::Opts,
 }
 
@@ -372,7 +372,7 @@ async fn read_block(data_dir: MartinezDataDir, block_num: BlockNumber) -> anyhow
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let opt: Opt = Opt::parse();
+    let opt: Opt = Opt::from_args();
 
     let filter = if std::env::var(EnvFilter::DEFAULT_ENV)
         .unwrap_or_default()
