@@ -5,19 +5,19 @@ use martinez::{
     stagedsync::stages::*,
 };
 use async_trait::async_trait;
+use clap::Parser;
 use ethereum_types::{Address, U256};
 use jsonrpsee::{core::RpcResult, http_server::HttpServerBuilder, proc_macros::rpc};
 use std::{future::pending, net::SocketAddr, sync::Arc};
-use structopt::StructOpt;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
-#[derive(StructOpt)]
-#[structopt(name = "Martinez RPC", about = "RPC server for Martinez")]
+#[derive(Parser)]
+#[clap(name = "Martinez RPC", about = "RPC server for Martinez")]
 pub struct Opt {
-    #[structopt(long, env)]
+    #[clap(long)]
     pub datadir: MartinezDataDir,
 
-    #[structopt(long, env)]
+    #[clap(long)]
     pub listen_address: SocketAddr,
 }
 
@@ -65,7 +65,7 @@ where
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let opt = Opt::from_args();
+    let opt = Opt::parse();
 
     let env_filter = if std::env::var(EnvFilter::DEFAULT_ENV)
         .unwrap_or_default()

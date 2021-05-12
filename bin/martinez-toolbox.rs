@@ -6,61 +6,61 @@ use martinez::{
         traits::*,
     },
     models::*,
-    stagedsync::{self},
+    stagedsync,
     stages::*,
 };
 use anyhow::{bail, ensure, format_err, Context};
 use bytes::Bytes;
+use clap::Parser;
 use itertools::Itertools;
-use std::{borrow::Cow, path::PathBuf};
-use structopt::StructOpt;
+use std::{borrow::Cow, path::PathBuf, sync::Arc};
 use tracing::*;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
-#[derive(StructOpt)]
-#[structopt(name = "Martinez Toolbox", about = "Utilities for Martinez Ethereum client")]
+#[derive(Parser)]
+#[clap(name = "Martinez Toolbox", about = "Utilities for Martinez Ethereum client")]
 struct Opt {
-    #[structopt(long = "datadir", help = "Database directory path", default_value)]
+    #[clap(long = "datadir", help = "Database directory path", default_value_t)]
     pub data_dir: MartinezDataDir,
 
-    #[structopt(subcommand)]
+    #[clap(subcommand)]
     pub command: OptCommand,
 }
 
-#[derive(StructOpt)]
+#[derive(Parser)]
 pub enum OptCommand {
     /// Print database statistics
     DbStats {
         /// Whether to print CSV
-        #[structopt(long)]
+        #[clap(long)]
         csv: bool,
     },
 
     /// Query database
     DbQuery {
-        #[structopt(long)]
+        #[clap(long)]
         table: String,
-        #[structopt(long, parse(try_from_str = hex_to_bytes))]
+        #[clap(long, parse(try_from_str = hex_to_bytes))]
         key: Bytes,
     },
 
     /// Walk over table entries
     DbWalk {
-        #[structopt(long)]
+        #[clap(long)]
         table: String,
-        #[structopt(long, parse(try_from_str = hex_to_bytes))]
+        #[clap(long, parse(try_from_str = hex_to_bytes))]
         starting_key: Option<Bytes>,
-        #[structopt(long)]
+        #[clap(long)]
         max_entries: Option<usize>,
     },
 
     /// Check table equality in two databases
     CheckEqual {
-        #[structopt(long, parse(from_os_str))]
+        #[clap(long, parse(from_os_str))]
         db1: PathBuf,
-        #[structopt(long, parse(from_os_str))]
+        #[clap(long, parse(from_os_str))]
         db2: PathBuf,
-        #[structopt(long)]
+        #[clap(long)]
         table: String,
     },
 
@@ -68,9 +68,9 @@ pub enum OptCommand {
     Blockhashes,
 
     /// Execute HeaderDownload stage
-    #[structopt(name = "download-headers", about = "Run block headers downloader")]
+    #[clap(name = "download-headers", about = "Run block headers downloader")]
     HeaderDownload {
-        #[structopt(flatten)]
+        #[clap(flatten)]
         opts: HeaderDownloadOpts,
     },
 
@@ -79,28 +79,35 @@ pub enum OptCommand {
     },
 }
 
-#[derive(StructOpt)]
+#[derive(Parser)]
 pub struct HeaderDownloadOpts {
-    #[structopt(
+    #[clap(
         long = "chain",
         help = "Name of the testnet to join",
         default_value = "mainnet"
     )]
     pub chain_name: String,
 
-    #[structopt(
+    #[clap(
         long = "sentry.api.addr",
         help = "Sentry GRPC service URL as 'http://host:port'",
         default_value = "http://localhost:8000"
     )]
     pub sentry_api_addr: martinez::sentry::sentry_address::SentryAddress,
 
-    #[structopt(flatten)]
+    #[clap(flatten)]
     pub downloader_opts: martinez::downloader::opts::Opts,
 }
 
 async fn blockhashes(data_dir: MartinezDataDir) -> anyhow::Result<()> {
     std::fs::create_dir_all(&data_dir.0)?;
+
+    let etl_temp_path = data_dir.etl_temp_dir();
+    let _ = std::fs::remove_dir_all(&etl_temp_path);
+    std::fs::create_dir_all(&etl_temp_path)?;
+    let etl_temp_dir =
+        Arc::new(tempfile::tempdir_in(&etl_temp_path).context("failed to create ETL temp dir")?);
+
     let env = martinez::kv::mdbx::Environment::<mdbx::NoWriteMap>::open_rw(
         mdbx::Environment::new(),
         &data_dir.chain_data_dir(),
@@ -108,7 +115,9 @@ async fn blockhashes(data_dir: MartinezDataDir) -> anyhow::Result<()> {
     )?;
 
     let mut staged_sync = stagedsync::StagedSync::new();
-    staged_sync.push(BlockHashes);
+    staged_sync.push(BlockHashes {
+        temp_dir: etl_temp_dir.clone(),
+    });
     staged_sync.run(&env).await?;
 }
 
@@ -372,7 +381,7 @@ async fn read_block(data_dir: MartinezDataDir, block_num: BlockNumber) -> anyhow
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let opt: Opt = Opt::from_args();
+    let opt: Opt = Opt::parse();
 
     let filter = if std::env::var(EnvFilter::DEFAULT_ENV)
         .unwrap_or_default()
