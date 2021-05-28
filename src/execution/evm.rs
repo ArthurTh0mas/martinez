@@ -526,10 +526,6 @@ where
                         .await?;
                     self.state.set_balance(i.data().address, 0).await?;
 
-                    if let Some(tracer) = &mut self.tracer {
-                        tracer.capture_self_destruct(i.data().address, i.data().beneficiary);
-                    }
-
                     i.resume(())
                 }
                 InterruptVariant::Call(i) => {

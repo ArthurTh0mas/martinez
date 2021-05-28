@@ -1,7 +1,7 @@
 use super::{
     header::BlockHeader,
     header_slice_status_watch::HeaderSliceStatusWatch,
-    header_slice_verifier, header_slices,
+    header_slice_verifier,
     header_slices::{HeaderSlice, HeaderSliceStatus, HeaderSlices},
 };
 use crate::{models::BlockNumber, sentry::chain_config::ChainConfig};
@@ -130,17 +130,13 @@ impl VerifyStageLinearLink {
     }
 
     fn verify_slice_link(&self, slice: &HeaderSlice, parent: &Option<BlockHeader>) -> bool {
-        let Some(headers) = slice.headers.as_ref() else {
+        if slice.headers.is_none() {
             return false;
-        };
-
+        }
+        let headers = slice.headers.as_ref().unwrap();
         if headers.is_empty() {
             return false;
         }
-        if headers.len() != header_slices::HEADER_SLICE_SIZE {
-            return false;
-        }
-
         let child = &headers[0];
 
         // for the start header we just verify its hash
