@@ -6,9 +6,10 @@ use super::headers::{
 use crate::{
     kv,
     kv::{tables::HeaderKey, traits::MutableTransaction},
-    models::*,
+    models::BlockNumber,
 };
 use anyhow::format_err;
+use ethereum_types::U256;
 use parking_lot::RwLock;
 use std::{
     ops::{ControlFlow, DerefMut},
@@ -182,7 +183,7 @@ impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>> SaveStage<'tx, RwTx> {
         tx: &RwTx,
     ) -> anyhow::Result<Option<U256>> {
         if child.number() == BlockNumber(0) {
-            return Ok(Some(U256::ZERO));
+            return Ok(Some(U256::zero()));
         }
         let parent_block_num = BlockNumber(child.number().0 - 1);
         let parent_header_key: HeaderKey = (parent_block_num, child.parent_hash());
