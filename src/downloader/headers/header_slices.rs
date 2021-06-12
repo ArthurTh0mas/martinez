@@ -28,10 +28,13 @@ pub enum HeaderSliceStatus {
     Invalid,
     // linking to the canonical chain failed, a potential fork
     Fork,
+    // request refetching to try linking an alternative slice
+    Refetch,
     // saved in the database
     Saved,
 }
 
+#[derive(Default, Clone)]
 pub struct HeaderSlice {
     pub start_block_num: BlockNumber,
     pub status: HeaderSliceStatus,
@@ -39,6 +42,9 @@ pub struct HeaderSlice {
     pub from_peer_id: Option<PeerId>,
     pub request_time: Option<time::Instant>,
     pub request_attempt: u16,
+    pub refetch_attempt: u16,
+    pub fork_status: HeaderSliceStatus,
+    pub fork_headers: Option<Vec<BlockHeader>>,
 }
 
 struct HeaderSliceStatusWatch {
@@ -62,7 +68,7 @@ pub struct HeaderSlices {
     state_watches: HashMap<HeaderSliceStatus, HeaderSliceStatusWatch>,
 }
 
-pub(super) const HEADER_SLICE_SIZE: usize = 192;
+pub const HEADER_SLICE_SIZE: usize = 192;
 
 const ATOMIC_ORDERING: Ordering = Ordering::SeqCst;
 
@@ -92,11 +98,7 @@ impl HeaderSlices {
         for i in 0..max_slices {
             let slice = HeaderSlice {
                 start_block_num: BlockNumber(start_block_num.0 + (i * HEADER_SLICE_SIZE) as u64),
-                status: HeaderSliceStatus::Empty,
-                headers: None,
-                from_peer_id: None,
-                request_time: None,
-                request_attempt: 0,
+                ..Default::default()
             };
             slices.push_back(Arc::new(RwLock::new(slice)));
         }
@@ -114,6 +116,37 @@ impl HeaderSlices {
         }
     }
 
+    #[cfg(test)]
+    pub fn from_slices_vec(slices: Vec<HeaderSlice>) -> Self {
+        let max_slices = slices.len();
+        assert!(max_slices > 0, "slices must not be empty");
+
+        let start_block_num = slices[0].start_block_num;
+        let max_block_num = start_block_num.0 + (max_slices * HEADER_SLICE_SIZE) as u64;
+
+        let state_watches = Self::make_state_watches_from_slices(&slices);
+
+        let slice_locks =
+            VecDeque::from_iter(slices.into_iter().map(|slice| Arc::new(RwLock::new(slice))));
+
+        Self {
+            slices: RwLock::new(slice_locks),
+            max_slices,
+            max_block_num: AtomicU64::new(max_block_num),
+            final_block_num: BlockNumber(max_block_num),
+            state_watches,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn clone_slices_vec(&self) -> Vec<HeaderSlice> {
+        self.slices
+            .read()
+            .iter()
+            .map(|slice_lock| slice_lock.read().clone())
+            .collect()
+    }
+
     fn make_state_watches(max_slices: usize) -> HashMap<HeaderSliceStatus, HeaderSliceStatusWatch> {
         let mut state_watches = HashMap::<HeaderSliceStatus, HeaderSliceStatusWatch>::new();
         for id in HeaderSliceStatus::iter() {
@@ -123,6 +156,31 @@ impl HeaderSlices {
                 0
             };
 
+            let (sender, receiver) = watch::channel(initial_count);
+            let channel = HeaderSliceStatusWatch {
+                sender,
+                receiver,
+                count: AtomicUsize::new(initial_count),
+            };
+
+            state_watches.insert(id, channel);
+        }
+        state_watches
+    }
+
+    fn make_state_watches_from_slices(
+        slices: &[HeaderSlice],
+    ) -> HashMap<HeaderSliceStatus, HeaderSliceStatusWatch> {
+        let mut state_counters = HashMap::<HeaderSliceStatus, usize>::new();
+        for id in HeaderSliceStatus::iter() {
+            state_counters.insert(id, 0);
+        }
+        for slice in slices {
+            state_counters.insert(slice.status, state_counters[&slice.status] + 1);
+        }
+
+        let mut state_watches = HashMap::<HeaderSliceStatus, HeaderSliceStatusWatch>::new();
+        for (id, initial_count) in state_counters {
             let (sender, receiver) = watch::channel(initial_count);
             let channel = HeaderSliceStatusWatch {
                 sender,
@@ -166,6 +224,18 @@ impl HeaderSlices {
             .iter()
             .find(|slice| slice.read().start_block_num == start_block_num)
             .map(Arc::clone)
+    }
+
+    pub fn find_by_block_num(&self, block_num: BlockNumber) -> Option<Arc<RwLock<HeaderSlice>>> {
+        let start_block_num = align_block_num_to_slice_start(block_num);
+        let slice_opt = self.find_by_start_block_num(start_block_num);
+        slice_opt.and_then(|slice_lock| {
+            if slice_lock.read().contains_block_num(block_num) {
+                Some(slice_lock)
+            } else {
+                None
+            }
+        })
     }
 
     pub fn find_by_status(&self, status: HeaderSliceStatus) -> Option<Arc<RwLock<HeaderSlice>>> {
@@ -228,11 +298,7 @@ impl HeaderSlices {
 
             let slice = HeaderSlice {
                 start_block_num: max_block_num,
-                status: HeaderSliceStatus::Empty,
-                headers: None,
-                from_peer_id: None,
-                request_time: None,
-                request_attempt: 0,
+                ..Default::default()
             };
             slices.push_back(Arc::new(RwLock::new(slice)));
             self.max_block_num
@@ -309,9 +375,72 @@ impl HeaderSlices {
     pub fn is_empty_at_final_position(&self) -> bool {
         (self.max_block_num() >= self.final_block_num) && self.slices.read().is_empty()
     }
+
+    pub fn all_in_status(&self, status: HeaderSliceStatus) -> bool {
+        self.count_slices_in_status(status) == self.slices.read().len()
+    }
 }
 
 pub fn align_block_num_to_slice_start(num: BlockNumber) -> BlockNumber {
     let slice_size = HEADER_SLICE_SIZE as u64;
     BlockNumber(num.0 / slice_size * slice_size)
+}
+
+impl HeaderSlice {
+    pub fn len(&self) -> usize {
+        self.headers.as_ref().map_or(0, |headers| headers.len())
+    }
+
+    pub fn block_num_range(&self) -> std::ops::Range<BlockNumber> {
+        let end = BlockNumber(self.start_block_num.0 + self.len() as u64);
+        self.start_block_num..end
+    }
+
+    pub fn contains_block_num(&self, num: BlockNumber) -> bool {
+        self.block_num_range().contains(&num)
+    }
+}
+
+impl Default for HeaderSliceStatus {
+    fn default() -> Self {
+        HeaderSliceStatus::Empty
+    }
+}
+
+impl From<HeaderSliceStatus> for char {
+    fn from(status: HeaderSliceStatus) -> Self {
+        match status {
+            HeaderSliceStatus::Empty => '-',
+            HeaderSliceStatus::Waiting => '<',
+            HeaderSliceStatus::Downloaded => '.',
+            HeaderSliceStatus::VerifiedInternally => '=',
+            HeaderSliceStatus::Verified => '#',
+            HeaderSliceStatus::Invalid => 'x',
+            HeaderSliceStatus::Fork => 'Y',
+            HeaderSliceStatus::Refetch => 'R',
+            HeaderSliceStatus::Saved => '+',
+        }
+    }
+}
+
+impl TryFrom<char> for HeaderSliceStatus {
+    type Error = anyhow::Error;
+
+    fn try_from(status_code: char) -> anyhow::Result<Self> {
+        match status_code {
+            '-' => Ok(HeaderSliceStatus::Empty),
+            '<' => Ok(HeaderSliceStatus::Waiting),
+            '.' => Ok(HeaderSliceStatus::Downloaded),
+            '=' => Ok(HeaderSliceStatus::VerifiedInternally),
+            '#' => Ok(HeaderSliceStatus::Verified),
+            'x' => Ok(HeaderSliceStatus::Invalid),
+            'Y' => Ok(HeaderSliceStatus::Fork),
+            'R' => Ok(HeaderSliceStatus::Refetch),
+            '+' => Ok(HeaderSliceStatus::Saved),
+            _ => Err(anyhow::format_err!(
+                "unrecognized status code '{:?}'",
+                status_code
+            )),
+        }
+    }
 }
