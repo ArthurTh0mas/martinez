@@ -206,8 +206,7 @@ pub mod block_body {
         number: impl Into<BlockNumber>,
     ) -> anyhow::Result<Option<(BlockBody, TxIndex)>> {
         if let Some(body) = super::storage_body::read(tx, hash, number).await? {
-            let transactions =
-                super::tx::read(tx, body.base_tx_id, body.tx_amount.try_into()?).await?;
+            let transactions = super::tx::read(tx, body.base_tx_id, body.tx_amount).await?;
 
             return Ok(Some((
                 BlockBody {
