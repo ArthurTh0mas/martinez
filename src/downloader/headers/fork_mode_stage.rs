@@ -1,8 +1,7 @@
 use super::{
     header::BlockHeader,
     header_slice_status_watch::HeaderSliceStatusWatch,
-    header_slice_verifier::HeaderSliceVerifier,
-    header_slices,
+    header_slice_verifier, header_slices,
     header_slices::{align_block_num_to_slice_start, HeaderSlice, HeaderSliceStatus, HeaderSlices},
 };
 use crate::{models::BlockNumber, sentry::chain_config::ChainConfig};
@@ -17,7 +16,6 @@ use tracing::*;
 pub struct ForkModeStage {
     header_slices: Arc<HeaderSlices>,
     chain_config: ChainConfig,
-    verifier: Arc<Box<dyn HeaderSliceVerifier>>,
     canonical_range: Range<BlockNumber>,
     fork_range: Range<BlockNumber>,
     pending_watch: HeaderSliceStatusWatch,
@@ -25,11 +23,7 @@ pub struct ForkModeStage {
 }
 
 impl ForkModeStage {
-    pub fn new(
-        header_slices: Arc<HeaderSlices>,
-        chain_config: ChainConfig,
-        verifier: Arc<Box<dyn HeaderSliceVerifier>>,
-    ) -> Self {
+    pub fn new(header_slices: Arc<HeaderSlices>, chain_config: ChainConfig) -> Self {
         let Some(fork_slice_lock) = header_slices.find_by_status(HeaderSliceStatus::Fork) else {
             panic!("invalid state: initial fork slice not found");
         };
@@ -39,7 +33,6 @@ impl ForkModeStage {
         Self {
             header_slices: header_slices.clone(),
             chain_config,
-            verifier,
             canonical_range,
             fork_range: fork_slice_lock.read().block_num_range(),
             pending_watch: HeaderSliceStatusWatch::new(
@@ -62,17 +55,16 @@ impl ForkModeStage {
         Ok(())
     }
 
-    // initial setup: start refetching on both ends
-    pub fn setup(&mut self) {
-        let Some(canonical_continuation_slice_lock) = self.find_canonical_continuation_slice() else { return };
-        let Some(fork_continuation_slice_lock) = self.find_fork_continuation_slice() else { return };
+    fn process_pending(&mut self) -> anyhow::Result<()> {
+        let Some(canonical_continuation_slice_lock) = self.find_canonical_continuation_slice() else { return Ok(()) };
+        let Some(fork_continuation_slice_lock) = self.find_fork_continuation_slice() else { return Ok(()) };
 
         let canonical_continuation_slice = canonical_continuation_slice_lock.upgradable_read();
         let fork_continuation_slice = fork_continuation_slice_lock.upgradable_read();
 
+        // initial setup: start refetching on both ends
         if (self.fork_range.start == self.canonical_range.end)
             && (canonical_continuation_slice.status == HeaderSliceStatus::Fork)
-            && (Self::is_canonical_slice_status(fork_continuation_slice.status))
         {
             let mut canonical_continuation_slice_mut =
                 RwLockUpgradableReadGuard::upgrade(canonical_continuation_slice);
@@ -80,15 +72,8 @@ impl ForkModeStage {
                 RwLockUpgradableReadGuard::upgrade(fork_continuation_slice);
             self.refetch_slice(canonical_continuation_slice_mut.deref_mut());
             self.refetch_slice(fork_continuation_slice_mut.deref_mut());
+            return Ok(());
         }
-    }
-
-    fn process_pending(&mut self) -> anyhow::Result<()> {
-        let Some(canonical_continuation_slice_lock) = self.find_canonical_continuation_slice() else { return Ok(()) };
-        let Some(fork_continuation_slice_lock) = self.find_fork_continuation_slice() else { return Ok(()) };
-
-        let canonical_continuation_slice = canonical_continuation_slice_lock.upgradable_read();
-        let fork_continuation_slice = fork_continuation_slice_lock.upgradable_read();
 
         // try to extend the chains
         let mut did_extend_canonical = false;
@@ -171,7 +156,6 @@ impl ForkModeStage {
         if self.verify_canonical_slices_link(continuation_slice, &end_slice) {
             self.header_slices
                 .set_slice_status(continuation_slice, HeaderSliceStatus::Verified);
-            continuation_slice.refetch_attempt = 0;
             self.canonical_range.end = continuation_slice.block_num_range().end;
             true
         } else {
@@ -185,7 +169,6 @@ impl ForkModeStage {
         if self.verify_fork_slices_link(&end_slice, continuation_slice) {
             self.header_slices
                 .set_slice_status(continuation_slice, HeaderSliceStatus::Fork);
-            continuation_slice.refetch_attempt = 0;
             self.fork_range.start = continuation_slice.block_num_range().start;
             true
         } else {
@@ -246,8 +229,7 @@ impl ForkModeStage {
     ) -> bool {
         let child = child_headers.first().unwrap();
         let parent = parent_headers.last().unwrap();
-        self.verifier
-            .verify_link(child, parent, self.chain_config.chain_spec())
+        header_slice_verifier::verify_link(child, parent, self.chain_config.chain_spec())
     }
 
     fn find_fork_connection_block_num(fork_slice: &HeaderSlice) -> Option<BlockNumber> {
@@ -354,7 +336,6 @@ impl ForkModeStage {
                     .set_slice_status(slice.deref_mut(), new_status);
                 slice.headers = slice.fork_headers.take();
                 slice.fork_status = HeaderSliceStatus::Empty;
-                slice.refetch_attempt = 0;
             }
         }
 
@@ -395,7 +376,6 @@ impl ForkModeStage {
             // cleanup the fork data
             slice.fork_status = HeaderSliceStatus::Empty;
             slice.fork_headers = None;
-            slice.refetch_attempt = 0;
 
             num = BlockNumber(num.0 + slice.len() as u64);
         }
@@ -421,7 +401,6 @@ impl ForkModeStage {
             // cleanup the fork data
             slice.fork_status = HeaderSliceStatus::Empty;
             slice.fork_headers = None;
-            slice.refetch_attempt = 0;
 
             num = BlockNumber(num.0 + slice.len() as u64);
         }
@@ -475,7 +454,6 @@ impl ForkModeStage {
                 // cleanup the fork data
                 slice.fork_status = HeaderSliceStatus::Empty;
                 slice.fork_headers = None;
-                slice.refetch_attempt = 0;
             }
 
             num = BlockNumber(num.0 + len as u64);

@@ -1,6 +1,5 @@
 use super::{
     fork_mode_stage::ForkModeStage,
-    header_slice_verifier::HeaderSliceVerifier,
     header_slices::{HeaderSliceStatus, HeaderSlices},
     verify_stage_linear_link::VerifyStageLinearLink,
 };
@@ -12,7 +11,6 @@ use tracing::*;
 pub struct VerifyStageForkyLink {
     header_slices: Arc<HeaderSlices>,
     chain_config: ChainConfig,
-    verifier: Arc<Box<dyn HeaderSliceVerifier>>,
     start_block_num: BlockNumber,
     start_block_hash: ethereum_types::H256,
     mode: Mode,
@@ -27,14 +25,12 @@ impl VerifyStageForkyLink {
     pub fn new(
         header_slices: Arc<HeaderSlices>,
         chain_config: ChainConfig,
-        verifier: Arc<Box<dyn HeaderSliceVerifier>>,
         start_block_num: BlockNumber,
         start_block_hash: ethereum_types::H256,
     ) -> Self {
         let linear_mode_stage = VerifyStageLinearLink::new(
             header_slices.clone(),
             chain_config.clone(),
-            verifier.clone(),
             start_block_num,
             start_block_hash,
             HeaderSliceStatus::Fork,
@@ -43,7 +39,6 @@ impl VerifyStageForkyLink {
         Self {
             header_slices,
             chain_config,
-            verifier,
             start_block_num,
             start_block_hash,
             mode: Mode::Linear(Box::new(linear_mode_stage)),
@@ -85,7 +80,6 @@ impl VerifyStageForkyLink {
         VerifyStageLinearLink::new(
             self.header_slices.clone(),
             self.chain_config.clone(),
-            self.verifier.clone(),
             self.start_block_num,
             self.start_block_hash,
             HeaderSliceStatus::Fork,
@@ -97,17 +91,11 @@ impl VerifyStageForkyLink {
     }
 
     fn make_fork_mode_stage(&self) -> ForkModeStage {
-        ForkModeStage::new(
-            self.header_slices.clone(),
-            self.chain_config.clone(),
-            self.verifier.clone(),
-        )
+        ForkModeStage::new(self.header_slices.clone(), self.chain_config.clone())
     }
 
     fn switch_to_fork_mode(&mut self) {
-        let mut fork_mode_stage = self.make_fork_mode_stage();
-        fork_mode_stage.setup();
-        self.mode = Mode::Fork(Box::new(fork_mode_stage));
+        self.mode = Mode::Fork(Box::new(self.make_fork_mode_stage()));
     }
 }
 

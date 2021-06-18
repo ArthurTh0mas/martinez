@@ -1,20 +1,15 @@
 use super::{
-    downloader_stage_loop::DownloaderStageLoop,
-    fetch_receive_stage::FetchReceiveStage,
-    fetch_request_stage::FetchRequestStage,
-    header_slice_verifier::HeaderSliceVerifier,
-    header_slices,
-    header_slices::{align_block_num_to_slice_start, HeaderSliceStatus, HeaderSlices},
-    penalize_stage::PenalizeStage,
-    refetch_stage::RefetchStage,
-    retry_stage::RetryStage,
-    save_stage::SaveStage,
-    verify_stage_forky_link::VerifyStageForkyLink,
-    verify_stage_linear::VerifyStageLinear,
+    downloader_stage_loop::DownloaderStageLoop, fetch_receive_stage::FetchReceiveStage,
+    fetch_request_stage::FetchRequestStage, header_slices, header_slices::HeaderSlices,
+    penalize_stage::PenalizeStage, retry_stage::RetryStage, save_stage::SaveStage,
+    verify_stage_forky_link::VerifyStageForkyLink, verify_stage_linear::VerifyStageLinear,
     HeaderSlicesView,
 };
 use crate::{
-    downloader::ui_system::{UISystemShared, UISystemViewScope},
+    downloader::{
+        headers::header_slices::align_block_num_to_slice_start,
+        ui_system::{UISystemShared, UISystemViewScope},
+    },
     kv,
     models::BlockNumber,
     sentry::{chain_config::ChainConfig, messages::BlockHashAndNumber, sentry_client_reactor::*},
@@ -24,42 +19,20 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct DownloaderForky {
     chain_config: ChainConfig,
-    verifier: Arc<Box<dyn HeaderSliceVerifier>>,
     sentry: SentryClientReactorShared,
 }
 
 pub struct DownloaderForkyReport {
     pub loaded_count: usize,
     pub final_block_num: BlockNumber,
-    pub header_slices: Option<Arc<HeaderSlices>>,
 }
 
 impl DownloaderForky {
-    pub fn new(
-        chain_config: ChainConfig,
-        verifier: Arc<Box<dyn HeaderSliceVerifier>>,
-        sentry: SentryClientReactorShared,
-    ) -> Self {
+    pub fn new(chain_config: ChainConfig, sentry: SentryClientReactorShared) -> Self {
         Self {
             chain_config,
-            verifier,
             sentry,
         }
-    }
-
-    fn make_header_slices(
-        start_block_num: BlockNumber,
-        forky_max_blocks_count: usize,
-    ) -> HeaderSlices {
-        // This is more than enough to store forky_max_blocks_count blocks.
-        // It's not gonna affect the window size or memory usage.
-        let mem_limit = byte_unit::n_gib_bytes!(1) as usize;
-
-        let final_block_num = align_block_num_to_slice_start(BlockNumber(
-            start_block_num.0 + (forky_max_blocks_count as u64),
-        ));
-
-        HeaderSlices::new(mem_limit, start_block_num, final_block_num)
     }
 
     pub async fn run<'downloader, 'db: 'downloader, RwTx: kv::traits::MutableTransaction<'db>>(
@@ -67,7 +40,6 @@ impl DownloaderForky {
         db_transaction: &'downloader RwTx,
         start_block_id: BlockHashAndNumber,
         max_blocks_count: usize,
-        previous_run_header_slices: Option<Arc<HeaderSlices>>,
         ui_system: UISystemShared,
     ) -> anyhow::Result<DownloaderForkyReport> {
         let start_block_num = start_block_id.number;
@@ -83,16 +55,22 @@ impl DownloaderForky {
             return Ok(DownloaderForkyReport {
                 loaded_count: 0,
                 final_block_num: start_block_num,
-                header_slices: previous_run_header_slices,
             });
         }
 
-        let header_slices = previous_run_header_slices.unwrap_or_else(|| {
-            Arc::new(Self::make_header_slices(
-                start_block_num,
-                forky_max_blocks_count,
-            ))
-        });
+        // This is more than enough to store forky_max_blocks_count blocks.
+        // It's not gonna affect the window size or memory usage.
+        let mem_limit = byte_unit::n_gib_bytes!(1) as usize;
+
+        let final_block_num = align_block_num_to_slice_start(BlockNumber(
+            start_block_num.0 + (forky_max_blocks_count as u64),
+        ));
+
+        let header_slices = Arc::new(HeaderSlices::new(
+            mem_limit,
+            start_block_num,
+            final_block_num,
+        ));
         let sentry = self.sentry.clone();
 
         let header_slices_view = HeaderSlicesView::new(header_slices.clone(), "DownloaderForky");
@@ -106,27 +84,17 @@ impl DownloaderForky {
         );
         let fetch_receive_stage = FetchReceiveStage::new(header_slices.clone(), sentry.clone());
         let retry_stage = RetryStage::new(header_slices.clone());
-        let verify_stage = VerifyStageLinear::new(
-            header_slices.clone(),
-            self.chain_config.clone(),
-            self.verifier.clone(),
-        );
+        let verify_stage = VerifyStageLinear::new(header_slices.clone(), self.chain_config.clone());
         let verify_link_stage = VerifyStageForkyLink::new(
             header_slices.clone(),
             self.chain_config.clone(),
-            self.verifier.clone(),
             start_block_num,
             start_block_id.hash,
         );
-        let refetch_stage = RefetchStage::new(header_slices.clone());
         let penalize_stage = PenalizeStage::new(header_slices.clone(), sentry.clone());
         let save_stage = SaveStage::<RwTx>::new(header_slices.clone(), db_transaction);
 
-        let fetch_receive_stage_can_proceed = fetch_receive_stage.can_proceed_check();
-        let can_proceed = move |header_slices: Arc<HeaderSlices>| -> bool {
-            fetch_receive_stage_can_proceed()
-                && !header_slices.all_in_status(HeaderSliceStatus::Saved)
-        };
+        let can_proceed = fetch_receive_stage.can_proceed_check();
 
         let mut stages = DownloaderStageLoop::new(&header_slices);
         stages.insert(fetch_request_stage);
@@ -134,7 +102,6 @@ impl DownloaderForky {
         stages.insert(retry_stage);
         stages.insert(verify_stage);
         stages.insert(verify_link_stage);
-        stages.insert(refetch_stage);
         stages.insert(penalize_stage);
         stages.insert(save_stage);
 
@@ -143,7 +110,6 @@ impl DownloaderForky {
         let report = DownloaderForkyReport {
             loaded_count: (header_slices.min_block_num().0 - start_block_num.0) as usize,
             final_block_num: header_slices.min_block_num(),
-            header_slices: Some(header_slices),
         };
 
         Ok(report)

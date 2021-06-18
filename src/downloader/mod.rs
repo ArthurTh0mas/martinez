@@ -7,8 +7,6 @@ pub use headers::downloader::{
     DownloaderReport as HeaderDownloaderReport, DownloaderRunState as HeaderDownloaderRunState,
 };
 
-pub use headers::header_slice_verifier;
-
 #[cfg(test)]
 mod downloader_tests;
 
