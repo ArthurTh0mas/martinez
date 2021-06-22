@@ -1,16 +1,14 @@
-mod downloader_impl;
-mod headers;
 pub mod opts;
 pub mod sentry_status_provider;
+pub mod ui;
 
-pub use headers::downloader::{
-    DownloaderReport as HeaderDownloaderReport, DownloaderRunState as HeaderDownloaderRunState,
+mod headers_downloader;
+
+pub use headers_downloader::{
+    downloader::{
+        Downloader as HeadersDownloader, DownloaderReport as HeadersDownloaderReport,
+        DownloaderRunState as HeadersDownloaderRunState,
+        DownloaderUnwindRequest as HeadersDownloaderUnwindRequest,
+    },
+    verification::header_slice_verifier,
 };
-
-#[cfg(test)]
-mod downloader_tests;
-
-mod ui_system;
-mod ui_view;
-
-pub use self::downloader_impl::Downloader;

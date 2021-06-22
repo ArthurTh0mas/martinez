@@ -1,8 +1,10 @@
+pub(super) mod fork_switch_command;
 pub mod save_stage;
 pub mod stage;
 
 use super::{headers, verification};
 
+mod extend_stage;
 mod fetch_receive_stage;
 mod fetch_request_stage;
 mod fork_mode_stage;
@@ -17,6 +19,7 @@ mod verify_link_linear_stage;
 mod verify_preverified_stage;
 mod verify_slices_stage;
 
+pub use extend_stage::ExtendStage;
 pub use fetch_receive_stage::FetchReceiveStage;
 pub use fetch_request_stage::FetchRequestStage;
 pub use fork_mode_stage::ForkModeStage;
