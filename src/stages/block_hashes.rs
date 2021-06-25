@@ -2,7 +2,7 @@ use crate::{
     etl::collector::*,
     kv::{tables, traits::*},
     models::*,
-    stagedsync::{stage::*, stages::*},
+    stagedsync::stage::*,
     StageId,
 };
 use async_trait::async_trait;
@@ -12,7 +12,6 @@ use tokio::pin;
 use tokio_stream::StreamExt;
 use tracing::*;
 
-/// Generate BlockHashes => BlockNumber Mapping
 #[derive(Debug)]
 pub struct BlockHashes {
     pub temp_dir: Arc<TempDir>,
@@ -24,14 +23,14 @@ where
     RwTx: MutableTransaction<'db>,
 {
     fn id(&self) -> StageId {
-        BLOCK_HASHES
+        StageId("BlockHashes")
     }
 
-    async fn execute<'tx>(
-        &mut self,
-        tx: &'tx mut RwTx,
-        input: StageInput,
-    ) -> anyhow::Result<ExecOutput>
+    fn description(&self) -> &'static str {
+        "Generating BlockHashes => BlockNumber Mapping"
+    }
+
+    async fn execute<'tx>(&self, tx: &'tx mut RwTx, input: StageInput) -> anyhow::Result<ExecOutput>
     where
         'db: 'tx,
     {
@@ -62,7 +61,7 @@ where
     }
 
     async fn unwind<'tx>(
-        &mut self,
+        &self,
         tx: &'tx mut RwTx,
         input: crate::stagedsync::stage::UnwindInput,
     ) -> anyhow::Result<UnwindOutput>

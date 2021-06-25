@@ -10,6 +10,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
+use ethereum_types::{Address, H256, *};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     marker::PhantomData,
@@ -124,7 +125,7 @@ where
             if let Some(value) = account_storage.slots.get(&location) {
                 return Ok(*value);
             } else if account_storage.erased {
-                return Ok(U256::ZERO);
+                return Ok(U256::zero());
             }
         }
 
@@ -419,13 +420,13 @@ mod tests {
         let location_a = H256(hex!(
             "0000000000000000000000000000000000000000000000000000000000000013"
         ));
-        let value_a1 = 0x6b.as_u256();
-        let value_a2 = 0x85.as_u256();
+        let value_a1 = 0x6b.into();
+        let value_a2 = 0x85.into();
 
         let location_b = H256(hex!(
             "0000000000000000000000000000000000000000000000000000000000000002"
         ));
-        let value_b = 0x132.as_u256();
+        let value_b = 0x132.into();
 
         txn.set(tables::Storage, address, (location_a, value_a1))
             .await

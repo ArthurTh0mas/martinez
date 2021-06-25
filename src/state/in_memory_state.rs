@@ -1,6 +1,7 @@
 use crate::{crypto::*, models::*, util::*, State};
 use async_trait::async_trait;
 use bytes::Bytes;
+use ethereum_types::*;
 use std::{collections::HashMap, convert::TryInto};
 
 // address -> initial value
@@ -134,7 +135,7 @@ impl InMemoryState {
 
         let d = {
             if block_number == 0 {
-                U256::ZERO
+                U256::zero()
             } else {
                 *self.difficulty[block_number - 1]
                     .entry(parent_hash)
@@ -209,7 +210,7 @@ impl InMemoryState {
         {
             for (location, value) in storage {
                 let e = self.storage.entry(address).or_default();
-                if value == 0 {
+                if value.is_zero() {
                     e.remove(&location);
                 } else {
                     e.insert(location, value);
@@ -238,7 +239,7 @@ impl State for InMemoryState {
             }
         }
 
-        Ok(U256::ZERO)
+        Ok(U256::zero())
     }
 
     async fn erase_storage(&mut self, address: Address) -> anyhow::Result<()> {
@@ -345,7 +346,7 @@ impl State for InMemoryState {
 
         let e = self.storage.entry(address).or_default();
 
-        if current == 0 {
+        if current.is_zero() {
             e.remove(&location);
         } else {
             e.insert(location, current);
@@ -539,7 +540,7 @@ mod tests {
 
                     for (location, value) in account.storage {
                         state
-                            .update_storage(address, location, U256::ZERO, value)
+                            .update_storage(address, location, U256::zero(), value)
                             .await
                             .unwrap();
                     }
