@@ -5,8 +5,7 @@ use super::{
     header_slices,
     header_slices::{align_block_num_to_slice_start, HeaderSlice, HeaderSliceStatus, HeaderSlices},
 };
-use crate::{models::BlockNumber, sentry::chain_config::ChainConfig};
-use ethereum_types::U256;
+use crate::{models::*, sentry::chain_config::ChainConfig};
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use std::{
     ops::{ControlFlow, DerefMut, Range},
@@ -308,7 +307,7 @@ impl ForkModeStage {
         connection_block_num: BlockNumber,
         slice_status_predicate: impl Fn(HeaderSliceStatus) -> bool,
     ) -> U256 {
-        let mut difficulty: U256 = U256::zero();
+        let mut difficulty = U256::ZERO;
 
         for num in range {
             if num <= connection_block_num {

@@ -5,6 +5,7 @@ use super::{
     parallel::map_parallel,
     preverified_hashes_config::PreverifiedHashesConfig,
 };
+use crate::models::*;
 use parking_lot::RwLock;
 use std::{ops::DerefMut, sync::Arc};
 use tracing::*;
@@ -136,7 +137,7 @@ impl VerifyStagePreverified {
         header_slice_verifier::verify_slice_is_linked_by_parent_hash(headers)
     }
 
-    fn preverified_hash(&self, block_num: u64) -> Option<&ethereum_types::H256> {
+    fn preverified_hash(&self, block_num: u64) -> Option<&H256> {
         let preverified_step_size = header_slices::HEADER_SLICE_SIZE as u64;
         if block_num % preverified_step_size != 0 {
             return None;

@@ -1,7 +1,6 @@
 use crate::{
     downloader::{
-        sentry_status_provider::SentryStatusProvider, ui::ui_system::UISystem, HeadersDownloader,
-        HeadersDownloaderRunState,
+        sentry_status_provider::SentryStatusProvider, Downloader, HeaderDownloaderRunState,
     },
     kv::traits::*,
     models::BlockNumber,
@@ -15,10 +14,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 #[derive(Debug)]
 pub struct HeaderDownload {
-    downloader: HeadersDownloader,
+    downloader: Downloader,
     batch_size: usize,
-    sentry_status_provider: SentryStatusProvider,
-    previous_run_state: Arc<AsyncMutex<Option<HeadersDownloaderRunState>>>,
+    previous_run_state: Arc<AsyncMutex<Option<HeaderDownloaderRunState>>>,
 }
 
 impl HeaderDownload {
@@ -31,22 +29,27 @@ impl HeaderDownload {
     ) -> anyhow::Result<Self> {
         let verifier = crate::downloader::header_slice_verifier::make_ethash_verifier();
 
-        let downloader = HeadersDownloader::new(chain_config, verifier, mem_limit, sentry)?;
+        let downloader = Downloader::new(
+            chain_config,
+            verifier,
+            mem_limit,
+            sentry,
+            sentry_status_provider,
+        )?;
 
         let instance = Self {
             downloader,
             batch_size,
-            sentry_status_provider,
             previous_run_state: Arc::new(AsyncMutex::new(None)),
         };
         Ok(instance)
     }
 
-    async fn load_previous_run_state(&self) -> Option<HeadersDownloaderRunState> {
+    async fn load_previous_run_state(&self) -> Option<HeaderDownloaderRunState> {
         self.previous_run_state.lock().await.clone()
     }
 
-    async fn save_run_state(&self, run_state: HeadersDownloaderRunState) {
+    async fn save_run_state(&self, run_state: HeaderDownloaderRunState) {
         *self.previous_run_state.lock().await = Some(run_state);
     }
 }
@@ -68,29 +71,15 @@ where
     where
         'db: 'tx,
     {
-        self.sentry_status_provider.update(tx).await?;
-
         let past_progress = input.stage_progress.unwrap_or_default();
 
         let start_block_num = BlockNumber(past_progress.0 + 1);
         let previous_run_state = self.load_previous_run_state().await;
 
-        let mut ui_system = UISystem::new();
-        ui_system.start()?;
-        let ui_system = Arc::new(AsyncMutex::new(ui_system));
-
         let report = self
             .downloader
-            .run(
-                tx,
-                start_block_num,
-                self.batch_size,
-                previous_run_state,
-                ui_system.clone(),
-            )
+            .run(tx, start_block_num, self.batch_size, previous_run_state)
             .await?;
-
-        ui_system.try_lock()?.stop().await?;
 
         let final_block_num = report.final_block_num.0;
         let stage_progress = if final_block_num > 0 {

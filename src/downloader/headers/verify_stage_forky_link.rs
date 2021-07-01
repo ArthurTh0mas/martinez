@@ -4,7 +4,7 @@ use super::{
     header_slices::{HeaderSliceStatus, HeaderSlices},
     verify_stage_linear_link::VerifyStageLinearLink,
 };
-use crate::{models::BlockNumber, sentry::chain_config::ChainConfig};
+use crate::{models::*, sentry::chain_config::ChainConfig};
 use std::sync::Arc;
 use tracing::*;
 
@@ -14,7 +14,7 @@ pub struct VerifyStageForkyLink {
     chain_config: ChainConfig,
     verifier: Arc<Box<dyn HeaderSliceVerifier>>,
     start_block_num: BlockNumber,
-    start_block_hash: ethereum_types::H256,
+    start_block_hash: H256,
     mode: Mode,
 }
 
@@ -29,7 +29,7 @@ impl VerifyStageForkyLink {
         chain_config: ChainConfig,
         verifier: Arc<Box<dyn HeaderSliceVerifier>>,
         start_block_num: BlockNumber,
-        start_block_hash: ethereum_types::H256,
+        start_block_hash: H256,
     ) -> Self {
         let linear_mode_stage = VerifyStageLinearLink::new(
             header_slices.clone(),

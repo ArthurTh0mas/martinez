@@ -5,7 +5,7 @@ use super::{
     header_slices,
     header_slices::{HeaderSlice, HeaderSliceStatus, HeaderSlices},
 };
-use crate::{models::BlockNumber, sentry::chain_config::ChainConfig};
+use crate::{models::*, sentry::chain_config::ChainConfig};
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use std::{
     ops::{ControlFlow, DerefMut},
@@ -19,7 +19,7 @@ pub struct VerifyStageLinearLink {
     chain_config: ChainConfig,
     verifier: Arc<Box<dyn HeaderSliceVerifier>>,
     start_block_num: BlockNumber,
-    start_block_hash: ethereum_types::H256,
+    start_block_hash: H256,
     invalid_status: HeaderSliceStatus,
     last_verified_header: Option<BlockHeader>,
     pending_watch: HeaderSliceStatusWatch,
@@ -32,7 +32,7 @@ impl VerifyStageLinearLink {
         chain_config: ChainConfig,
         verifier: Arc<Box<dyn HeaderSliceVerifier>>,
         start_block_num: BlockNumber,
-        start_block_hash: ethereum_types::H256,
+        start_block_hash: H256,
         invalid_status: HeaderSliceStatus,
     ) -> Self {
         let last_verified_header = Self::find_last_verified_header(&header_slices);
