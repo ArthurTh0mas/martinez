@@ -55,4 +55,5 @@ pub trait Stage<'db, RwTx: MutableTransaction<'db>>: Send + Sync + Debug {
     ) -> anyhow::Result<UnwindOutput>
     where
         'db: 'tx;
+
 }

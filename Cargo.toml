@@ -32,7 +32,6 @@ ethereum-interfaces = { git = "https://github.com/ledgerwatch/interfaces", branc
 ] }
 ethereum-types = { version = "0.12", features = ["codec"] }
 ethnum = { git = "https://github.com/vorot93/ethnum-rs", branch = "staging", features = [
-    "llvm-intrinsics",
     "rlp",
     "scale",
 ] }
