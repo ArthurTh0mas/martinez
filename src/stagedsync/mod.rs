@@ -122,6 +122,8 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                 let mut previous_stage = None;
                 let mut timings = vec![];
 
+                let mut minimum_progress = None;
+
                 // Execute each stage in direct order.
                 for (stage_index, stage) in self.stages.iter_mut().enumerate() {
                     let mut restarted = false;
@@ -224,6 +226,12 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                             } => {
                                 stage_id.save_progress(&tx, stage_progress).await?;
 
+                                if let Some(m) = &mut minimum_progress {
+                                    *m = std::cmp::min(*m, stage_progress);
+                                } else {
+                                    minimum_progress = Some(stage_progress);
+                                }
+
                                 // Check if we should commit now.
                                 if stage_progress
                                     .saturating_sub(start_progress.map(|v| v.0).unwrap_or(0))
@@ -265,6 +273,9 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                         format!("{} {}={}", acc, stage_id, format_duration(time, true))
                     });
                 info!("Staged sync complete.{}", t);
+
+                // Prune all stages
+                // for (stage_index, stage) in self.stages.iter_mut().enumerate() {}
             }
         }
     }

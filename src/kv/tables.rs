@@ -858,6 +858,7 @@ decl_table!(CallToIndex => BitmapKey<Address> => RoaringTreemap);
 decl_table!(BlockTransactionLookup => H256 => TruncateStart<BlockNumber>);
 decl_table!(Config => H256 => ChainSpec);
 decl_table!(SyncStage => StageId => BlockNumber);
+decl_table!(PruneProgress => StageId => BlockNumber);
 decl_table!(TxSender => HeaderKey => Vec<Address>);
 decl_table!(LastBlock => Vec<u8> => Vec<u8>);
 decl_table!(Migration => Vec<u8> => Vec<u8>);
