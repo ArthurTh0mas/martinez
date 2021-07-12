@@ -172,14 +172,14 @@ impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>> SaveStage<'tx, RwTx> {
         for header_ref in headers {
             // this clone happens mostly on the stack (except extra_data)
             let header = header_ref.clone();
-            self.save_header(header, tx).await?;
+            Self::save_header(header, self.is_canonical_chain, tx).await?;
         }
         Ok(())
     }
 
     async fn read_parent_header_total_difficulty(
         child: &BlockHeader,
-        tx: &RwTx,
+        tx: &'tx RwTx,
     ) -> anyhow::Result<Option<U256>> {
         if child.number() == BlockNumber(0) {
             return Ok(Some(U256::ZERO));
@@ -192,51 +192,101 @@ impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>> SaveStage<'tx, RwTx> {
         Ok(parent_total_difficulty)
     }
 
-    async fn save_header(&self, header: BlockHeader, tx: &RwTx) -> anyhow::Result<()> {
+    async fn header_total_difficulty(
+        header: &BlockHeader,
+        tx: &'tx RwTx,
+    ) -> anyhow::Result<Option<U256>> {
+        let Some(parent_total_difficulty) = Self::read_parent_header_total_difficulty(header, tx).await? else {
+            return Ok(None)
+        };
+        let total_difficulty = parent_total_difficulty + header.difficulty();
+        Ok(Some(total_difficulty))
+    }
+
+    pub async fn load_canonical_header_by_num(
+        block_num: BlockNumber,
+        tx: &'tx RwTx,
+    ) -> anyhow::Result<Option<BlockHeader>> {
+        let Some(header_hash) = tx.get(kv::tables::CanonicalHeader, block_num).await? else {
+            return Ok(None);
+        };
+        let header_key: HeaderKey = (block_num, header_hash);
+        let header_opt = tx.get(kv::tables::Header, header_key).await?;
+        Ok(header_opt.map(|header| BlockHeader::new(header, header_hash)))
+    }
+
+    pub async fn save_header(
+        header: BlockHeader,
+        is_canonical_chain: bool,
+        tx: &'tx RwTx,
+    ) -> anyhow::Result<()> {
         let block_num = header.number();
         let header_hash = header.hash();
         let header_key: HeaderKey = (block_num, header_hash);
 
-        // saving a precomputed RLP representation
-        tx.set(HeaderTableWithBytes, header_key, header.rlp_repr())
+        if is_canonical_chain {
+            Self::update_canonical_chain_header(&header, tx).await?;
+        }
+
+        tx.set(kv::tables::Header, header_key, header.header)
             .await?;
         tx.set(kv::tables::HeaderNumber, header_hash, block_num)
             .await?;
 
-        if self.is_canonical_chain {
-            tx.set(kv::tables::CanonicalHeader, block_num, header_hash)
-                .await?;
-            tx.set(kv::tables::LastHeader, Default::default(), header_hash)
-                .await?;
+        Ok(())
+    }
 
-            if let Some(mut total_difficulty) =
-                Self::read_parent_header_total_difficulty(&header, tx).await?
-            {
-                total_difficulty += header.difficulty();
-                tx.set(
-                    kv::tables::HeadersTotalDifficulty,
-                    header_key,
-                    total_difficulty,
-                )
-                .await?;
-            }
+    pub async fn update_canonical_chain_header(
+        header: &BlockHeader,
+        tx: &'tx RwTx,
+    ) -> anyhow::Result<()> {
+        let block_num = header.number();
+        let header_hash = header.hash();
+        let header_key: HeaderKey = (block_num, header_hash);
+
+        tx.set(kv::tables::CanonicalHeader, block_num, header_hash)
+            .await?;
+        tx.set(kv::tables::LastHeader, Default::default(), header_hash)
+            .await?;
+
+        let total_difficulty_opt = Self::header_total_difficulty(header, tx).await?;
+        if let Some(total_difficulty) = total_difficulty_opt {
+            tx.set(
+                kv::tables::HeadersTotalDifficulty,
+                header_key,
+                total_difficulty,
+            )
+            .await?;
         }
 
         Ok(())
     }
-}
 
-#[derive(Debug)]
-struct HeaderTableWithBytes;
+    pub async fn unwind(unwind_to_block_num: BlockNumber, tx: &'tx RwTx) -> anyhow::Result<()> {
+        // headers after unwind_to_block_num are not canonical anymore
+        for i in unwind_to_block_num.0 + 1.. {
+            let num = BlockNumber(i);
+            let was_found = tx.del(kv::tables::CanonicalHeader, num, None).await?;
+            if !was_found {
+                break;
+            }
+        }
 
-impl kv::traits::Table for HeaderTableWithBytes {
-    type Key = <kv::tables::Header as kv::traits::Table>::Key;
-    type Value = bytes::Bytes;
-    type SeekKey = <kv::tables::Header as kv::traits::Table>::SeekKey;
+        // update LastHeader to point to unwind_to_block_num
+        let last_header_hash_opt = tx
+            .get(kv::tables::CanonicalHeader, unwind_to_block_num)
+            .await?;
+        if let Some(hash) = last_header_hash_opt {
+            tx.set(kv::tables::LastHeader, Default::default(), hash)
+                .await?;
+        } else {
+            anyhow::bail!(
+                "unwind: not found header hash of the top block after unwind {}",
+                unwind_to_block_num.0
+            );
+        }
 
-    fn db_name(&self) -> string::String<bytes::Bytes> {
-        let table = kv::tables::Header;
-        table.db_name()
+        Ok(())
     }
 }
 

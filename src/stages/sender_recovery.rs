@@ -4,7 +4,7 @@ use crate::{
         traits::*,
     },
     models::*,
-    stagedsync::{format_duration, stage::*},
+    stagedsync::{format_duration, stage::*, stages::*},
     StageId,
 };
 use async_trait::async_trait;
@@ -26,7 +26,7 @@ where
     RwTx: MutableTransaction<'db>,
 {
     fn id(&self) -> StageId {
-        StageId("SenderRecovery")
+        SENDERS
     }
 
     async fn execute<'tx>(
@@ -51,13 +51,13 @@ where
         let started_at = Instant::now();
         let started_at_txnum = tx
             .get(
-                tables::CumulativeIndex,
+                tables::TotalTx,
                 input.first_started_at.1.unwrap_or(BlockNumber(0)),
             )
-            .await?
-            .map(|v| v.tx_num);
+            .await?;
         let done = loop {
             let mut read_again = false;
+            let mut batch_txs = 0;
             debug!("Reading bodies");
             while let Some(((block_number, hash), body)) = walker.try_next().await? {
                 let txs = walk(&mut tx_cur, Some(body.base_tx_id.encode().to_vec()))
@@ -65,11 +65,12 @@ where
                     .map(|res| res.map(|(_, tx)| tx))
                     .collect::<anyhow::Result<Vec<_>>>()
                     .await?;
+                batch_txs += txs.len();
                 batch.push((block_number, hash, txs));
 
                 highest_block = block_number;
 
-                if batch.len() >= self.batch_size {
+                if batch_txs >= self.batch_size {
                     read_again = true;
                     break;
                 }
@@ -119,16 +120,13 @@ where
                 let mut format_string = format!("Extracted senders from block {}", highest_block);
 
                 if let Some(started_at_txnum) = started_at_txnum {
-                    let current_txnum = tx
-                        .get(tables::CumulativeIndex, highest_block)
-                        .await?
-                        .map(|v| v.tx_num);
+                    let current_txnum = tx.get(tables::TotalTx, highest_block).await?;
                     let total_txnum = tx
-                        .cursor(tables::CumulativeIndex)
+                        .cursor(tables::TotalTx)
                         .await?
                         .last()
                         .await?
-                        .map(|(_, v)| v.tx_num);
+                        .map(|(_, v)| v);
 
                     if let Some(current_txnum) = current_txnum {
                         if let Some(total_txnum) = total_txnum {
@@ -367,12 +365,14 @@ mod tests {
             .await
             .unwrap();
 
-        let mut stage = SenderRecovery { batch_size: 50_000 };
+        let mut stage = SenderRecovery {
+            batch_size: 500_000,
+        };
 
         let stage_input = StageInput {
             restarted: false,
             first_started_at: (Instant::now(), Some(BlockNumber(0))),
-            previous_stage: Some((StageId("BodyDownload"), 3.into())),
+            previous_stage: Some((BODIES, 3.into())),
             stage_progress: Some(0.into()),
         };
 

@@ -18,12 +18,6 @@ pub struct UnwindInput {
     pub unwind_to: BlockNumber,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct PruningInput {
-    pub prune_progress: Option<BlockNumber>,
-    pub prune_to: BlockNumber,
-}
-
 #[derive(Debug, PartialEq)]
 pub enum ExecOutput {
     Unwind {
@@ -61,11 +55,4 @@ pub trait Stage<'db, RwTx: MutableTransaction<'db>>: Send + Sync + Debug {
     ) -> anyhow::Result<UnwindOutput>
     where
         'db: 'tx;
-
-    async fn prune<'tx>(&mut self, _tx: &'tx mut RwTx, _input: PruningInput) -> anyhow::Result<()>
-    where
-        'db: 'tx,
-    {
-        Ok(())
-    }
 }

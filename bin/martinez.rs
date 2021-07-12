@@ -14,11 +14,12 @@ use martinez::{
     stages::*,
     version_string, StageId,
 };
-use anyhow::{bail, Context};
+use anyhow::{bail, format_err, Context};
 use async_trait::async_trait;
 use clap::Parser;
 use rayon::prelude::*;
 use std::{
+    panic,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -64,7 +65,7 @@ pub struct Opt {
     pub downloader_opts: martinez::downloader::opts::Opts,
 
     /// Sender recovery batch size (blocks)
-    #[clap(long, default_value = "50000")]
+    #[clap(long, default_value = "500000")]
     pub sender_recovery_batch_size: u64,
 
     /// Execution batch size (Ggas).
@@ -78,6 +79,10 @@ pub struct Opt {
     /// Exit execution stage after batch.
     #[clap(long)]
     pub execution_exit_after_batch: bool,
+
+    /// Skip commitment (state root) verification.
+    #[clap(long)]
+    pub skip_commitment: bool,
 
     /// Exit Martinez after sync is complete and there's no progress.
     #[clap(long)]
@@ -132,9 +137,11 @@ where
             .await?
             != tx.get(tables::CanonicalHeader, highest_block).await?
         {
-            return Ok(ExecOutput::Unwind {
-                unwind_to: BlockNumber(highest_block.0 - 1),
-            });
+            let unwind_to = BlockNumber(highest_block.0.checked_sub(1).ok_or_else(|| {
+                format_err!("Attempted to unwind past genesis block, are Erigon and Martinez on the same chain?")
+            })?);
+
+            return Ok(ExecOutput::Unwind { unwind_to });
         }
 
         let walker = walk(&mut erigon_canonical_cur, Some(highest_block + 1));
@@ -265,9 +272,11 @@ where
             .await?
             != tx.get(tables::CanonicalHeader, highest_block).await?
         {
-            return Ok(ExecOutput::Unwind {
-                unwind_to: BlockNumber(highest_block.0 - 1),
-            });
+            let unwind_to = BlockNumber(highest_block.0.checked_sub(1).ok_or_else(|| {
+                format_err!("Attempted to unwind past genesis block, are Erigon and Martinez on the same chain?")
+            })?);
+
+            return Ok(ExecOutput::Unwind { unwind_to });
         }
 
         let mut canonical_header_cur = tx.cursor(tables::CanonicalHeader).await?;
@@ -476,11 +485,7 @@ where
 }
 
 #[derive(Debug)]
-struct FinishStage {
-    max_block: Option<BlockNumber>,
-    exit_after_sync: bool,
-    delay_after_sync: Duration,
-}
+struct FinishStage;
 
 #[async_trait]
 impl<'db, RwTx> Stage<'db, RwTx> for FinishStage
@@ -502,29 +507,11 @@ where
             .previous_stage
             .map(|(_, b)| b)
             .unwrap_or(BlockNumber(0));
-        let last_cycle_progress = input.stage_progress.unwrap_or(BlockNumber(0));
-        Ok(
-            if prev_stage > last_cycle_progress
-                && prev_stage < self.max_block.unwrap_or(BlockNumber(u64::MAX))
-            {
-                ExecOutput::Progress {
-                    stage_progress: prev_stage,
-                    done: true,
-                }
-            } else {
-                if self.exit_after_sync {
-                    info!("Sync complete, exiting.");
-                    std::process::exit(0)
-                }
 
-                tokio::time::sleep(self.delay_after_sync).await;
-
-                ExecOutput::Progress {
-                    stage_progress: prev_stage,
-                    done: true,
-                }
-            },
-        )
+        Ok(ExecOutput::Progress {
+            stage_progress: prev_stage,
+            done: true,
+        })
     }
     async fn unwind<'tx>(
         &mut self,
@@ -541,8 +528,7 @@ where
 }
 
 #[allow(unreachable_code)]
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let opt: Opt = Opt::parse();
 
     let nocolor = std::env::var("RUST_LOG_STYLE")
@@ -567,113 +553,130 @@ async fn main() -> anyhow::Result<()> {
         .with(env_filter)
         .init();
 
-    info!("Starting Martinez ({})", version_string());
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(64 * 1024 * 1024)
+                .build()?;
 
-    let chains_config = martinez::sentry::chain_config::ChainsConfig::new()?;
-    let chain_config = chains_config.get(&opt.chain_name)?;
+            rt.block_on(async move {
+                info!("Starting Martinez ({})", version_string());
 
-    // database setup
-    let erigon_db = if let Some(erigon_data_dir) = opt.erigon_data_dir {
-        let erigon_chain_data_dir = erigon_data_dir.join("chaindata");
-        let erigon_db = martinez::kv::mdbx::Environment::<mdbx::NoWriteMap>::open_ro(
-            mdbx::Environment::new(),
-            &erigon_chain_data_dir,
-            martinez::kv::tables::CHAINDATA_TABLES.clone(),
-        )?;
-        Some(Arc::new(erigon_db))
-    } else {
-        None
-    };
+                let chains_config = martinez::sentry::chain_config::ChainsConfig::new()?;
+                let chain_config = chains_config.get(&opt.chain_name)?;
 
-    std::fs::create_dir_all(&opt.data_dir.0)?;
-    let martinez_chain_data_dir = opt.data_dir.chain_data_dir();
-    let etl_temp_path = opt.data_dir.etl_temp_dir();
-    let _ = std::fs::remove_dir_all(&etl_temp_path);
-    std::fs::create_dir_all(&etl_temp_path)?;
-    let etl_temp_dir =
-        Arc::new(tempfile::tempdir_in(&etl_temp_path).context("failed to create ETL temp dir")?);
-    let db = martinez::kv::new_database(&martinez_chain_data_dir)?;
-    async {
-        let txn = db.begin_mutable().await?;
-        if martinez::genesis::initialize_genesis(
-            &txn,
-            &*etl_temp_dir,
-            chain_config.chain_spec().clone(),
-        )
-        .await?
-        {
-            txn.commit().await?;
-        }
+                // database setup
+                let erigon_db = if let Some(erigon_data_dir) = opt.erigon_data_dir {
+                    let erigon_chain_data_dir = erigon_data_dir.join("chaindata");
+                    let erigon_db = martinez::kv::mdbx::Environment::<mdbx::NoWriteMap>::open_ro(
+                        mdbx::Environment::new(),
+                        &erigon_chain_data_dir,
+                        martinez::kv::tables::CHAINDATA_TABLES.clone(),
+                    )?;
+                    Some(Arc::new(erigon_db))
+                } else {
+                    None
+                };
 
-        Ok::<_, anyhow::Error>(())
-    }
-    .instrument(span!(Level::INFO, "", " Genesis initialization "))
-    .await?;
+                std::fs::create_dir_all(&opt.data_dir.0)?;
+                let martinez_chain_data_dir = opt.data_dir.chain_data_dir();
+                let etl_temp_path = opt.data_dir.etl_temp_dir();
+                let _ = std::fs::remove_dir_all(&etl_temp_path);
+                std::fs::create_dir_all(&etl_temp_path)?;
+                let etl_temp_dir = Arc::new(
+                    tempfile::tempdir_in(&etl_temp_path)
+                        .context("failed to create ETL temp dir")?,
+                );
+                let db = martinez::kv::new_database(&martinez_chain_data_dir)?;
+                async {
+                    let txn = db.begin_mutable().await?;
+                    if martinez::genesis::initialize_genesis(
+                        &txn,
+                        &*etl_temp_dir,
+                        chain_config.chain_spec().clone(),
+                    )
+                    .await?
+                    {
+                        txn.commit().await?;
+                    }
 
-    let sentry_status_provider = SentryStatusProvider::new(chain_config.clone());
-    // staged sync setup
-    let mut staged_sync = stagedsync::StagedSync::new();
-    staged_sync.set_min_progress_to_commit_after_stage(1024);
-    if let Some(erigon_db) = erigon_db.clone() {
-        staged_sync.push(ConvertHeaders {
-            db: erigon_db,
-            max_block: opt.max_block,
-        });
-    } else {
-        // sentry setup
-        let mut sentry_reactor = SentryClientReactor::new(
-            Box::new(SentryClientConnectorImpl::new(opt.sentry_api_addr.clone())),
-            sentry_status_provider.current_status_stream(),
-        );
-        sentry_reactor.start()?;
+                    Ok::<_, anyhow::Error>(())
+                }
+                .instrument(span!(Level::INFO, "", " Genesis initialization "))
+                .await?;
 
-        staged_sync.push(HeaderDownload::new(
-            chain_config,
-            opt.downloader_opts.headers_mem_limit(),
-            opt.downloader_opts.headers_batch_size,
-            sentry_reactor.into_shared(),
-            sentry_status_provider,
-        )?);
-    }
-    staged_sync.push(BlockHashes {
-        temp_dir: etl_temp_dir.clone(),
-    });
-    if let Some(erigon_db) = erigon_db {
-        staged_sync.push(ConvertBodies {
-            db: erigon_db,
-            commit_after: Duration::from_secs(120),
-        });
-    } else {
-        // also add body download stage here
-    }
-    staged_sync.push(CumulativeIndex);
-    staged_sync.push(SenderRecovery {
-        batch_size: opt.sender_recovery_batch_size.try_into().unwrap(),
-    });
-    staged_sync.push(Execution {
-        batch_size: opt.execution_batch_size.saturating_mul(1_000_000_000_u64),
-        history_batch_size: opt
-            .execution_history_batch_size
-            .saturating_mul(1_000_000_000_u64),
-        exit_after_batch: opt.execution_exit_after_batch,
-        batch_until: None,
-        commit_every: None,
-        prune_from: BlockNumber(0),
-    });
-    staged_sync.push(HashState::new(etl_temp_dir.clone(), None));
-    staged_sync.push(Interhashes::new(etl_temp_dir.clone(), None));
-    staged_sync.push(CallTraceIndex {
-        temp_dir: etl_temp_dir.clone(),
-        flush_interval: 50_000,
-    });
-    staged_sync.push(FinishStage {
-        max_block: opt.max_block,
-        exit_after_sync: opt.exit_after_sync,
-        delay_after_sync: Duration::from_millis(opt.delay_after_sync),
-    });
+                let sentry_status_provider = SentryStatusProvider::new(chain_config.clone());
+                // staged sync setup
+                let mut staged_sync = stagedsync::StagedSync::new();
+                staged_sync.set_min_progress_to_commit_after_stage(1024);
+                staged_sync.set_max_block(opt.max_block);
+                staged_sync.set_exit_after_sync(opt.exit_after_sync);
+                staged_sync.set_delay_after_sync(Some(Duration::from_millis(opt.delay_after_sync)));
+                if let Some(erigon_db) = erigon_db.clone() {
+                    staged_sync.push(ConvertHeaders {
+                        db: erigon_db,
+                        max_block: opt.max_block,
+                    });
+                } else {
+                    // sentry setup
+                    let mut sentry_reactor = SentryClientReactor::new(
+                        Box::new(SentryClientConnectorImpl::new(opt.sentry_api_addr.clone())),
+                        sentry_status_provider.current_status_stream(),
+                    );
+                    sentry_reactor.start()?;
 
-    info!("Running staged sync");
-    staged_sync.run(&db).await?;
+                    staged_sync.push(HeaderDownload::new(
+                        chain_config,
+                        opt.downloader_opts.headers_mem_limit(),
+                        opt.downloader_opts.headers_batch_size,
+                        sentry_reactor.into_shared(),
+                        sentry_status_provider,
+                    )?);
+                }
+                staged_sync.push(TotalGasIndex);
+                staged_sync.push(BlockHashes {
+                    temp_dir: etl_temp_dir.clone(),
+                });
+                if let Some(erigon_db) = erigon_db {
+                    staged_sync.push(ConvertBodies {
+                        db: erigon_db,
+                        commit_after: Duration::from_secs(120),
+                    });
+                } else {
+                    // also add body download stage here
+                }
+                staged_sync.push(TotalTxIndex);
+                staged_sync.push(SenderRecovery {
+                    batch_size: opt.sender_recovery_batch_size.try_into().unwrap(),
+                });
+                staged_sync.push(Execution {
+                    batch_size: opt.execution_batch_size.saturating_mul(1_000_000_000_u64),
+                    history_batch_size: opt
+                        .execution_history_batch_size
+                        .saturating_mul(1_000_000_000_u64),
+                    exit_after_batch: opt.execution_exit_after_batch,
+                    batch_until: None,
+                    commit_every: None,
+                    prune_from: BlockNumber(0),
+                });
+                if !opt.skip_commitment {
+                    staged_sync.push(HashState::new(etl_temp_dir.clone(), None));
+                    staged_sync.push(Interhashes::new(etl_temp_dir.clone(), None));
+                }
+                staged_sync.push(CallTraceIndex {
+                    temp_dir: etl_temp_dir.clone(),
+                    flush_interval: 50_000,
+                });
+                staged_sync.push(FinishStage);
 
-    Ok(())
+                info!("Running staged sync");
+                staged_sync.run(&db).await?;
+
+                Ok(())
+            })
+        })?
+        .join()
+        .unwrap_or_else(|e| panic::resume_unwind(e))
 }
