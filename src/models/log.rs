@@ -1,10 +1,9 @@
-use super::*;
 use bytes::Bytes;
-use parity_scale_codec::*;
+use ethereum_types::*;
 use rlp::*;
 use serde::*;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Log {
     pub address: Address,
     pub topics: Vec<H256>,

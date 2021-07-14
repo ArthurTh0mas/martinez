@@ -45,12 +45,7 @@ impl TopBlockEstimateStage {
     }
 
     pub async fn execute(&self) -> anyhow::Result<()> {
-        // when it is over - hang to avoid a live idle loop
-        // ideally stop calling this execute() in the make_stage_stream loop
-        if self.is_over.load(Ordering::SeqCst) {
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        }
-
+        debug!("TopBlockEstimateStage: start");
         let mut message_stream = self.message_stream.try_lock()?;
         if message_stream.is_none() {
             let sentry = self.sentry.read().await;
@@ -62,6 +57,7 @@ impl TopBlockEstimateStage {
             Some(message) => self.on_message(message),
             None => self.is_over.store(true, Ordering::SeqCst),
         }
+        debug!("TopBlockEstimateStage: done");
         Ok(())
     }
 
@@ -131,19 +127,11 @@ impl TopBlockEstimateStage {
         let average_block_num = BlockNumber(block_nums.sum::<u64>() / (peer_blocks.len() as u64));
         Some(average_block_num)
     }
-
-    pub fn can_proceed_check(&self) -> impl Fn() -> bool {
-        let is_over = self.is_over.clone();
-        move || -> bool { !is_over.load(Ordering::SeqCst) }
-    }
 }
 
 #[async_trait::async_trait]
 impl super::stage::Stage for TopBlockEstimateStage {
     async fn execute(&mut self) -> anyhow::Result<()> {
-        Self::execute(self).await
-    }
-    fn can_proceed_check(&self) -> Box<dyn Fn() -> bool + Send> {
-        Box::new(Self::can_proceed_check(self))
+        TopBlockEstimateStage::execute(self).await
     }
 }

@@ -1,6 +1,7 @@
-use crate::{chain::protocol_param::param, crypto::*, models::*, util::*};
+use crate::{chain::protocol_param::param, crypto::*, util::*};
 use arrayref::array_ref;
 use bytes::{Buf, Bytes};
+use ethereum_types::*;
 use evmodin::Revision;
 use num_bigint::BigUint;
 use num_traits::Zero;
@@ -81,9 +82,9 @@ fn ecrecover_run_inner(mut input: Bytes) -> Option<Bytes> {
         input = input2.into();
     }
 
-    let v = U256::from_be_bytes(*array_ref!(input, 32, 32));
-    let r = H256(*array_ref!(input, 64, 32));
-    let s = H256(*array_ref!(input, 96, 32));
+    let v = U256::from_big_endian(&input[32..64]);
+    let r = H256::from_slice(&input[64..96]);
+    let s = H256::from_slice(&input[96..128]);
 
     if !is_valid_signature(r, s) {
         return None;
@@ -93,9 +94,9 @@ fn ecrecover_run_inner(mut input: Bytes) -> Option<Bytes> {
     sig[..32].copy_from_slice(&r.0);
     sig[32..].copy_from_slice(&s.0);
 
-    let odd = if v == 28 {
+    let odd = if v == 28.into() {
         true
-    } else if v == 27 {
+    } else if v == 27.into() {
         false
     } else {
         return None;
@@ -143,12 +144,12 @@ fn id_run(input: Bytes) -> Option<Bytes> {
 
 fn mult_complexity_eip198(x: U256) -> U256 {
     let x_squared = x * x;
-    if x <= 64 {
+    if x <= U256::from(64) {
         x_squared
-    } else if x <= 1024 {
-        (x_squared >> 2) + 96.as_u256() * x - 3072.as_u256()
+    } else if x <= U256::from(1024) {
+        (x_squared >> 2) + U256::from(96) * x - 3072
     } else {
-        (x_squared >> 4) + 480.as_u256() * x - 199680.as_u256()
+        (x_squared >> 4) + U256::from(480) * x - 199680
     }
 }
 
@@ -162,11 +163,11 @@ fn expmod_gas(mut input: Bytes, rev: Revision) -> Option<u64> {
 
     input = right_pad(input, 3 * 32);
 
-    let base_len256 = U256::from_be_bytes(*array_ref!(input, 0, 32));
-    let exp_len256 = U256::from_be_bytes(*array_ref!(input, 32, 32));
-    let mod_len256 = U256::from_be_bytes(*array_ref!(input, 64, 32));
+    let base_len256 = U256::from_big_endian(&input[0..32]);
+    let exp_len256 = U256::from_big_endian(&input[32..64]);
+    let mod_len256 = U256::from_big_endian(&input[64..96]);
 
-    if base_len256 == 0 && mod_len256 == 0 {
+    if base_len256.is_zero() && mod_len256.is_zero() {
         return Some(min_gas);
     }
 
@@ -176,7 +177,7 @@ fn expmod_gas(mut input: Bytes, rev: Revision) -> Option<u64> {
 
     input.advance(3 * 32);
 
-    let mut exp_head = U256::ZERO; // first 32 bytes of the exponent
+    let mut exp_head = U256::zero(); // first 32 bytes of the exponent
 
     if input.len() > base_len {
         let mut exp_input = right_pad(input.slice(base_len..min(base_len + 32, input.len())), 32);
@@ -184,21 +185,21 @@ fn expmod_gas(mut input: Bytes, rev: Revision) -> Option<u64> {
             exp_input = exp_input.slice(..exp_len);
             exp_input = left_pad(exp_input, 32);
         }
-        exp_head = U256::from_be_bytes(*array_ref!(exp_input, 0, 32));
+        exp_head = U256::from_big_endian(&*exp_input);
     }
 
     let bit_len = 256 - exp_head.leading_zeros();
 
-    let mut adjusted_exponent_len = U256::ZERO;
+    let mut adjusted_exponent_len = U256::zero();
     if exp_len > 32 {
-        adjusted_exponent_len = (8 * (exp_len - 32)).as_u256();
+        adjusted_exponent_len = U256::from(8 * (exp_len - 32));
     }
     if bit_len > 1 {
-        adjusted_exponent_len += (bit_len - 1).as_u256();
+        adjusted_exponent_len += U256::from(bit_len - 1);
     }
 
-    if adjusted_exponent_len == 0 {
-        adjusted_exponent_len = U256::ONE;
+    if adjusted_exponent_len.is_zero() {
+        adjusted_exponent_len = U256::one();
     }
 
     let max_length = std::cmp::max(mod_len256, base_len256);
@@ -344,7 +345,7 @@ fn snarkv_run(input: Bytes) -> Option<Bytes> {
     let k = input.len() / usize::from(SNARKV_STRIDE);
 
     let ret_val = if input.is_empty() {
-        U256::ONE
+        U256::one()
     } else {
         let mut mul = Gt::one();
         for i in 0..k {
@@ -371,13 +372,15 @@ fn snarkv_run(input: Bytes) -> Option<Bytes> {
         }
 
         if mul == Gt::one() {
-            U256::ONE
+            U256::one()
         } else {
-            U256::ZERO
+            U256::zero()
         }
     };
 
-    Some(ret_val.to_be_bytes().to_vec().into())
+    let mut buf = [0; 32];
+    ret_val.to_big_endian(&mut buf);
+    Some(buf.to_vec().into())
 }
 
 fn blake2_f_gas(input: Bytes, _: Revision) -> Option<u64> {

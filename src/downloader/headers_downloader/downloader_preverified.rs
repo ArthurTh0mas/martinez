@@ -28,21 +28,21 @@ pub struct DownloaderPreverifiedReport {
 
 impl DownloaderPreverified {
     pub fn new(
-        preverified_hashes_config: PreverifiedHashesConfig,
+        chain_name: String,
         mem_limit: usize,
         sentry: SentryClientReactorShared,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        let preverified_hashes_config = PreverifiedHashesConfig::new(&chain_name)?;
+
+        let instance = Self {
             preverified_hashes_config,
             mem_limit,
             sentry,
-        }
+        };
+        Ok(instance)
     }
 
     fn target_final_block_num(&self) -> BlockNumber {
-        if self.preverified_hashes_config.is_empty() {
-            return BlockNumber(0);
-        }
         let slice_size = header_slices::HEADER_SLICE_SIZE as u64;
         BlockNumber((self.preverified_hashes_config.hashes.len() as u64 - 1) * slice_size)
     }
@@ -92,26 +92,24 @@ impl DownloaderPreverified {
         );
         let fetch_receive_stage = FetchReceiveStage::new(header_slices.clone(), sentry.clone());
         let retry_stage = RetryStage::new(header_slices.clone());
-        let verify_stage = VerifyPreverifiedStage::new(
+        let verify_stage = VerifyStagePreverified::new(
             header_slices.clone(),
             self.preverified_hashes_config.clone(),
         );
         let penalize_stage = PenalizeStage::new(header_slices.clone(), sentry.clone());
-        let save_stage = SaveStage::<RwTx>::new(
-            header_slices.clone(),
-            db_transaction,
-            save_stage::SaveOrder::Monotonic,
-            true,
-        );
+        let save_stage = SaveStage::<RwTx>::new(header_slices.clone(), db_transaction);
         let refill_stage = RefillStage::new(header_slices.clone());
         let top_block_estimate_stage = TopBlockEstimateStage::new(sentry.clone());
 
-        let refill_stage_is_over = refill_stage.is_over_check();
+        let fetch_receive_stage_can_proceed = fetch_receive_stage.can_proceed_check();
+        let refill_stage_can_proceed = refill_stage.can_proceed_check();
+        let can_proceed =
+            move |_| -> bool { fetch_receive_stage_can_proceed() && refill_stage_can_proceed() };
 
         let estimated_top_block_num_provider =
             top_block_estimate_stage.estimated_top_block_num_provider();
 
-        let mut stages = DownloaderStageLoop::new(&header_slices, None);
+        let mut stages = DownloaderStageLoop::new(&header_slices);
         stages.insert(fetch_request_stage);
         stages.insert(fetch_receive_stage);
         stages.insert(retry_stage);
@@ -121,7 +119,7 @@ impl DownloaderPreverified {
         stages.insert(refill_stage);
         stages.insert(top_block_estimate_stage);
 
-        stages.run(refill_stage_is_over).await;
+        stages.run(can_proceed).await;
 
         let report = DownloaderPreverifiedReport {
             loaded_count: (header_slices.min_block_num().0 - start_block_num.0) as usize,

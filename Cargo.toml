@@ -25,17 +25,12 @@ crossterm = { version = "0.22", optional = true }
 derive_more = "0.99"
 directories = "4.0"
 educe = { version = "0.4", features = ["Debug", "Default"] }
-ethash = { git = "https://github.com/rust-ethereum/ethash", branch = "ethnum" }
-ethereum-interfaces = { git = "https://github.com/ledgerwatch/interfaces", branch = "vorot93/ethnum", features = [
+ethash = { git = "https://github.com/rust-ethereum/ethash" }
+ethereum-interfaces = { git = "https://github.com/ledgerwatch/interfaces", branch = "martinez", features = [
     "remotekv",
     "sentry",
 ] }
-ethereum-types = { version = "0.12", features = ["codec"] }
-ethnum = { git = "https://github.com/vorot93/ethnum-rs", branch = "staging", features = [
-    "llvm-intrinsics",
-    "rlp",
-    "scale",
-] }
+ethereum-types = "0.12"
 evmodin = { git = "https://github.com/vorot93/evmodin", branch = "martinez-staging" }
 futures-core = "0.3"
 futures-util = "0.3"
@@ -57,7 +52,7 @@ num-bigint = "0.4"
 num_cpus = "1.13"
 num-traits = "0.2"
 once_cell = "1"
-parity-scale-codec = { version = "2", features = ["bytes"] }
+parity-scale-codec = "2"
 parking_lot = "0.11"
 rand = "0.8"
 rayon = "1"
@@ -99,7 +94,6 @@ bytes-literal = { git = "https://github.com/vorot93/bytes-literal" }
 proptest = "1.0.0"
 tokio = { version = "1", features = ["full"] }
 tokio-test = "0.4.2"
-fdlimit = "0.2"
 
 [[bin]]
 path = "bin/martinez.rs"
@@ -116,11 +110,3 @@ name = "martinez-toolbox"
 [[bin]]
 path = "bin/consensus-tests.rs"
 name = "consensus-tests"
-
-[patch.crates-io]
-parity-scale-codec = { git = "https://github.com/paritytech/parity-scale-codec" }
-
-[profile.production]
-inherits = "release"
-codegen-units = 1
-lto = true

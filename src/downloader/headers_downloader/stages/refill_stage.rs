@@ -25,6 +25,7 @@ impl RefillStage {
     }
 
     pub async fn execute(&mut self) -> anyhow::Result<()> {
+        debug!("RefillStage: start");
         self.pending_watch.wait().await?;
 
         debug!(
@@ -32,6 +33,7 @@ impl RefillStage {
             self.pending_watch.pending_count()
         );
         self.refill_pending();
+        debug!("RefillStage: done");
         Ok(())
     }
 
@@ -40,23 +42,15 @@ impl RefillStage {
         self.header_slices.refill();
     }
 
-    pub fn is_over_check(&self) -> impl Fn() -> bool {
-        let header_slices = self.header_slices.clone();
-        move || -> bool { header_slices.is_empty_at_final_position() }
-    }
-
     pub fn can_proceed_check(&self) -> impl Fn() -> bool {
         let header_slices = self.header_slices.clone();
-        move || -> bool { header_slices.contains_status(HeaderSliceStatus::Saved) }
+        move || -> bool { !header_slices.is_empty_at_final_position() }
     }
 }
 
 #[async_trait::async_trait]
 impl super::stage::Stage for RefillStage {
     async fn execute(&mut self) -> anyhow::Result<()> {
-        Self::execute(self).await
-    }
-    fn can_proceed_check(&self) -> Box<dyn Fn() -> bool + Send> {
-        Box::new(Self::can_proceed_check(self))
+        RefillStage::execute(self).await
     }
 }

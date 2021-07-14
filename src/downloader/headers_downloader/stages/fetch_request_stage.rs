@@ -48,6 +48,7 @@ impl FetchRequestStage {
     }
 
     pub async fn execute(&mut self) -> anyhow::Result<()> {
+        debug!("FetchRequestStage: start");
         self.pending_watch.wait().await?;
 
         debug!(
@@ -69,6 +70,7 @@ impl FetchRequestStage {
             capacity_future.await?;
         }
 
+        debug!("FetchRequestStage: done");
         Ok(())
     }
 
@@ -129,19 +131,11 @@ impl FetchRequestStage {
         };
         sentry.try_send_message(Message::GetBlockHeaders(message), PeerFilter::Random(1))
     }
-
-    pub fn can_proceed_check(&self) -> impl Fn() -> bool {
-        let header_slices = self.header_slices.clone();
-        move || -> bool { header_slices.contains_status(HeaderSliceStatus::Empty) }
-    }
 }
 
 #[async_trait::async_trait]
 impl super::stage::Stage for FetchRequestStage {
     async fn execute(&mut self) -> anyhow::Result<()> {
-        Self::execute(self).await
-    }
-    fn can_proceed_check(&self) -> Box<dyn Fn() -> bool + Send> {
-        Box::new(Self::can_proceed_check(self))
+        FetchRequestStage::execute(self).await
     }
 }

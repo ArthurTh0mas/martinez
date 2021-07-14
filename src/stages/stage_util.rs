@@ -16,13 +16,15 @@ where
     Tx: Transaction<'db>,
 {
     let current_gas = tx
-        .get(tables::TotalGas, past_progress)
+        .get(tables::CumulativeIndex, past_progress)
         .await?
-        .ok_or_else(|| format_err!("No cumulative index for block {}", past_progress))?;
+        .ok_or_else(|| format_err!("No cumulative index for block {}", past_progress))?
+        .gas;
     let max_gas = tx
-        .get(tables::TotalGas, max_block)
+        .get(tables::CumulativeIndex, max_block)
         .await?
-        .ok_or_else(|| format_err!("No cumulative index for block {}", max_block))?;
+        .ok_or_else(|| format_err!("No cumulative index for block {}", max_block))?
+        .gas;
 
     let gas_progress = max_gas.checked_sub(current_gas).ok_or_else(|| {
         format_err!(

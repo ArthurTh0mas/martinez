@@ -1,6 +1,7 @@
 use super::{delta::*, object::*, *};
 use crate::{crypto::*, models::*};
 use bytes::Bytes;
+use ethereum_types::*;
 use evmodin::host::AccessStatus;
 use hex_literal::hex;
 use std::{collections::*, fmt::Debug};
@@ -139,7 +140,7 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
             if let Some(current) = &obj.current {
                 return Ok(current.code_hash == EMPTY_HASH
                     && current.nonce == 0
-                    && current.balance == 0);
+                    && current.balance.is_zero());
             }
         }
 
@@ -232,12 +233,12 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
             .await?
             .map(|object| object.current.as_ref().map(|current| current.balance))
             .flatten()
-            .unwrap_or(U256::ZERO))
+            .unwrap_or_else(U256::zero))
     }
     pub async fn set_balance(
         &mut self,
         address: Address,
-        value: impl AsU256,
+        value: impl Into<U256>,
     ) -> anyhow::Result<()> {
         let obj =
             get_or_create_object(self.db, &mut self.objects, &mut self.journal, address).await?;
@@ -247,7 +248,7 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
             address,
             previous: current.balance,
         });
-        current.balance = value.as_u256();
+        current.balance = value.into();
         self.touch(address);
 
         Ok(())
@@ -255,7 +256,7 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
     pub async fn add_to_balance(
         &mut self,
         address: Address,
-        addend: impl AsU256,
+        addend: impl Into<U256>,
     ) -> anyhow::Result<()> {
         let obj =
             get_or_create_object(self.db, &mut self.objects, &mut self.journal, address).await?;
@@ -265,7 +266,7 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
             address,
             previous: current.balance,
         });
-        current.balance += addend.as_u256();
+        current.balance += addend.into();
         self.touch(address);
 
         Ok(())
@@ -420,7 +421,7 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
                 }
 
                 if obj.initial.is_none() || self.incarnations.contains_key(&address) {
-                    return Ok(U256::ZERO);
+                    return Ok(U256::zero());
                 }
 
                 let val = self.db.read_storage(address, key).await?;
@@ -437,7 +438,7 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
             }
         }
 
-        Ok(U256::ZERO)
+        Ok(U256::zero())
     }
 
     pub async fn get_current_storage(
