@@ -1,5 +1,4 @@
 use super::messages::*;
-use crate::sentry::messages::Message;
 
 pub fn decode_rlp_message(id: EthMessageId, message_bytes: &[u8]) -> anyhow::Result<Message> {
     let message: Message = match id {

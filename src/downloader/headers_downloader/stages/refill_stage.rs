@@ -40,14 +40,9 @@ impl RefillStage {
         self.header_slices.refill();
     }
 
-    pub fn is_over_check(&self) -> impl Fn() -> bool {
-        let header_slices = self.header_slices.clone();
-        move || -> bool { header_slices.is_empty_at_final_position() }
-    }
-
     pub fn can_proceed_check(&self) -> impl Fn() -> bool {
         let header_slices = self.header_slices.clone();
-        move || -> bool { header_slices.contains_status(HeaderSliceStatus::Saved) }
+        move || -> bool { !header_slices.is_empty_at_final_position() }
     }
 }
 
@@ -55,8 +50,5 @@ impl RefillStage {
 impl super::stage::Stage for RefillStage {
     async fn execute(&mut self) -> anyhow::Result<()> {
         Self::execute(self).await
-    }
-    fn can_proceed_check(&self) -> Box<dyn Fn() -> bool + Send> {
-        Box::new(Self::can_proceed_check(self))
     }
 }

@@ -3,9 +3,10 @@ use crate::{models::*, zeroless_view, StageId};
 use anyhow::{bail, format_err};
 use arrayref::array_ref;
 use arrayvec::ArrayVec;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use croaring::{treemap::NativeSerializer, Treemap as RoaringTreemap};
 use derive_more::*;
+use ethereum_types::*;
 use maplit::hashmap;
 use modular_bitfield::prelude::*;
 use once_cell::sync::Lazy;
@@ -286,27 +287,45 @@ where
     }
 }
 
-macro_rules! scale_table_object {
+macro_rules! rlp_table_object {
     ($ty:ty) => {
         impl TableEncode for $ty {
-            type Encoded = Vec<u8>;
+            type Encoded = BytesMut;
 
             fn encode(self) -> Self::Encoded {
-                ::parity_scale_codec::Encode::encode(&self)
+                rlp::encode(&self)
             }
         }
 
         impl TableDecode for $ty {
-            fn decode(mut b: &[u8]) -> anyhow::Result<Self> {
-                Ok(<Self as ::parity_scale_codec::Decode>::decode(&mut b)?)
+            fn decode(b: &[u8]) -> anyhow::Result<Self> {
+                Ok(rlp::decode(b)?)
             }
         }
     };
 }
 
-scale_table_object!(BodyForStorage);
-scale_table_object!(BlockHeader);
-scale_table_object!(MessageWithSignature);
+macro_rules! rlp_standalone_table_object {
+    ($ty:ty) => {
+        impl TableEncode for $ty {
+            type Encoded = Bytes;
+
+            fn encode(self) -> Self::Encoded {
+                crate::crypto::TrieEncode::trie_encode(&self)
+            }
+        }
+
+        impl TableDecode for $ty {
+            fn decode(b: &[u8]) -> anyhow::Result<Self> {
+                Ok(Self::trie_decode(b)?)
+            }
+        }
+    };
+}
+
+rlp_table_object!(BodyForStorage);
+rlp_table_object!(BlockHeader);
+rlp_standalone_table_object!(MessageWithSignature);
 
 macro_rules! ron_table_object {
     ($ty:ident) => {
@@ -451,10 +470,12 @@ impl TableEncode for U256 {
     type Encoded = VariableVec<KECCAK_LENGTH>;
 
     fn encode(self) -> Self::Encoded {
-        self.to_be_bytes()
-            .into_iter()
-            .skip_while(|&v| v == 0)
-            .collect()
+        let enc = <[u8; 32]>::from(self);
+        let mut out = Self::Encoded::default();
+        let byte_len = (self.bits() + 7) / 8;
+        out.try_extend_from_slice(&enc[KECCAK_LENGTH - byte_len..])
+            .unwrap();
+        out
     }
 }
 
@@ -463,9 +484,7 @@ impl TableDecode for U256 {
         if b.len() > KECCAK_LENGTH {
             return Err(TooLong::<KECCAK_LENGTH> { got: b.len() }.into());
         }
-        let mut v = [0; 32];
-        v[KECCAK_LENGTH - b.len()..].copy_from_slice(b);
-        Ok(Self::from_be_bytes(v))
+        Ok(Self::from_big_endian(b))
     }
 }
 
@@ -926,12 +945,12 @@ mod tests {
     #[test]
     fn u256() {
         for (fixture, expected) in [
-            (U256::ZERO, vec![]),
+            (U256::from(0), vec![]),
             (
                 U256::from(0xDEADBEEFBAADCAFE_u128),
                 hex!("DEADBEEFBAADCAFE").to_vec(),
             ),
-            (U256::MAX, hex!("FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF").to_vec()),
+            (U256::max_value(), hex!("FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF FFFF").to_vec()),
         ] {
             assert_eq!(fixture.encode().to_vec(), expected);
             assert_eq!(U256::decode(&expected).unwrap(), fixture);

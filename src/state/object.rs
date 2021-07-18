@@ -1,4 +1,5 @@
-use crate::models::*;
+use crate::models::Account;
+use ethereum_types::*;
 use std::collections::HashMap;
 
 #[derive(Clone, Debug, Default)]

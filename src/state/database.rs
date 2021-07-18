@@ -4,6 +4,7 @@ use crate::{
     u256_to_h256,
 };
 use bytes::Bytes;
+use ethereum_types::*;
 
 pub async fn seek_storage_key<'tx, C: CursorDupSort<'tx, tables::Storage>>(
     cur: &mut C,
@@ -33,7 +34,7 @@ where
         cur.delete_current().await?;
     }
 
-    if value != 0 {
+    if !value.is_zero() {
         cur.upsert(address, (u256_to_h256(location), value)).await?;
     }
 
@@ -68,7 +69,7 @@ where
         cur.delete_current().await?;
     }
 
-    if value != 0 {
+    if !value.is_zero() {
         cur.upsert(hashed_address, (hashed_location, value)).await?;
     }
 

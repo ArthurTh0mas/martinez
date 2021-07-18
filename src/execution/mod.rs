@@ -37,6 +37,7 @@ mod tests {
         chain::protocol_param::param, crypto::root_hash, res::chainspec::MAINNET,
         util::test_util::run_test, InMemoryState,
     };
+    use ethereum_types::*;
     use hex_literal::hex;
     use sha3::{Digest, Keccak256};
 
@@ -106,10 +107,10 @@ mod tests {
 
             let sender = hex!("b685342b8c54347aad148e1f22eff3eb3eb29391").into();
 
-            let t = |action, input, nonce, max_priority_fee_per_gas: u128| MessageWithSender {
+            let t = |action, input, nonce, max_priority_fee_per_gas| MessageWithSender {
                 message: Message::EIP1559 {
                     input,
-                    max_priority_fee_per_gas: max_priority_fee_per_gas.as_u256(),
+                    max_priority_fee_per_gas,
                     action,
                     nonce,
 
@@ -117,17 +118,22 @@ mod tests {
                     max_fee_per_gas: U256::from(20 * GIGA),
                     chain_id: ChainId(1),
 
-                    value: U256::ZERO,
+                    value: U256::zero(),
                     access_list: Default::default(),
                 },
                 sender,
             };
 
-            let tx = (t)(TransactionAction::Create, deployment_code.into(), 0, 0);
+            let tx = (t)(
+                TransactionAction::Create,
+                deployment_code.into(),
+                0,
+                U256::zero(),
+            );
 
             let mut state = InMemoryState::default();
             let sender_account = Account {
-                balance: ETHER.into(),
+                balance: *ETHER,
                 ..Default::default()
             };
             state.update_account(sender, None, Some(sender_account));
@@ -154,28 +160,35 @@ mod tests {
             let code_hash = H256::from_slice(&Keccak256::digest(&contract_code)[..]);
             assert_eq!(contract_account.code_hash, code_hash);
 
-            let storage_key0 = U256::ZERO;
+            let storage_key0 = U256::zero();
             let storage0 = state
                 .read_storage(contract_address, storage_key0)
                 .await
                 .unwrap();
-            assert_eq!(storage0, 0x2a);
+            assert_eq!(
+                storage0,
+                hex!("000000000000000000000000000000000000000000000000000000000000002a").into()
+            );
 
-            let storage_key1 = 0x01.as_u256();
+            let storage_key1 =
+                hex!("0000000000000000000000000000000000000000000000000000000000000001").into();
             let storage1 = state
                 .read_storage(contract_address, storage_key1)
                 .await
                 .unwrap();
-            assert_eq!(storage1, 0x01c9);
+            assert_eq!(
+                storage1,
+                hex!("00000000000000000000000000000000000000000000000000000000000001c9").into()
+            );
 
             let miner_account = state.read_account(miner).await.unwrap().unwrap();
-            assert_eq!(miner_account.balance, param::BLOCK_REWARD_CONSTANTINOPLE);
+            assert_eq!(miner_account.balance, *param::BLOCK_REWARD_CONSTANTINOPLE);
 
             // ---------------------------------------
             // Execute second block
             // ---------------------------------------
 
-            let new_val = 0x3e;
+            let new_val = hex!("000000000000000000000000000000000000000000000000000000000000003e");
 
             let block_number = 13_500_002.into();
             let mut header = header.clone();
@@ -189,9 +202,9 @@ mod tests {
 
             let tx = (t)(
                 TransactionAction::Call(contract_address),
-                new_val.as_u256().to_be_bytes().to_vec().into(),
+                new_val.to_vec().into(),
                 1,
-                20_u128 * u128::from(GIGA),
+                U256::from(20 * GIGA),
             );
 
             execute_block(
@@ -210,11 +223,11 @@ mod tests {
                 .read_storage(contract_address, storage_key0)
                 .await
                 .unwrap();
-            assert_eq!(storage0, new_val);
+            assert_eq!(storage0, new_val.into());
 
             let miner_account = state.read_account(miner).await.unwrap().unwrap();
-            assert!(miner_account.balance > 2 * param::BLOCK_REWARD_CONSTANTINOPLE);
-            assert!(miner_account.balance < 3 * param::BLOCK_REWARD_CONSTANTINOPLE);
+            assert!(miner_account.balance > U256::from(2) * *param::BLOCK_REWARD_CONSTANTINOPLE);
+            assert!(miner_account.balance < U256::from(3) * *param::BLOCK_REWARD_CONSTANTINOPLE);
         })
     }
 }

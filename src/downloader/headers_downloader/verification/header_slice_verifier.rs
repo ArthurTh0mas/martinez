@@ -1,6 +1,4 @@
-use super::{
-    super::headers::header::BlockHeader, preverified_hashes_config::PreverifiedHashesConfig,
-};
+use super::super::headers::header::BlockHeader;
 use crate::{
     consensus::difficulty::{canonical_difficulty, BlockDifficultyBombData},
     models::{switch_is_active, BlockNumber, ChainSpec, SealVerificationParams, EMPTY_LIST_HASH},
@@ -22,11 +20,6 @@ pub trait HeaderSliceVerifier: Send + Sync + Debug {
         max_timestamp: u64,
         chain_spec: &ChainSpec,
     ) -> bool;
-
-    fn preverified_hashes_config(
-        &self,
-        chain_name: &str,
-    ) -> anyhow::Result<PreverifiedHashesConfig>;
 }
 
 pub fn make_ethash_verifier() -> Box<dyn HeaderSliceVerifier> {
@@ -62,13 +55,6 @@ impl HeaderSliceVerifier for EthashHeaderSliceVerifier {
             && verify_slice_timestamps(headers, max_timestamp)
             && verify_slice_difficulties(headers, chain_spec)
             && verify_slice_pow(headers)
-    }
-
-    fn preverified_hashes_config(
-        &self,
-        chain_name: &str,
-    ) -> anyhow::Result<PreverifiedHashesConfig> {
-        PreverifiedHashesConfig::new(chain_name)
     }
 }
 
