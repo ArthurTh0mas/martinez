@@ -43,7 +43,12 @@ impl FetchReceiveStage {
     }
 
     pub async fn execute(&self) -> anyhow::Result<()> {
-        debug!("FetchReceiveStage: start");
+        // when it is over - hang to avoid a live idle loop
+        // ideally stop calling this execute() in the make_stage_stream loop
+        if self.is_over.load(Ordering::SeqCst) {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        }
+
         let mut message_stream = self.message_stream.try_lock()?;
         if message_stream.is_none() {
             let sentry = self.sentry.read().await;
@@ -55,7 +60,6 @@ impl FetchReceiveStage {
             Some(message) => self.on_headers_message(message),
             None => self.is_over.store(true, Ordering::SeqCst),
         }
-        debug!("FetchReceiveStage: done");
         Ok(())
     }
 
@@ -123,32 +127,21 @@ impl FetchReceiveStage {
     }
 
     pub fn can_proceed_check(&self) -> impl Fn() -> bool {
-        let check = FetchReceiveStageCanProceedCheck {
-            header_slices: self.header_slices.clone(),
-            is_over: self.is_over.clone(),
-        };
-        move || -> bool { check.can_proceed() }
-    }
-}
-
-struct FetchReceiveStageCanProceedCheck {
-    header_slices: Arc<HeaderSlices>,
-    is_over: Arc<AtomicBool>,
-}
-
-impl FetchReceiveStageCanProceedCheck {
-    pub fn can_proceed(&self) -> bool {
-        let cant_receive_more = self.is_over.load(Ordering::SeqCst)
-            && self
-                .header_slices
-                .has_one_of_statuses(&[HeaderSliceStatus::Empty, HeaderSliceStatus::Waiting]);
-        !cant_receive_more
+        let header_slices = self.header_slices.clone();
+        let is_over = self.is_over.clone();
+        move || -> bool {
+            !is_over.load(Ordering::SeqCst)
+                && header_slices.contains_status(HeaderSliceStatus::Waiting)
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl super::stage::Stage for FetchReceiveStage {
     async fn execute(&mut self) -> anyhow::Result<()> {
-        FetchReceiveStage::execute(self).await
+        Self::execute(self).await
+    }
+    fn can_proceed_check(&self) -> Box<dyn Fn() -> bool + Send> {
+        Box::new(Self::can_proceed_check(self))
     }
 }

@@ -1,15 +1,10 @@
 use super::{
     fork_mode_stage::ForkModeStage,
-    fork_switch_command::ForkSwitchCommand,
-    headers::{
-        header::BlockHeader,
-        header_slices::{HeaderSliceStatus, HeaderSlices},
-    },
+    headers::header_slices::{HeaderSliceStatus, HeaderSlices},
     verification::header_slice_verifier::HeaderSliceVerifier,
     verify_link_linear_stage::VerifyLinkLinearStage,
 };
 use crate::{models::*, sentry::chain_config::ChainConfig};
-use parking_lot::RwLock;
 use std::{ops::DerefMut, sync::Arc};
 use tracing::*;
 
@@ -19,10 +14,9 @@ pub struct VerifyLinkForkyStage {
     fork_header_slices: Arc<HeaderSlices>,
     chain_config: ChainConfig,
     verifier: Arc<Box<dyn HeaderSliceVerifier>>,
-    last_verified_header: Option<BlockHeader>,
     start_block_num: BlockNumber,
+    start_block_hash: H256,
     mode: Mode,
-    termination_command: Arc<RwLock<Option<ForkSwitchCommand>>>,
 }
 
 enum Mode {
@@ -36,14 +30,16 @@ impl VerifyLinkForkyStage {
         fork_header_slices: Arc<HeaderSlices>,
         chain_config: ChainConfig,
         verifier: Arc<Box<dyn HeaderSliceVerifier>>,
-        last_verified_header: Option<BlockHeader>,
+        start_block_num: BlockNumber,
+        start_block_hash: H256,
     ) -> Self {
         let mode = if fork_header_slices.is_empty() {
             let linear_mode_stage = VerifyLinkLinearStage::new(
                 header_slices.clone(),
                 chain_config.clone(),
                 verifier.clone(),
-                last_verified_header.clone(),
+                start_block_num,
+                start_block_hash,
                 HeaderSliceStatus::Fork,
             );
             Mode::Linear(Box::new(linear_mode_stage))
@@ -57,21 +53,14 @@ impl VerifyLinkForkyStage {
             Mode::Fork(Box::new(fork_mode_stage))
         };
 
-        let start_block_num = if let Some(last_verified_header) = &last_verified_header {
-            BlockNumber(last_verified_header.number().0 + 1)
-        } else {
-            BlockNumber(0)
-        };
-
         Self {
             header_slices,
             fork_header_slices,
             chain_config,
             verifier,
-            last_verified_header,
             start_block_num,
+            start_block_hash,
             mode,
-            termination_command: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -106,11 +95,8 @@ impl VerifyLinkForkyStage {
                     }
                 }
             }
-            Mode::Fork(ref mut stage) => {
-                if stage.is_over() {
-                    debug!("VerifyLinkForkyStage: ForkModeStage is over, request termination");
-                    *self.termination_command.write() = stage.take_pending_termination_command();
-                } else if stage.is_done() {
+            Mode::Fork(ref stage) => {
+                if stage.is_done() {
                     debug!("VerifyLinkForkyStage: switching to Mode::Linear");
                     self.switch_to_linear_mode();
                 }
@@ -125,7 +111,8 @@ impl VerifyLinkForkyStage {
             self.header_slices.clone(),
             self.chain_config.clone(),
             self.verifier.clone(),
-            self.last_verified_header.clone(),
+            self.start_block_num,
+            self.start_block_hash,
             HeaderSliceStatus::Fork,
         )
     }
@@ -148,15 +135,6 @@ impl VerifyLinkForkyStage {
         fork_mode_stage.setup()?;
         self.mode = Mode::Fork(Box::new(fork_mode_stage));
         Ok(())
-    }
-
-    pub fn termination_command(&self) -> Arc<RwLock<Option<ForkSwitchCommand>>> {
-        self.termination_command.clone()
-    }
-
-    pub fn is_over_check(&self) -> impl Fn() -> bool {
-        let termination_command = self.termination_command.clone();
-        move || -> bool { termination_command.read().is_some() }
     }
 
     pub fn can_proceed_check(&self) -> impl Fn() -> bool {

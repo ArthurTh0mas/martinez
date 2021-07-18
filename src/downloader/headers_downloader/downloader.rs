@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     kv,
-    models::BlockNumber,
+    models::*,
     sentry::{chain_config::ChainConfig, messages::BlockHashAndNumber, sentry_client_reactor::*},
 };
 use std::{
@@ -19,7 +19,7 @@ pub struct Downloader {
     downloader_preverified: downloader_preverified::DownloaderPreverified,
     downloader_linear: downloader_linear::DownloaderLinear,
     downloader_forky: downloader_forky::DownloaderForky,
-    genesis_block_hash: ethereum_types::H256,
+    genesis_block_hash: H256,
 }
 
 pub struct DownloaderReport {
@@ -32,6 +32,7 @@ pub struct DownloaderReport {
 pub struct DownloaderRunState {
     pub estimated_top_block_num: Option<BlockNumber>,
     pub forky_header_slices: Option<Arc<HeaderSlices>>,
+    pub forky_fork_header_slices: Option<Arc<HeaderSlices>>,
 }
 
 impl Debug for DownloaderRunState {
@@ -39,6 +40,10 @@ impl Debug for DownloaderRunState {
         f.debug_struct("DownloaderRunState")
             .field("estimated_top_block_num", &self.estimated_top_block_num)
             .field("forky_header_slices", &self.forky_header_slices.is_some())
+            .field(
+                "forky_fork_header_slices",
+                &self.forky_fork_header_slices.is_some(),
+            )
             .finish()
     }
 }
@@ -53,10 +58,10 @@ impl Downloader {
         let verifier = Arc::new(verifier);
 
         let downloader_preverified = downloader_preverified::DownloaderPreverified::new(
-            chain_config.chain_name(),
+            verifier.preverified_hashes_config(&chain_config.chain_name())?,
             mem_limit,
             sentry.clone(),
-        )?;
+        );
 
         let downloader_linear = downloader_linear::DownloaderLinear::new(
             chain_config.clone(),
@@ -168,6 +173,9 @@ impl Downloader {
                 previous_run_state
                     .as_ref()
                     .and_then(|state| state.forky_header_slices.clone()),
+                previous_run_state
+                    .as_ref()
+                    .and_then(|state| state.forky_fork_header_slices.clone()),
                 ui_system,
             )
             .await?;
@@ -179,6 +187,7 @@ impl Downloader {
             run_state: DownloaderRunState {
                 estimated_top_block_num: Some(linear_report.estimated_top_block_num),
                 forky_header_slices: forky_report.header_slices,
+                forky_fork_header_slices: forky_report.fork_header_slices,
             },
         };
 

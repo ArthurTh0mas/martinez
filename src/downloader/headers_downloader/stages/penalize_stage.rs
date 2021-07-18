@@ -28,7 +28,6 @@ impl PenalizeStage {
     }
 
     pub async fn execute(&mut self) -> anyhow::Result<()> {
-        debug!("PenalizeStage: start");
         self.pending_watch.wait().await?;
 
         debug!(
@@ -45,7 +44,6 @@ impl PenalizeStage {
         self.penalize_peers(bad_peers).await?;
         self.reset_pending();
 
-        debug!("PenalizeStage: done");
         Ok(())
     }
 
@@ -82,11 +80,19 @@ impl PenalizeStage {
         }
         Ok(())
     }
+
+    pub fn can_proceed_check(&self) -> impl Fn() -> bool {
+        let header_slices = self.header_slices.clone();
+        move || -> bool { header_slices.contains_status(HeaderSliceStatus::Invalid) }
+    }
 }
 
 #[async_trait::async_trait]
 impl super::stage::Stage for PenalizeStage {
     async fn execute(&mut self) -> anyhow::Result<()> {
-        PenalizeStage::execute(self).await
+        Self::execute(self).await
+    }
+    fn can_proceed_check(&self) -> Box<dyn Fn() -> bool + Send> {
+        Box::new(Self::can_proceed_check(self))
     }
 }
