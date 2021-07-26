@@ -14,7 +14,7 @@ use anyhow::{format_err, Context};
 use async_trait::async_trait;
 use std::{cmp, sync::Arc};
 use tempfile::TempDir;
-use tracing::info;
+use tracing::*;
 
 /// Generation of intermediate hashes for efficient computation of the state trie root
 #[derive(Debug)]
@@ -77,10 +77,12 @@ where
             )
             .await?
             {
+                debug!("Regenerating intermediate hashes");
                 regenerate_intermediate_hashes(tx, self.temp_dir.as_ref(), Some(block_state_root))
                     .await
                     .with_context(|| "Failed to generate interhashes")?
             } else {
+                debug!("Incrementing intermediate hashes");
                 increment_intermediate_hashes(
                     tx,
                     self.temp_dir.as_ref(),

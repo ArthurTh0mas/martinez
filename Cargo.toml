@@ -30,13 +30,14 @@ ethereum-interfaces = { git = "https://github.com/ledgerwatch/interfaces", branc
     "remotekv",
     "sentry",
 ] }
+ethereum-jsonrpc = { package = "ethereum-jsonrpc", git = "https://github.com/rust-ethereum/jsonrpc" }
 ethereum-types = { version = "0.12", features = ["codec"] }
 ethnum = { git = "https://github.com/vorot93/ethnum-rs", branch = "staging", features = [
     "llvm-intrinsics",
     "rlp",
     "scale",
 ] }
-evmodin = { git = "https://github.com/vorot93/evmodin", branch = "ethnum" }
+evmodin = { git = "https://github.com/vorot93/evmodin", branch = "martinez-staging" }
 futures-core = "0.3"
 futures-util = "0.3"
 hash-db = "0.15"
@@ -96,9 +97,15 @@ vergen = "6"
 
 [dev-dependencies]
 bytes-literal = { git = "https://github.com/vorot93/bytes-literal" }
+jsonrpsee = { git = "https://github.com/paritytech/jsonrpsee", features = [
+    "server",
+    "client",
+    "macros",
+] }
 proptest = "1.0.0"
 tokio = { version = "1", features = ["full"] }
 tokio-test = "0.4.2"
+fdlimit = "0.2"
 
 [[bin]]
 path = "bin/martinez.rs"
@@ -117,4 +124,8 @@ path = "bin/consensus-tests.rs"
 name = "consensus-tests"
 
 [patch.crates-io]
-parity-scale-codec = { git = "https://github.com/vorot93/parity-scale-codec", branch = "bytes" }
+parity-scale-codec = { git = "https://github.com/paritytech/parity-scale-codec" }
+
+[profile.release]
+codegen-units = 1
+lto = true
