@@ -1,9 +1,6 @@
 use super::{
     fork_mode_stage::ForkModeStage,
-    headers::{
-        header::BlockHeader,
-        header_slices::{HeaderSliceStatus, HeaderSlices},
-    },
+    headers::header_slices::{HeaderSliceStatus, HeaderSlices},
     verification::header_slice_verifier::HeaderSliceVerifier,
     verify_link_linear_stage::VerifyLinkLinearStage,
 };
@@ -17,8 +14,8 @@ pub struct VerifyLinkForkyStage {
     fork_header_slices: Arc<HeaderSlices>,
     chain_config: ChainConfig,
     verifier: Arc<Box<dyn HeaderSliceVerifier>>,
-    last_verified_header: Option<BlockHeader>,
     start_block_num: BlockNumber,
+    start_block_hash: H256,
     mode: Mode,
 }
 
@@ -33,14 +30,16 @@ impl VerifyLinkForkyStage {
         fork_header_slices: Arc<HeaderSlices>,
         chain_config: ChainConfig,
         verifier: Arc<Box<dyn HeaderSliceVerifier>>,
-        last_verified_header: Option<BlockHeader>,
+        start_block_num: BlockNumber,
+        start_block_hash: H256,
     ) -> Self {
         let mode = if fork_header_slices.is_empty() {
             let linear_mode_stage = VerifyLinkLinearStage::new(
                 header_slices.clone(),
                 chain_config.clone(),
                 verifier.clone(),
-                last_verified_header.clone(),
+                start_block_num,
+                start_block_hash,
                 HeaderSliceStatus::Fork,
             );
             Mode::Linear(Box::new(linear_mode_stage))
@@ -54,19 +53,13 @@ impl VerifyLinkForkyStage {
             Mode::Fork(Box::new(fork_mode_stage))
         };
 
-        let start_block_num = if let Some(last_verified_header) = &last_verified_header {
-            BlockNumber(last_verified_header.number().0 + 1)
-        } else {
-            BlockNumber(0)
-        };
-
         Self {
             header_slices,
             fork_header_slices,
             chain_config,
             verifier,
-            last_verified_header,
             start_block_num,
+            start_block_hash,
             mode,
         }
     }
@@ -118,7 +111,8 @@ impl VerifyLinkForkyStage {
             self.header_slices.clone(),
             self.chain_config.clone(),
             self.verifier.clone(),
-            self.last_verified_header.clone(),
+            self.start_block_num,
+            self.start_block_hash,
             HeaderSliceStatus::Fork,
         )
     }

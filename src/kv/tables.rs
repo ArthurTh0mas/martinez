@@ -631,7 +631,7 @@ impl TableDecode for AccountChange {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StorageChangeKey {
     pub block_number: BlockNumber,
     pub address: Address,

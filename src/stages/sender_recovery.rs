@@ -4,7 +4,7 @@ use crate::{
         traits::*,
     },
     models::*,
-    stagedsync::{format_duration, stage::*, stages::*},
+    stagedsync::{format_duration, stage::*},
     StageId,
 };
 use async_trait::async_trait;
@@ -26,7 +26,7 @@ where
     RwTx: MutableTransaction<'db>,
 {
     fn id(&self) -> StageId {
-        SENDERS
+        StageId("SenderRecovery")
     }
 
     async fn execute<'tx>(
@@ -368,7 +368,7 @@ mod tests {
         let stage_input = StageInput {
             restarted: false,
             first_started_at: (Instant::now(), Some(BlockNumber(0))),
-            previous_stage: Some((BODIES, 3.into())),
+            previous_stage: Some((StageId("BodyDownload"), 3.into())),
             stage_progress: Some(0.into()),
         };
 

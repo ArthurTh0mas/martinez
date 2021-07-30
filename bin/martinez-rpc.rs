@@ -1,7 +1,8 @@
-use martinez::{binutil::MartinezDataDir, rpc::eth::EthApiServerImpl};
+use martinez::{binutil::MartinezDataDir, kv::traits::*, models::*, stagedsync::stages::*};
+use async_trait::async_trait;
 use clap::Parser;
-use ethereum_jsonrpc::EthApiServer;
-use jsonrpsee::http_server::HttpServerBuilder;
+use ethnum::U256;
+use jsonrpsee::{core::RpcResult, http_server::HttpServerBuilder, proc_macros::rpc};
 use std::{future::pending, net::SocketAddr, sync::Arc};
 use tracing_subscriber::{prelude::*, EnvFilter};
 
@@ -13,6 +14,45 @@ pub struct Opt {
 
     #[clap(long)]
     pub listen_address: SocketAddr,
+}
+
+#[rpc(server, namespace = "eth")]
+pub trait EthApi {
+    #[method(name = "blockNumber")]
+    async fn block_number(&self) -> RpcResult<BlockNumber>;
+    #[method(name = "getBalance")]
+    async fn get_balance(&self, address: Address, block_number: BlockNumber) -> RpcResult<U256>;
+}
+
+pub struct EthApiServerImpl<DB>
+where
+    DB: KV,
+{
+    db: Arc<DB>,
+}
+
+#[async_trait]
+impl<DB> EthApiServer for EthApiServerImpl<DB>
+where
+    DB: KV,
+{
+    async fn block_number(&self) -> RpcResult<BlockNumber> {
+        Ok(FINISH
+            .get_progress(&self.db.begin().await?)
+            .await?
+            .unwrap_or(BlockNumber(0)))
+    }
+
+    async fn get_balance(&self, address: Address, block_number: BlockNumber) -> RpcResult<U256> {
+        Ok(martinez::accessors::state::account::read(
+            &self.db.begin().await?,
+            address,
+            Some(block_number),
+        )
+        .await?
+        .map(|acc| acc.balance)
+        .unwrap_or(U256::ZERO))
+    }
 }
 
 #[tokio::main]
