@@ -14,6 +14,7 @@ use anyhow::{bail, ensure, format_err};
 use bytes::Bytes;
 use clap::Parser;
 use educe::Educe;
+use ethereum_types::*;
 use maplit::*;
 use once_cell::sync::Lazy;
 use serde::{de, Deserialize};
@@ -538,7 +539,7 @@ async fn init_pre_state<S: State>(pre: &HashMap<Address, AccountState>, state: &
 
         for (&key, &value) in &j.storage {
             state
-                .update_storage(*address, key, U256::ZERO, value)
+                .update_storage(*address, key, U256::zero(), value)
                 .await
                 .unwrap();
         }
@@ -792,9 +793,9 @@ async fn difficulty_test(testdata: HashMap<String, Value>) -> anyhow::Result<()>
         let testdata = serde_json::from_value::<NetworkDifficultyTests>(testdata)?;
 
         for (_, testdata) in testdata {
-            let parent_has_uncles = if testdata.parent_uncles == 0 {
+            let parent_has_uncles = if testdata.parent_uncles == 0.into() {
                 false
-            } else if testdata.parent_uncles == 1 {
+            } else if testdata.parent_uncles == 1.into() {
                 true
             } else {
                 bail!("Invalid parentUncles: {}", testdata.parent_uncles);

@@ -1,4 +1,5 @@
 use crate::models::*;
+use ethereum_types::*;
 use std::cmp::max;
 
 const MIN_DIFFICULTY: u64 = 131_072;
@@ -26,7 +27,7 @@ pub fn canonical_difficulty(
 
     if byzantium_formula {
         // Byzantium
-        difficulty -= x * 99.as_u256();
+        difficulty -= x * 99;
 
         // https://eips.ethereum.org/EIPS/eip-100
         let y = if parent_has_uncles { 2 } else { 1 };
@@ -36,7 +37,7 @@ pub fn canonical_difficulty(
         }
     } else if homestead_formula {
         // Homestead
-        difficulty -= x * 99.as_u256();
+        difficulty -= x * 99;
 
         let z = (block_timestamp - parent_timestamp) / 10;
         if 100 > z {
@@ -55,7 +56,7 @@ pub fn canonical_difficulty(
         // https://eips.ethereum.org/EIPS/eip-649
         let n = block_number.saturating_sub(bomb_config.delay_to.0) / 100_000;
         if n >= 2 {
-            difficulty += U256::ONE << (n - 2);
+            difficulty += U256::one() << (n - 2);
         }
     }
 
@@ -83,7 +84,7 @@ mod tests {
                 0x7268db7b46b0b154_u64.into(),
                 0x04bdbdaf,
                 false,
-                0x72772897b619876a_u64.as_u256(),
+                0x72772897b619876a_u64.into(),
             ),
             (
                 13636066,
@@ -91,7 +92,7 @@ mod tests {
                 11_578_490_198_380_085_u128.into(),
                 1637194129,
                 false,
-                11_578_627_637_333_557_u128.as_u256(),
+                11_578_627_637_333_557_u128.into(),
             ),
         ] {
             let block_number = block_number.into();

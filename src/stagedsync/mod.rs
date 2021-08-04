@@ -53,7 +53,7 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
     /// Invokes each loaded stage, and does unwinds if necessary.
     ///
     /// NOTE: it should never return, except if the loop or any stage fails with error.
-    pub async fn run(&mut self, db: &'db DB) -> anyhow::Result<!> {
+    pub async fn run(&self, db: &'db DB) -> anyhow::Result<!> {
         let num_stages = self.stages.len();
 
         let mut unwind_to = None;
@@ -63,7 +63,7 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
             // Start with unwinding if it's been requested.
             if let Some(to) = unwind_to.take() {
                 // Unwind stages in reverse order.
-                for (stage_index, stage) in self.stages.iter_mut().enumerate().rev() {
+                for (stage_index, stage) in self.stages.iter().enumerate().rev() {
                     let stage_id = stage.id();
 
                     // Unwind magic happens here.
@@ -123,7 +123,7 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                 let mut timings = vec![];
 
                 // Execute each stage in direct order.
-                for (stage_index, stage) in self.stages.iter_mut().enumerate() {
+                for (stage_index, stage) in self.stages.iter().enumerate() {
                     let mut restarted = false;
 
                     let stage_id = stage.id();
@@ -134,8 +134,6 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                     // Re-invoke the stage until it reports `StageOutput::done`.
                     let done_progress = loop {
                         let prev_progress = stage_id.get_progress(&tx).await?;
-
-                        let stage_id = stage.id();
 
                         let exec_output: anyhow::Result<_> = async {
                             if restarted {
@@ -212,7 +210,7 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                             " {}/{} {} ",
                             stage_index + 1,
                             num_stages,
-                            AsRef::<str>::as_ref(&stage_id)
+                            AsRef::<str>::as_ref(&stage.id())
                         ))
                         .await;
 

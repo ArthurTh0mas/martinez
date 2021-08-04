@@ -6,7 +6,6 @@ use super::headers::{
 use crate::{
     kv,
     kv::{tables::HeaderKey, traits::MutableTransaction},
-    models::*,
 };
 use anyhow::format_err;
 use parking_lot::RwLock;
@@ -19,39 +18,25 @@ use std::{
 };
 use tracing::*;
 
-pub enum SaveOrder {
-    Monotonic,
-    Random,
-}
-
 /// Saves slices into the database, and sets Saved status.
 pub struct SaveStage<'tx, RwTx> {
     header_slices: Arc<HeaderSlices>,
-    db_transaction: &'tx RwTx,
-    order: SaveOrder,
-    is_canonical_chain: bool,
     pending_watch: HeaderSliceStatusWatch,
     remaining_count: Arc<AtomicUsize>,
+    db_transaction: &'tx RwTx,
 }
 
 impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>> SaveStage<'tx, RwTx> {
-    pub fn new(
-        header_slices: Arc<HeaderSlices>,
-        db_transaction: &'tx RwTx,
-        order: SaveOrder,
-        is_canonical_chain: bool,
-    ) -> Self {
+    pub fn new(header_slices: Arc<HeaderSlices>, db_transaction: &'tx RwTx) -> Self {
         Self {
             header_slices: header_slices.clone(),
-            db_transaction,
-            order,
-            is_canonical_chain,
             pending_watch: HeaderSliceStatusWatch::new(
                 HeaderSliceStatus::Verified,
                 header_slices,
                 "SaveStage",
             ),
             remaining_count: Arc::new(AtomicUsize::new(0)),
+            db_transaction,
         }
     }
 
@@ -67,10 +52,7 @@ impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>> SaveStage<'tx, RwTx> {
         let pending_count = self.pending_watch.pending_count();
 
         debug!("SaveStage: saving {} slices", pending_count);
-        let saved_count = match self.order {
-            SaveOrder::Monotonic => self.save_pending_monotonic(pending_count).await?,
-            SaveOrder::Random => self.save_pending_all(pending_count).await?,
-        };
+        let saved_count = self.save_pending_monotonic(pending_count).await?;
         debug!("SaveStage: saved {} slices", saved_count);
 
         self.set_remaining_count(pending_count - saved_count);
@@ -129,17 +111,13 @@ impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>> SaveStage<'tx, RwTx> {
         }
     }
 
-    async fn save_pending_all(&self, pending_count: usize) -> anyhow::Result<usize> {
+    // this is kept for performance comparison with save_pending_monotonic
+    async fn save_pending_all(&self, _pending_count: usize) -> anyhow::Result<usize> {
         let mut saved_count: usize = 0;
         while let Some(slice_lock) = self
             .header_slices
             .find_by_status(HeaderSliceStatus::Verified)
         {
-            // don't update more than asked
-            if saved_count >= pending_count {
-                break;
-            }
-
             self.save_slice(slice_lock).await?;
             saved_count += 1;
         }
@@ -177,50 +155,27 @@ impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>> SaveStage<'tx, RwTx> {
         Ok(())
     }
 
-    async fn read_parent_header_total_difficulty(
-        child: &BlockHeader,
-        tx: &RwTx,
-    ) -> anyhow::Result<Option<U256>> {
-        if child.number() == BlockNumber(0) {
-            return Ok(Some(U256::ZERO));
-        }
-        let parent_block_num = BlockNumber(child.number().0 - 1);
-        let parent_header_key: HeaderKey = (parent_block_num, child.parent_hash());
-        let parent_total_difficulty = tx
-            .get(kv::tables::HeadersTotalDifficulty, parent_header_key)
-            .await?;
-        Ok(parent_total_difficulty)
-    }
-
     async fn save_header(&self, header: BlockHeader, tx: &RwTx) -> anyhow::Result<()> {
         let block_num = header.number();
         let header_hash = header.hash();
         let header_key: HeaderKey = (block_num, header_hash);
+        let total_difficulty = header.difficulty();
 
         // saving a precomputed RLP representation
         tx.set(HeaderTableWithBytes, header_key, header.rlp_repr())
             .await?;
         tx.set(kv::tables::HeaderNumber, header_hash, block_num)
             .await?;
-
-        if self.is_canonical_chain {
-            tx.set(kv::tables::CanonicalHeader, block_num, header_hash)
-                .await?;
-            tx.set(kv::tables::LastHeader, Default::default(), header_hash)
-                .await?;
-
-            if let Some(mut total_difficulty) =
-                Self::read_parent_header_total_difficulty(&header, tx).await?
-            {
-                total_difficulty += header.difficulty();
-                tx.set(
-                    kv::tables::HeadersTotalDifficulty,
-                    header_key,
-                    total_difficulty,
-                )
-                .await?;
-            }
-        }
+        tx.set(kv::tables::CanonicalHeader, block_num, header_hash)
+            .await?;
+        tx.set(
+            kv::tables::HeadersTotalDifficulty,
+            header_key,
+            total_difficulty,
+        )
+        .await?;
+        tx.set(kv::tables::LastHeader, Default::default(), header_hash)
+            .await?;
 
         Ok(())
     }

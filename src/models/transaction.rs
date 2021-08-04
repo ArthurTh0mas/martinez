@@ -1,13 +1,13 @@
 use crate::{
     crypto::{is_valid_signature, TrieEncode},
-    models::*,
+    models::ChainId,
     util::*,
 };
 use bytes::{BufMut, Bytes, BytesMut};
 use derive_more::Deref;
 use educe::Educe;
+use ethereum_types::*;
 use hex_literal::hex;
-use parity_scale_codec::{Compact, Decode, Encode, EncodeAsRef, EncodeLike, Input};
 use rlp::{Decodable, DecoderError, Encodable, Rlp, RlpStream};
 use secp256k1::{
     ecdsa::{RecoverableSignature, RecoveryId},
@@ -24,7 +24,7 @@ pub enum TxType {
     EIP1559 = 2,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransactionAction {
     Call(Address),
     Create,
@@ -93,7 +93,7 @@ impl YParityAndChainId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageSignature {
     odd_y_parity: bool,
     r: H256,
@@ -147,7 +147,7 @@ impl MessageSignature {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccessListItem {
     pub address: Address,
     pub slots: Vec<H256>,
@@ -172,98 +172,37 @@ impl Decodable for AccessListItem {
 
 pub type AccessList = Vec<AccessListItem>;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct OptionalChainId(pub Option<ChainId>);
-
-impl Encode for OptionalChainId {
-    fn using_encoded<R, F: FnOnce(&[u8]) -> R>(&self, f: F) -> R {
-        Compact(if let Some(chainid) = self.0 {
-            chainid.0
-        } else {
-            0
-        })
-        .using_encoded(f)
-    }
-}
-
-impl Decode for OptionalChainId {
-    fn decode<I: Input>(input: &mut I) -> Result<Self, parity_scale_codec::Error> {
-        Compact::<u64>::decode(input).map(|input| {
-            OptionalChainId(if input.0 == 0 {
-                None
-            } else {
-                Some(ChainId(input.0))
-            })
-        })
-    }
-}
-
-impl EncodeLike for OptionalChainId {}
-
-impl From<OptionalChainId> for Option<ChainId> {
-    fn from(v: OptionalChainId) -> Self {
-        v.0
-    }
-}
-
-impl EncodeAsRef<'_, Option<ChainId>> for OptionalChainId {
-    type RefType = OptionalChainId;
-}
-
-impl<'a> From<&'a Option<ChainId>> for OptionalChainId {
-    fn from(c: &'a Option<ChainId>) -> Self {
-        Self(*c)
-    }
-}
-
-#[derive(Clone, Educe, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Clone, Educe, PartialEq, Eq, Serialize, Deserialize)]
 #[educe(Debug)]
 pub enum Message {
     Legacy {
-        #[codec(encoded_as = "OptionalChainId")]
         chain_id: Option<ChainId>,
-        #[codec(compact)]
         nonce: u64,
-        #[codec(compact)]
         gas_price: U256,
-        #[codec(compact)]
         gas_limit: u64,
         action: TransactionAction,
-        #[codec(compact)]
         value: U256,
         #[educe(Debug(method = "write_hex_string"))]
         input: Bytes,
     },
     EIP2930 {
-        #[codec(compact)]
         chain_id: ChainId,
-        #[codec(compact)]
         nonce: u64,
-        #[codec(compact)]
         gas_price: U256,
-        #[codec(compact)]
         gas_limit: u64,
         action: TransactionAction,
-        #[codec(compact)]
         value: U256,
         #[educe(Debug(method = "write_hex_string"))]
         input: Bytes,
         access_list: Vec<AccessListItem>,
     },
     EIP1559 {
-        #[codec(compact)]
         chain_id: ChainId,
-        #[codec(compact)]
         nonce: u64,
-        #[codec(compact)]
         max_priority_fee_per_gas: U256,
-        #[codec(compact)]
         max_fee_per_gas: U256,
-        #[codec(compact)]
         gas_limit: u64,
         action: TransactionAction,
-        #[codec(compact)]
         value: U256,
         #[educe(Debug(method = "write_hex_string"))]
         input: Bytes,
@@ -362,7 +301,7 @@ impl Message {
     }
 }
 
-#[derive(Clone, Debug, Deref, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Clone, Debug, Deref, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageWithSignature {
     #[deref]
     pub message: Message,
@@ -402,8 +341,8 @@ impl MessageWithSignature {
                     }
                     .v(),
                 );
-                s.append(&U256::from_be_bytes(self.signature.r.0));
-                s.append(&U256::from_be_bytes(self.signature.s.0));
+                s.append(&U256::from_big_endian(&self.signature.r[..]));
+                s.append(&U256::from_big_endian(&self.signature.s[..]));
             }
             Message::EIP2930 {
                 chain_id,
@@ -427,8 +366,8 @@ impl MessageWithSignature {
                 s1.append(&input.as_ref());
                 s1.append_list(access_list);
                 s1.append(&self.signature.odd_y_parity);
-                s1.append(&U256::from_be_bytes(self.signature.r.0));
-                s1.append(&U256::from_be_bytes(self.signature.s.0));
+                s1.append(&U256::from_big_endian(&self.signature.r[..]));
+                s1.append(&U256::from_big_endian(&self.signature.s[..]));
                 if standalone {
                     s.append_raw(&*s1.out().freeze(), 1);
                 } else {
@@ -459,8 +398,8 @@ impl MessageWithSignature {
                 s1.append(&input.as_ref());
                 s1.append_list(access_list);
                 s1.append(&self.signature.odd_y_parity);
-                s1.append(&U256::from_be_bytes(self.signature.r.0));
-                s1.append(&U256::from_be_bytes(self.signature.s.0));
+                s1.append(&U256::from_big_endian(&self.signature.r[..]));
+                s1.append(&U256::from_big_endian(&self.signature.s[..]));
                 if standalone {
                     s.append_raw(&*s1.out().freeze(), 1);
                 } else {
@@ -503,8 +442,16 @@ impl MessageWithSignature {
                 },
                 signature: MessageSignature::new(
                     rlp.val_at(8)?,
-                    H256(rlp.val_at::<U256>(9)?.to_be_bytes()),
-                    H256(rlp.val_at::<U256>(10)?.to_be_bytes()),
+                    {
+                        let mut rarr = [0_u8; 32];
+                        rlp.val_at::<U256>(9)?.to_big_endian(&mut rarr);
+                        H256::from(rarr)
+                    },
+                    {
+                        let mut sarr = [0_u8; 32];
+                        rlp.val_at::<U256>(10)?.to_big_endian(&mut sarr);
+                        H256::from(sarr)
+                    },
                 )
                 .ok_or(DecoderError::Custom("Invalid transaction signature format"))?,
             });
@@ -531,8 +478,16 @@ impl MessageWithSignature {
                 },
                 signature: MessageSignature::new(
                     rlp.val_at(9)?,
-                    H256(rlp.val_at::<U256>(10)?.to_be_bytes()),
-                    H256(rlp.val_at::<U256>(11)?.to_be_bytes()),
+                    {
+                        let mut rarr = [0_u8; 32];
+                        rlp.val_at::<U256>(10)?.to_big_endian(&mut rarr);
+                        H256::from(rarr)
+                    },
+                    {
+                        let mut sarr = [0_u8; 32];
+                        rlp.val_at::<U256>(11)?.to_big_endian(&mut sarr);
+                        H256::from(sarr)
+                    },
                 )
                 .ok_or(DecoderError::Custom("Invalid transaction signature format"))?,
             });
@@ -549,8 +504,16 @@ impl MessageWithSignature {
                 chain_id,
             } = YParityAndChainId::from_v(rlp.val_at(6)?)
                 .ok_or(DecoderError::Custom("Invalid recovery ID"))?;
-            let r = H256(rlp.val_at::<U256>(7)?.to_be_bytes());
-            let s = H256(rlp.val_at::<U256>(8)?.to_be_bytes());
+            let r = {
+                let mut rarr = [0_u8; 32];
+                rlp.val_at::<U256>(7)?.to_big_endian(&mut rarr);
+                H256::from(rarr)
+            };
+            let s = {
+                let mut sarr = [0_u8; 32];
+                rlp.val_at::<U256>(8)?.to_big_endian(&mut sarr);
+                H256::from(sarr)
+            };
             let signature = MessageSignature::new(odd, r, s)
                 .ok_or(DecoderError::Custom("Invalid transaction signature format"))?;
 
@@ -594,8 +557,16 @@ impl Decodable for MessageWithSignature {
                 chain_id,
             } = YParityAndChainId::from_v(rlp.val_at(6)?)
                 .ok_or(DecoderError::Custom("Invalid recovery ID"))?;
-            let r = H256(rlp.val_at::<U256>(7)?.to_be_bytes());
-            let s = H256(rlp.val_at::<U256>(8)?.to_be_bytes());
+            let r = {
+                let mut rarr = [0_u8; 32];
+                rlp.val_at::<U256>(7)?.to_big_endian(&mut rarr);
+                H256::from(rarr)
+            };
+            let s = {
+                let mut sarr = [0_u8; 32];
+                rlp.val_at::<U256>(8)?.to_big_endian(&mut sarr);
+                H256::from(sarr)
+            };
             let signature = MessageSignature::new(odd, r, s)
                 .ok_or(DecoderError::Custom("Invalid transaction signature format"))?;
 
@@ -634,8 +605,16 @@ impl Decodable for MessageWithSignature {
                 },
                 signature: MessageSignature::new(
                     rlp.val_at(8)?,
-                    H256(rlp.val_at::<U256>(9)?.to_be_bytes()),
-                    H256(rlp.val_at::<U256>(10)?.to_be_bytes()),
+                    {
+                        let mut rarr = [0_u8; 32];
+                        rlp.val_at::<U256>(9)?.to_big_endian(&mut rarr);
+                        H256::from(rarr)
+                    },
+                    {
+                        let mut sarr = [0_u8; 32];
+                        rlp.val_at::<U256>(10)?.to_big_endian(&mut sarr);
+                        H256::from(sarr)
+                    },
                 )
                 .ok_or(DecoderError::Custom("Invalid transaction signature format"))?,
             });
@@ -661,8 +640,16 @@ impl Decodable for MessageWithSignature {
                 },
                 signature: MessageSignature::new(
                     rlp.val_at(9)?,
-                    H256(rlp.val_at::<U256>(10)?.to_be_bytes()),
-                    H256(rlp.val_at::<U256>(11)?.to_be_bytes()),
+                    {
+                        let mut rarr = [0_u8; 32];
+                        rlp.val_at::<U256>(10)?.to_big_endian(&mut rarr);
+                        H256::from(rarr)
+                    },
+                    {
+                        let mut sarr = [0_u8; 32];
+                        rlp.val_at::<U256>(11)?.to_big_endian(&mut sarr);
+                        H256::from(sarr)
+                    },
                 )
                 .ok_or(DecoderError::Custom("Invalid transaction signature format"))?,
             });
@@ -828,7 +815,7 @@ mod tests {
                 action: TransactionAction::Call(
                     hex!("727fc6a68321b754475c668a6abfb6e9e71c169a").into(),
                 ),
-                value: 10.as_u256() * 1_000_000_000 * 1_000_000_000,
+                value: U256::from(10) * 1_000_000_000 * 1_000_000_000,
                 input: hex!("a9059cbb000000000213ed0f886efd100b67c7e4ec0a85a7d20dc971600000000000000000000015af1d78b58c4000").to_vec().into(),
             },
 			signature: MessageSignature::new(
@@ -856,7 +843,7 @@ mod tests {
                     action: TransactionAction::Call(
                         hex!("811a752c8cd697e3cb27279c330ed1ada745a8d7").into(),
                     ),
-                    value: 2.as_u256() * 1_000_000_000 * 1_000_000_000,
+                    value: U256::from(2) * 1_000_000_000 * 1_000_000_000,
                     input: hex!("6ebaf477f83e051589c1188bcc6ddccd").to_vec().into(),
                     access_list: vec![
                         AccessListItem {
@@ -905,7 +892,7 @@ mod tests {
                     action: TransactionAction::Call(
                         hex!("811a752c8cd697e3cb27279c330ed1ada745a8d7").into(),
                     ),
-                    value: 2.as_u256() * 1_000_000_000 * 1_000_000_000,
+                    value: U256::from(2) * 1_000_000_000 * 1_000_000_000,
                     input: hex!("6ebaf477f83e051589c1188bcc6ddccd").to_vec().into(),
                     access_list: vec![
                         AccessListItem {

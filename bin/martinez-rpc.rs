@@ -1,7 +1,12 @@
-use martinez::{binutil::MartinezDataDir, kv::traits::*, models::*, stagedsync::stages::*};
+use martinez::{
+    binutil::MartinezDataDir,
+    kv::{tables, traits::*},
+    models::*,
+    stagedsync::stages::*,
+};
 use async_trait::async_trait;
 use clap::Parser;
-use ethnum::U256;
+use ethereum_types::{Address, U256};
 use jsonrpsee::{core::RpcResult, http_server::HttpServerBuilder, proc_macros::rpc};
 use std::{future::pending, net::SocketAddr, sync::Arc};
 use tracing_subscriber::{prelude::*, EnvFilter};
@@ -37,8 +42,11 @@ where
     DB: KV,
 {
     async fn block_number(&self) -> RpcResult<BlockNumber> {
-        Ok(FINISH
-            .get_progress(&self.db.begin().await?)
+        Ok(self
+            .db
+            .begin()
+            .await?
+            .get(tables::SyncStage, FINISH)
             .await?
             .unwrap_or(BlockNumber(0)))
     }
@@ -51,7 +59,7 @@ where
         )
         .await?
         .map(|acc| acc.balance)
-        .unwrap_or(U256::ZERO))
+        .unwrap_or_else(U256::zero))
     }
 }
 
