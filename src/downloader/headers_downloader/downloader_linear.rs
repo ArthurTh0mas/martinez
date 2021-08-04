@@ -2,7 +2,10 @@ use super::{
     downloader_stage_loop::DownloaderStageLoop,
     headers::{
         header_slices,
-        header_slices::{align_block_num_to_slice_start, HeaderSliceStatus, HeaderSlices},
+        header_slices::{
+            align_block_num_to_slice_start, is_block_num_aligned_to_slice_start, HeaderSliceStatus,
+            HeaderSlices,
+        },
     },
     headers_ui::HeaderSlicesView,
     stages::*,
@@ -73,6 +76,12 @@ impl DownloaderLinear {
         ui_system: UISystemShared,
     ) -> anyhow::Result<DownloaderLinearReport> {
         let start_block_num = start_block_id.number;
+        if !is_block_num_aligned_to_slice_start(start_block_num) {
+            return Err(anyhow::format_err!(
+                "expected an aligned start block, got {}",
+                start_block_num.0
+            ));
+        }
 
         let trusted_len: u64 = 90_000;
 
@@ -121,12 +130,12 @@ impl DownloaderLinear {
         );
         let fetch_receive_stage = FetchReceiveStage::new(header_slices.clone(), sentry.clone());
         let retry_stage = RetryStage::new(header_slices.clone());
-        let verify_stage = VerifyStageLinear::new(
+        let verify_slices_stage = VerifySlicesStage::new(
             header_slices.clone(),
             self.chain_config.clone(),
             self.verifier.clone(),
         );
-        let verify_link_stage = VerifyStageLinearLink::new(
+        let verify_link_stage = VerifyLinkLinearStage::new(
             header_slices.clone(),
             self.chain_config.clone(),
             self.verifier.clone(),
@@ -135,16 +144,21 @@ impl DownloaderLinear {
             HeaderSliceStatus::Invalid,
         );
         let penalize_stage = PenalizeStage::new(header_slices.clone(), sentry.clone());
-        let save_stage = SaveStage::<RwTx>::new(header_slices.clone(), db_transaction);
+        let save_stage = SaveStage::<RwTx>::new(
+            header_slices.clone(),
+            db_transaction,
+            save_stage::SaveOrder::Monotonic,
+            true,
+        );
         let refill_stage = RefillStage::new(header_slices.clone());
 
         let refill_stage_is_over = refill_stage.is_over_check();
 
-        let mut stages = DownloaderStageLoop::new(&header_slices);
+        let mut stages = DownloaderStageLoop::new(&header_slices, None);
         stages.insert(fetch_request_stage);
         stages.insert(fetch_receive_stage);
         stages.insert(retry_stage);
-        stages.insert(verify_stage);
+        stages.insert(verify_slices_stage);
         stages.insert(verify_link_stage);
         stages.insert(penalize_stage);
         stages.insert(save_stage);
