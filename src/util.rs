@@ -1,6 +1,5 @@
 use bytes::{Bytes, BytesMut};
 use ethereum_types::*;
-use ethnum::U256;
 use num_traits::Zero;
 use serde::{
     de::{self, Error},
@@ -10,14 +9,6 @@ use std::{
     borrow::Borrow,
     fmt::{self, Formatter},
 };
-
-pub fn static_left_pad<const LEN: usize>(unpadded: &[u8]) -> [u8; LEN] {
-    assert!(unpadded.len() <= LEN);
-
-    let mut v = [0; LEN];
-    v[LEN - unpadded.len()..].copy_from_slice(unpadded);
-    v
-}
 
 fn pad<const LEFT: bool>(buffer: Bytes, min_size: usize) -> Bytes {
     if buffer.len() >= min_size {
@@ -41,11 +32,11 @@ pub fn right_pad(buffer: Bytes, min_size: usize) -> Bytes {
 }
 
 pub fn u256_to_h256(v: U256) -> H256 {
-    H256(v.to_be_bytes())
+    H256(v.into())
 }
 
 pub fn h256_to_u256(v: impl Borrow<H256>) -> U256 {
-    U256::from_be_bytes(v.borrow().0)
+    U256::from_big_endian(&v.borrow().0)
 }
 
 pub fn zeroless_view(v: &impl AsRef<[u8]>) -> &[u8] {
@@ -121,7 +112,7 @@ pub mod test_util {
     pub fn run_test<F: Future<Output = ()> + Send + 'static>(f: F) {
         Builder::new_multi_thread()
             .enable_all()
-            .thread_stack_size(64 * 1024 * 1024)
+            .thread_stack_size(32 * 1024 * 1024)
             .build()
             .unwrap()
             .block_on(async move { tokio::spawn(f).await.unwrap() })

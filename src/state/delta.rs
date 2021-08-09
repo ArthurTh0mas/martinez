@@ -1,5 +1,6 @@
 use super::{intra_block_state::IntraBlockState, object::Object};
-use crate::{models::*, State, Storage};
+use crate::{State, Storage};
+use ethereum_types::*;
 use std::{collections::hash_map::Entry, fmt::Debug};
 
 /// Reversible change made to `IntraBlockState`.
