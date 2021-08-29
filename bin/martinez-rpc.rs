@@ -1,9 +1,4 @@
-use martinez::{
-    binutil::MartinezDataDir,
-    kv::{tables, traits::*},
-    models::*,
-    stagedsync::stages::*,
-};
+use martinez::{binutil::MartinezDataDir, kv::traits::*, models::*, stagedsync::stages::*};
 use async_trait::async_trait;
 use clap::Parser;
 use ethnum::U256;
@@ -42,11 +37,8 @@ where
     DB: KV,
 {
     async fn block_number(&self) -> RpcResult<BlockNumber> {
-        Ok(self
-            .db
-            .begin()
-            .await?
-            .get(tables::SyncStage, FINISH)
+        Ok(FINISH
+            .get_progress(&self.db.begin().await?)
             .await?
             .unwrap_or(BlockNumber(0)))
     }

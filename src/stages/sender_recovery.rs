@@ -14,6 +14,7 @@ use tokio::pin;
 use tokio_stream::StreamExt as _;
 use tracing::*;
 
+/// Recovery of senders of transactions from signatures
 #[derive(Debug)]
 pub struct SenderRecovery {
     pub batch_size: usize,
@@ -28,11 +29,11 @@ where
         StageId("SenderRecovery")
     }
 
-    fn description(&self) -> &'static str {
-        "Recovering senders of transactions from signatures"
-    }
-
-    async fn execute<'tx>(&self, tx: &'tx mut RwTx, input: StageInput) -> anyhow::Result<ExecOutput>
+    async fn execute<'tx>(
+        &mut self,
+        tx: &'tx mut RwTx,
+        input: StageInput,
+    ) -> anyhow::Result<ExecOutput>
     where
         'db: 'tx,
     {
@@ -50,11 +51,10 @@ where
         let started_at = Instant::now();
         let started_at_txnum = tx
             .get(
-                tables::CumulativeIndex,
+                tables::TotalTx,
                 input.first_started_at.1.unwrap_or(BlockNumber(0)),
             )
-            .await?
-            .map(|v| v.tx_num);
+            .await?;
         let done = loop {
             let mut read_again = false;
             debug!("Reading bodies");
@@ -118,16 +118,13 @@ where
                 let mut format_string = format!("Extracted senders from block {}", highest_block);
 
                 if let Some(started_at_txnum) = started_at_txnum {
-                    let current_txnum = tx
-                        .get(tables::CumulativeIndex, highest_block)
-                        .await?
-                        .map(|v| v.tx_num);
+                    let current_txnum = tx.get(tables::TotalTx, highest_block).await?;
                     let total_txnum = tx
-                        .cursor(tables::CumulativeIndex)
+                        .cursor(tables::TotalTx)
                         .await?
                         .last()
                         .await?
-                        .map(|(_, v)| v.tx_num);
+                        .map(|(_, v)| v);
 
                     if let Some(current_txnum) = current_txnum {
                         if let Some(total_txnum) = total_txnum {
@@ -170,7 +167,7 @@ where
     }
 
     async fn unwind<'tx>(
-        &self,
+        &mut self,
         tx: &'tx mut RwTx,
         input: UnwindInput,
     ) -> anyhow::Result<UnwindOutput>
@@ -366,7 +363,7 @@ mod tests {
             .await
             .unwrap();
 
-        let stage = SenderRecovery { batch_size: 50_000 };
+        let mut stage = SenderRecovery { batch_size: 50_000 };
 
         let stage_input = StageInput {
             restarted: false,
