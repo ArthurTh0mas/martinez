@@ -25,6 +25,7 @@ pub mod accessors;
 pub mod binutil;
 mod bitmapdb;
 pub mod chain;
+pub mod commitment;
 pub mod consensus;
 pub mod crypto;
 pub mod downloader;
