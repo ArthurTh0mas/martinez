@@ -20,6 +20,8 @@ pub struct VerifyLinkLinearStage {
     header_slices: Arc<HeaderSlices>,
     chain_config: ChainConfig,
     verifier: Arc<Box<dyn HeaderSliceVerifier>>,
+    start_block_num: BlockNumber,
+    start_block_hash: H256,
     invalid_status: HeaderSliceStatus,
     last_verified_header: Option<BlockHeader>,
     pending_watch: HeaderSliceStatusWatch,
@@ -31,23 +33,18 @@ impl VerifyLinkLinearStage {
         header_slices: Arc<HeaderSlices>,
         chain_config: ChainConfig,
         verifier: Arc<Box<dyn HeaderSliceVerifier>>,
-        last_verified_header: Option<BlockHeader>,
+        start_block_num: BlockNumber,
+        start_block_hash: H256,
         invalid_status: HeaderSliceStatus,
     ) -> Self {
-        if let Some(last_verified_header) = &last_verified_header {
-            assert_eq!(
-                BlockNumber(last_verified_header.number().0 + 1),
-                header_slices.min_block_num()
-            );
-        }
-
-        let last_verified_header =
-            Self::find_last_verified_header(&header_slices).or(last_verified_header);
+        let last_verified_header = Self::find_last_verified_header(&header_slices);
 
         Self {
             header_slices: header_slices.clone(),
             chain_config,
             verifier,
+            start_block_num,
+            start_block_hash,
             invalid_status,
             last_verified_header,
             pending_watch: HeaderSliceStatusWatch::new(
@@ -172,9 +169,9 @@ impl VerifyLinkLinearStage {
 
         let child = &headers[0];
 
-        // for the genesis header we just verify its hash
-        if child.number() == BlockNumber(0) {
-            return child.hash() == self.chain_config.genesis_block_hash();
+        // for the start header we just verify its hash
+        if child.number() == self.start_block_num {
+            return child.hash() == self.start_block_hash;
         }
         // otherwise we expect that we have a verified parent
         if parent.is_none() {

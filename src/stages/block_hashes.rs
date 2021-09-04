@@ -2,7 +2,7 @@ use crate::{
     etl::collector::*,
     kv::{tables, traits::*},
     models::*,
-    stagedsync::{stage::*, stages::*},
+    stagedsync::stage::*,
     StageId,
 };
 use async_trait::async_trait;
@@ -24,7 +24,7 @@ where
     RwTx: MutableTransaction<'db>,
 {
     fn id(&self) -> StageId {
-        BLOCK_HASHES
+        StageId("BlockHashes")
     }
 
     async fn execute<'tx>(

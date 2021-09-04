@@ -71,17 +71,9 @@ where
     {
         self.sentry_status_provider.update(tx).await?;
 
-        // finalize unwind request
-        if let Some(mut state) = self.load_previous_run_state().await {
-            if let Some(unwind_request) = state.unwind_request.take() {
-                self.downloader.unwind_finalize(tx, unwind_request).await?;
-                self.save_run_state(state).await;
-            }
-        }
-
         let past_progress = input.stage_progress.unwrap_or_default();
-        let start_block_num = BlockNumber(past_progress.0 + 1);
 
+        let start_block_num = BlockNumber(past_progress.0 + 1);
         let previous_run_state = self.load_previous_run_state().await;
 
         let mut ui_system = UISystem::new();
@@ -101,14 +93,6 @@ where
 
         ui_system.try_lock()?.stop().await?;
 
-        if let Some(unwind_request) = &report.run_state.unwind_request {
-            let unwind_to = unwind_request.unwind_to_block_num;
-            self.save_run_state(report.run_state).await;
-            return Ok(ExecOutput::Unwind { unwind_to });
-        }
-
-        self.save_run_state(report.run_state).await;
-
         let final_block_num = report.final_block_num.0;
         let stage_progress = if final_block_num > 0 {
             BlockNumber(final_block_num - 1)
@@ -117,6 +101,8 @@ where
         };
 
         let done = final_block_num >= report.target_final_block_num.0;
+
+        self.save_run_state(report.run_state).await;
 
         Ok(ExecOutput::Progress {
             stage_progress,
@@ -132,9 +118,8 @@ where
     where
         'db: 'tx,
     {
-        self.downloader.unwind(tx, input.unwind_to).await?;
-
-        let stage_progress = BlockNumber(std::cmp::min(input.stage_progress.0, input.unwind_to.0));
-        Ok(UnwindOutput { stage_progress })
+        let _ = tx;
+        let _ = input;
+        todo!()
     }
 }
