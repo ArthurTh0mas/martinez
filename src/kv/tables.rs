@@ -298,7 +298,13 @@ macro_rules! scale_table_object {
 
         impl TableDecode for $ty {
             fn decode(mut b: &[u8]) -> anyhow::Result<Self> {
-                Ok(<Self as ::parity_scale_codec::Decode>::decode(&mut b)?)
+                <Self as ::parity_scale_codec::Decode>::decode(&mut b).map_err(|e| {
+                    format_err!(
+                        "Failed to decode SCALE object: {}, input: {}",
+                        e,
+                        hex::encode(b)
+                    )
+                })
             }
         }
     };
