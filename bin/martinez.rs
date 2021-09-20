@@ -80,10 +80,6 @@ pub struct Opt {
     #[clap(long)]
     pub execution_exit_after_batch: bool,
 
-    /// Skip commitment (state root) verification.
-    #[clap(long)]
-    pub skip_commitment: bool,
-
     /// Exit Martinez after sync is complete and there's no progress.
     #[clap(long)]
     pub exit_after_sync: bool,
@@ -681,9 +677,7 @@ fn main() -> anyhow::Result<()> {
                     prune_from: BlockNumber(0),
                 });
                 staged_sync.push(HashState::new(etl_temp_dir.clone(), None));
-                if !opt.skip_commitment {
-                    staged_sync.push(Interhashes::new(etl_temp_dir.clone(), None));
-                }
+                staged_sync.push(Interhashes::new(etl_temp_dir.clone(), None));
                 staged_sync.push(CallTraceIndex {
                     temp_dir: etl_temp_dir.clone(),
                     flush_interval: 50_000,
