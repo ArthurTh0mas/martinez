@@ -1,14 +1,13 @@
 use super::{
     downloader_forky, downloader_linear, downloader_preverified,
-    headers::header_slices::HeaderSlices, stages::fork_switch_command::ForkSwitchCommand,
-    ui::ui_system::UISystemShared, verification::header_slice_verifier::HeaderSliceVerifier,
+    headers::header_slices::HeaderSlices, ui::ui_system::UISystemShared,
+    verification::header_slice_verifier::HeaderSliceVerifier,
 };
 use crate::{
     kv,
     models::*,
     sentry::{chain_config::ChainConfig, sentry_client_reactor::*},
 };
-use parking_lot::Mutex;
 use std::{
     fmt::{Debug, Formatter},
     sync::Arc,
@@ -33,13 +32,6 @@ pub struct DownloaderRunState {
     pub estimated_top_block_num: Option<BlockNumber>,
     pub forky_header_slices: Option<Arc<HeaderSlices>>,
     pub forky_fork_header_slices: Option<Arc<HeaderSlices>>,
-    pub unwind_request: Option<DownloaderUnwindRequest>,
-}
-
-#[derive(Clone)]
-pub struct DownloaderUnwindRequest {
-    pub unwind_to_block_num: BlockNumber,
-    finalize: Arc<Mutex<Option<ForkSwitchCommand>>>,
 }
 
 impl Debug for DownloaderRunState {
@@ -52,15 +44,6 @@ impl Debug for DownloaderRunState {
                 &self.forky_fork_header_slices.is_some(),
             )
             .finish()
-    }
-}
-
-impl From<ForkSwitchCommand> for DownloaderUnwindRequest {
-    fn from(command: ForkSwitchCommand) -> Self {
-        Self {
-            unwind_to_block_num: command.connection_block_num(),
-            finalize: Arc::new(Mutex::new(Some(command))),
-        }
     }
 }
 
@@ -163,39 +146,9 @@ impl Downloader {
                 estimated_top_block_num: Some(linear_report.estimated_top_block_num),
                 forky_header_slices: forky_report.header_slices,
                 forky_fork_header_slices: forky_report.fork_header_slices,
-                unwind_request: forky_report
-                    .termination_command
-                    .map(DownloaderUnwindRequest::from),
             },
         };
 
         Ok(report)
-    }
-
-    pub async fn unwind<
-        'downloader,
-        'db: 'downloader,
-        RwTx: kv::traits::MutableTransaction<'db>,
-    >(
-        &'downloader self,
-        db_transaction: &'downloader RwTx,
-        unwind_to_block_num: BlockNumber,
-    ) -> anyhow::Result<()> {
-        super::stages::SaveStage::unwind(unwind_to_block_num, db_transaction).await
-    }
-
-    pub async fn unwind_finalize<
-        'downloader,
-        'db: 'downloader,
-        RwTx: kv::traits::MutableTransaction<'db>,
-    >(
-        &'downloader self,
-        db_transaction: &'downloader RwTx,
-        unwind_request: DownloaderUnwindRequest,
-    ) -> anyhow::Result<()> {
-        let Some(finalize) = unwind_request.finalize.lock().take() else {
-            anyhow::bail!("unwind_finalize: finalize command expected in unwind_request");
-        };
-        finalize.execute(db_transaction).await
     }
 }
