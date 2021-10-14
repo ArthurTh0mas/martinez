@@ -1,7 +1,7 @@
 [package]
 name = "martinez"
 version = "0.1.0"
-authors = ["Annie Lai <ng8eke@163.com>"]
+authors = ["Annie Lai <ng8eke@163.com>", "Emilia Hane <emiliaha95@gmail.com>"]
 edition = "2021"
 description = "Ethereum client based on turbo-geth client architecture"
 license = "Apache-2.0"
@@ -45,6 +45,7 @@ hex = "0.4"
 hex-literal = "0.3"
 http = "0.2"
 itertools = "0.10"
+jsonrpc = { package = "ethereum-jsonrpc", git = "https://github.com/rust-ethereum/jsonrpc" }
 jsonrpsee = { git = "https://github.com/paritytech/jsonrpsee", features = [
     "server",
     "macros",
@@ -120,6 +121,7 @@ name = "consensus-tests"
 [patch.crates-io]
 parity-scale-codec = { git = "https://github.com/paritytech/parity-scale-codec" }
 
-[profile.release]
+[profile.production]
+inherits = "release"
 codegen-units = 1
 lto = true
