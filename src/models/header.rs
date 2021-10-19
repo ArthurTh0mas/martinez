@@ -5,7 +5,7 @@ use parity_scale_codec::*;
 use rlp::*;
 use serde::*;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 /// Ethereum block header definition.
 pub struct BlockHeader {
     pub parent_hash: H256,
