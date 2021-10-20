@@ -172,7 +172,7 @@ impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>> SaveStage<'tx, RwTx> {
         for header_ref in headers {
             // this clone happens mostly on the stack (except extra_data)
             let header = header_ref.clone();
-            Self::save_header(header, self.is_canonical_chain, tx).await?;
+            self.save_header(header, tx).await?;
         }
         Ok(())
     }
@@ -215,48 +215,36 @@ impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>> SaveStage<'tx, RwTx> {
         Ok(header_opt.map(|header| BlockHeader::new(header, header_hash)))
     }
 
-    pub async fn save_header(
-        header: BlockHeader,
-        is_canonical_chain: bool,
-        tx: &'tx RwTx,
-    ) -> anyhow::Result<()> {
+    async fn save_header(&self, header: BlockHeader, tx: &'tx RwTx) -> anyhow::Result<()> {
         let block_num = header.number();
         let header_hash = header.hash();
         let header_key: HeaderKey = (block_num, header_hash);
 
-        if is_canonical_chain {
-            Self::update_canonical_chain_header(&header, tx).await?;
-        }
+        let total_difficulty_opt = if self.is_canonical_chain {
+            Self::header_total_difficulty(&header, tx).await?
+        } else {
+            None
+        };
 
         tx.set(kv::tables::Header, header_key, header.header)
             .await?;
         tx.set(kv::tables::HeaderNumber, header_hash, block_num)
             .await?;
 
-        Ok(())
-    }
+        if self.is_canonical_chain {
+            tx.set(kv::tables::CanonicalHeader, block_num, header_hash)
+                .await?;
+            tx.set(kv::tables::LastHeader, Default::default(), header_hash)
+                .await?;
 
-    pub async fn update_canonical_chain_header(
-        header: &BlockHeader,
-        tx: &'tx RwTx,
-    ) -> anyhow::Result<()> {
-        let block_num = header.number();
-        let header_hash = header.hash();
-        let header_key: HeaderKey = (block_num, header_hash);
-
-        tx.set(kv::tables::CanonicalHeader, block_num, header_hash)
-            .await?;
-        tx.set(kv::tables::LastHeader, Default::default(), header_hash)
-            .await?;
-
-        let total_difficulty_opt = Self::header_total_difficulty(header, tx).await?;
-        if let Some(total_difficulty) = total_difficulty_opt {
-            tx.set(
-                kv::tables::HeadersTotalDifficulty,
-                header_key,
-                total_difficulty,
-            )
-            .await?;
+            if let Some(total_difficulty) = total_difficulty_opt {
+                tx.set(
+                    kv::tables::HeadersTotalDifficulty,
+                    header_key,
+                    total_difficulty,
+                )
+                .await?;
+            }
         }
 
         Ok(())

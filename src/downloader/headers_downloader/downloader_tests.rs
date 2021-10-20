@@ -67,9 +67,9 @@ async fn run_downloader(
         .await?;
 
     if let Some(unwind_request) = report.run_state.unwind_request.take() {
-        downloader
-            .unwind_finalize(&db_transaction, unwind_request)
-            .await?;
+        if let Some(finalize) = unwind_request.finalize.lock().take() {
+            finalize();
+        }
     }
 
     db_transaction.commit().await?;
