@@ -744,6 +744,66 @@ impl TableDecode for CallTraceSetEntry {
     }
 }
 
+impl TableEncode for crate::trie::Node {
+    type Encoded = Vec<u8>;
+
+    fn encode(self) -> Self::Encoded {
+        let buf_size =
+            6 + if self.root_hash.is_some() {
+                KECCAK_LENGTH
+            } else {
+                0
+            } + self.hashes.len() * KECCAK_LENGTH;
+        let mut buf = Vec::<u8>::with_capacity(buf_size);
+
+        buf.extend_from_slice(self.state_mask.to_be_bytes().as_slice());
+        buf.extend_from_slice(self.tree_mask.to_be_bytes().as_slice());
+        buf.extend_from_slice(self.hash_mask.to_be_bytes().as_slice());
+
+        if let Some(root_hash) = self.root_hash {
+            buf.extend_from_slice(root_hash.as_bytes());
+        }
+
+        for hash in self.hashes {
+            buf.extend_from_slice(hash.as_bytes());
+        }
+
+        buf
+    }
+}
+
+impl TableDecode for crate::trie::Node {
+    fn decode(v: &[u8]) -> anyhow::Result<Self> {
+        if v.len() < 6 {
+            return Err(TooShort::<6> { got: v.len() }.into());
+        } else if (v.len() - 6) % KECCAK_LENGTH != 0 {
+            bail!("Unaligned length");
+        }
+
+        let state_mask = u16::from_be_bytes(v[0..2].try_into().unwrap());
+        let tree_mask = u16::from_be_bytes(v[2..4].try_into().unwrap());
+        let hash_mask = u16::from_be_bytes(v[4..6].try_into().unwrap());
+        let mut i = 6;
+
+        let mut root_hash = None;
+        if hash_mask.count_ones() as usize + 1 == v[6..].len() / KECCAK_LENGTH {
+            root_hash = Some(H256::from_slice(&v[i..i + KECCAK_LENGTH]));
+            i += KECCAK_LENGTH;
+        }
+
+        let num_hashes = v[i..].len() / KECCAK_LENGTH;
+        let mut hashes = Vec::<H256>::with_capacity(num_hashes);
+        for _ in 0..num_hashes {
+            hashes.push(H256::from_slice(&v[i..i + KECCAK_LENGTH]));
+            i += KECCAK_LENGTH;
+        }
+
+        Ok(crate::trie::Node::new(
+            state_mask, tree_mask, hash_mask, hashes, root_hash,
+        ))
+    }
+}
+
 decl_table!(Account => Address => crate::models::Account);
 decl_table!(Storage => Address => (H256, U256));
 decl_table!(AccountChangeSet => AccountChangeKey => AccountChange);
@@ -753,8 +813,8 @@ decl_table!(HashedStorage => H256 => (H256, U256));
 decl_table!(AccountHistory => BitmapKey<Address> => RoaringTreemap);
 decl_table!(StorageHistory => BitmapKey<(Address, H256)> => RoaringTreemap);
 decl_table!(Code => H256 => Bytes);
-decl_table!(TrieAccount => Vec<u8> => Vec<u8>);
-decl_table!(TrieStorage => Vec<u8> => Vec<u8>);
+decl_table!(TrieAccount => Vec<u8> => crate::trie::Node);
+decl_table!(TrieStorage => Vec<u8> => crate::trie::Node);
 decl_table!(DbInfo => Vec<u8> => Vec<u8>);
 decl_table!(SnapshotInfo => Vec<u8> => Vec<u8>);
 decl_table!(BittorrentInfo => Vec<u8> => Vec<u8>);
@@ -876,5 +936,23 @@ mod tests {
         println!("{}", hex::encode(&encoded));
 
         assert_eq!(Vec::<crate::models::Log>::decode(&encoded).unwrap(), input);
+    }
+
+    #[test]
+    fn trie_node_marshalling() {
+        let n = crate::trie::Node::new(
+            0xf607,
+            0x0005,
+            0x4004,
+            vec![
+                hex!("90d53cd810cc5d4243766cd4451e7b9d14b736a1148b26b3baac7617f617d321").into(),
+                hex!("cc35c964dda53ba6c0b87798073a9628dbc9cd26b5cce88eb69655a9c609caf1").into(),
+            ],
+            Some(hex!("aaaabbbb0006767767776fffffeee44444000005567645600000000eeddddddd").into()),
+        );
+
+        assert_eq!(n.hash_mask.count_ones() as usize, n.hashes.len());
+
+        assert_eq!(crate::trie::Node::decode(&n.clone().encode()).unwrap(), n);
     }
 }

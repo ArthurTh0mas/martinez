@@ -7,6 +7,7 @@ use crate::{
         util::{assert_subset, prefix_length},
     },
 };
+use bytes::BytesMut;
 use ethereum_types::H256;
 use rlp::RlpStream;
 use std::{boxed::Box, cmp};
@@ -51,7 +52,7 @@ fn node_ref(rlp: &[u8]) -> Vec<u8> {
     wrap_hash(&hash)
 }
 
-type NodeCollector<'nc> = Box<dyn FnMut(&[u8], &Node) + Send + Sync + 'nc>;
+type NodeCollector<'nc> = Box<dyn FnMut(&[u8], Node) + Send + Sync + 'nc>;
 
 #[derive(Clone)]
 enum HashBuilderValue {
@@ -68,7 +69,6 @@ pub(crate) struct HashBuilder<'nc> {
     tree_masks: Vec<u16>,
     hash_masks: Vec<u16>,
     stack: Vec<Vec<u8>>,
-    rlp_buffer: Vec<u8>,
 }
 
 impl<'nc> HashBuilder<'nc> {
@@ -82,7 +82,6 @@ impl<'nc> HashBuilder<'nc> {
             tree_masks: vec![],
             hash_masks: vec![],
             stack: vec![],
-            rlp_buffer: vec![],
         }
     }
 
@@ -118,16 +117,16 @@ impl<'nc> HashBuilder<'nc> {
             self.finalize();
         }
 
-        if self.stack.is_empty() {
-            return EMPTY_ROOT;
-        }
-
-        let node_ref = self.stack.last().unwrap();
-        if node_ref.len() == KECCAK_LENGTH + 1 {
-            H256::from_slice(&node_ref[1..])
-        } else {
-            keccak256(node_ref)
-        }
+        self.stack
+            .last()
+            .map(|node_ref| {
+                if node_ref.len() == KECCAK_LENGTH + 1 {
+                    H256::from_slice(&node_ref[1..])
+                } else {
+                    keccak256(node_ref)
+                }
+            })
+            .unwrap_or(EMPTY_ROOT)
     }
 
     fn finalize(&mut self) {
@@ -176,10 +175,8 @@ impl<'nc> HashBuilder<'nc> {
                 let value = self.value.clone();
                 match value {
                     HashBuilderValue::Bytes(ref leaf_value) => {
-                        let x = node_ref(
-                            self.leaf_node_rlp(short_node_key.as_slice(), leaf_value)
-                                .as_slice(),
-                        );
+                        let x =
+                            node_ref(&self.leaf_node_rlp(short_node_key.as_slice(), leaf_value));
                         self.stack.push(x);
                     }
                     HashBuilderValue::Hash(ref hash) => {
@@ -209,8 +206,7 @@ impl<'nc> HashBuilder<'nc> {
 
                 let stack_last = self.stack.pop().unwrap();
                 let new_stack_last = node_ref(
-                    self.extension_node_rlp(short_node_key.as_slice(), stack_last.as_slice())
-                        .as_slice(),
+                    &self.extension_node_rlp(short_node_key.as_slice(), stack_last.as_slice()),
                 );
                 self.stack.push(new_stack_last);
 
@@ -241,18 +237,19 @@ impl<'nc> HashBuilder<'nc> {
                             assert_eq!(child_hashes[i].len(), KECCAK_LENGTH + 1);
                             hashes.push(H256::from_slice(&child_hashes[i][1..]))
                         }
-                        let mut n = Node::new(
+                        let n = Node::new(
                             self.groups[len],
                             self.tree_masks[len],
                             self.hash_masks[len],
                             hashes,
-                            None,
+                            if len == 0 {
+                                Some(self.private_root_hash(false))
+                            } else {
+                                None
+                            },
                         );
-                        if len == 0 {
-                            n.set_root_hash(Some(self.private_root_hash(false)));
-                        }
 
-                        self.node_collector.as_mut().unwrap()(&current[0..len], &n);
+                        self.node_collector.as_mut().unwrap()(&current[0..len], n);
                     }
                 }
             }
@@ -294,33 +291,31 @@ impl<'nc> HashBuilder<'nc> {
         }
         stream.append_empty_data();
 
-        self.rlp_buffer = stream.out().to_vec();
+        let rlp_buffer = stream.out();
         self.stack.truncate(first_child_idx);
-        self.stack.push(node_ref(self.rlp_buffer.as_slice()));
+        self.stack.push(node_ref(&rlp_buffer));
 
         child_hashes
     }
 
-    fn leaf_node_rlp(&mut self, path: &[u8], value: &[u8]) -> Vec<u8> {
+    fn leaf_node_rlp(&mut self, path: &[u8], value: &[u8]) -> BytesMut {
         let encoded_path = encode_path(path, true);
 
         let mut stream = RlpStream::new_list(2);
         stream.append(&encoded_path);
         stream.append(&value);
 
-        self.rlp_buffer = stream.out().to_vec();
-        self.rlp_buffer.clone()
+        stream.out()
     }
 
-    fn extension_node_rlp(&mut self, path: &[u8], child_ref: &[u8]) -> Vec<u8> {
+    fn extension_node_rlp(&mut self, path: &[u8], child_ref: &[u8]) -> BytesMut {
         let encoded_path = encode_path(path, false);
 
         let mut stream = RlpStream::new_list(2);
         stream.append(&encoded_path);
         stream.append_raw(child_ref, 1);
 
-        self.rlp_buffer = stream.out().to_vec();
-        self.rlp_buffer.clone()
+        stream.out()
     }
 }
 

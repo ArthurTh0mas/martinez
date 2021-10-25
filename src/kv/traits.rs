@@ -99,7 +99,7 @@ pub trait MutableTransaction<'db>: Transaction<'db> {
 }
 
 #[async_trait]
-pub trait Cursor<'tx, T>: Send + Debug
+pub trait Cursor<'tx, T>: Send + Sync + Debug
 where
     T: Table,
 {

@@ -9,16 +9,14 @@ use crate::{
     models::*,
     trie::{
         hash_builder::{pack_nibbles, unpack_nibbles, HashBuilder},
-        node::{marshal_node, unmarshal_node, Node},
+        node::Node,
         prefix_set::PrefixSet,
-        util::has_prefix,
     },
 };
 use anyhow::{bail, Result};
 use async_recursion::async_recursion;
 use std::{marker::PhantomData, sync::Mutex};
 use tempfile::TempDir;
-use tokio::sync::Mutex as AsyncMutex;
 
 struct CursorSubNode {
     key: Vec<u8>,
@@ -36,26 +34,35 @@ impl CursorSubNode {
     }
 
     fn state_flag(&self) -> bool {
-        if self.nibble < 0 || self.node.is_none() {
-            return true;
+        if self.nibble >= 0 {
+            if let Some(node) = &self.node {
+                return node.state_mask & (1u16 << self.nibble) != 0;
+            }
         }
-        self.node.as_ref().unwrap().state_mask() & (1u16 << self.nibble) != 0
+
+        true
     }
 
     fn tree_flag(&self) -> bool {
-        if self.nibble < 0 || self.node.is_none() {
-            return true;
+        if self.nibble >= 0 {
+            if let Some(node) = &self.node {
+                return node.tree_mask & (1u16 << self.nibble) != 0;
+            }
         }
-        self.node.as_ref().unwrap().tree_mask() & (1u16 << self.nibble) != 0
+
+        true
     }
 
     fn hash_flag(&self) -> bool {
-        if self.node.is_none() {
-            return false;
-        } else if self.nibble < 0 {
-            return self.node.as_ref().unwrap().root_hash().is_some();
+        if let Some(node) = &self.node {
+            if self.nibble < 0 {
+                node.root_hash.is_some()
+            } else {
+                node.hash_mask & (1u16 << self.nibble) != 0
+            }
+        } else {
+            false
         }
-        self.node.as_ref().unwrap().hash_mask() & (1u16 << self.nibble) != 0
     }
 
     fn hash(&self) -> Option<H256> {
@@ -63,13 +70,15 @@ impl CursorSubNode {
             return None;
         }
 
+        let node = self.node.as_ref().unwrap();
+
         if self.nibble < 0 {
-            return self.node.as_ref().unwrap().root_hash();
+            return node.root_hash;
         }
 
         let first_nibbles_mask = (1u16 << self.nibble) - 1;
-        let hash_idx = (self.node.as_ref().unwrap().hash_mask() & first_nibbles_mask).count_ones();
-        Some(self.node.as_ref().unwrap().hashes()[hash_idx as usize])
+        let hash_idx = (node.hash_mask & first_nibbles_mask).count_ones();
+        Some(node.hashes[hash_idx as usize])
     }
 }
 
@@ -92,11 +101,11 @@ fn increment_key(unpacked: &[u8]) -> Option<Vec<u8>> {
 
 struct Cursor<'cu, 'tx, 'ps, C, T>
 where
-    T: Table<Key = Vec<u8>, SeekKey = Vec<u8>, Value = Vec<u8>>,
+    T: Table<Key = Vec<u8>, SeekKey = Vec<u8>, Value = Node>,
     'tx: 'cu,
     C: MutableCursor<'tx, T>,
 {
-    cursor: AsyncMutex<&'cu mut C>,
+    cursor: &'cu mut C,
     changed: &'ps mut PrefixSet,
     prefix: Vec<u8>,
     stack: Vec<CursorSubNode>,
@@ -106,19 +115,19 @@ where
 
 impl<'cu, 'tx, 'ps, C, T> Cursor<'cu, 'tx, 'ps, C, T>
 where
-    T: Table<Key = Vec<u8>, SeekKey = Vec<u8>, Value = Vec<u8>>,
+    T: Table<Key = Vec<u8>, SeekKey = Vec<u8>, Value = Node>,
     'tx: 'cu,
     C: MutableCursor<'tx, T>,
 {
     async fn new(
         cursor: &'cu mut C,
         changed: &'ps mut PrefixSet,
-        prefix: &[u8],
+        prefix: Vec<u8>,
     ) -> Result<Cursor<'cu, 'tx, 'ps, C, T>> {
         let mut new_cursor = Self {
-            cursor: AsyncMutex::new(cursor),
+            cursor,
             changed,
-            prefix: prefix.to_vec(),
+            prefix,
             stack: vec![],
             can_skip_state: false,
             _marker: PhantomData,
@@ -147,25 +156,15 @@ where
     }
 
     fn key(&self) -> Option<Vec<u8>> {
-        if self.stack.is_empty() {
-            None
-        } else {
-            Some(self.stack.last().unwrap().full_key())
-        }
+        self.stack.last().map(|v| v.full_key())
     }
 
     fn hash(&self) -> Option<H256> {
-        if self.stack.is_empty() {
-            return None;
-        }
-        self.stack.last().unwrap().hash()
+        self.stack.last().and_then(|v| v.hash())
     }
 
     fn children_are_in_trie(&self) -> bool {
-        if self.stack.is_empty() {
-            return false;
-        }
-        self.stack.last().unwrap().tree_flag()
+        self.stack.last().map(|v| v.tree_flag()).unwrap_or(false)
     }
 
     fn can_skip_state(&self) -> bool {
@@ -173,24 +172,23 @@ where
     }
 
     fn first_uncovered_prefix(&self) -> Option<Vec<u8>> {
-        let mut k = self.key();
-
-        if self.can_skip_state && k.is_some() {
-            k = increment_key(&k.unwrap());
-        }
-        if k.is_none() {
-            return None;
-        }
-
-        Some(pack_nibbles(k.as_ref().unwrap()))
+        self.key()
+            .and_then(|k| {
+                if self.can_skip_state {
+                    increment_key(&k)
+                } else {
+                    Some(k)
+                }
+            })
+            .map(|k| pack_nibbles(&k))
     }
 
     async fn consume_node(&mut self, to: &[u8], exact: bool) -> Result<()> {
         let db_key = [self.prefix.as_slice(), to].concat().to_vec();
         let entry = if exact {
-            self.cursor.lock().await.seek_exact(db_key).await?
+            self.cursor.seek_exact(db_key).await?
         } else {
-            self.cursor.lock().await.seek(db_key).await?
+            self.cursor.seek(db_key).await?
         };
 
         if entry.is_none() && !exact {
@@ -201,37 +199,44 @@ where
         let mut key = to.to_vec();
         if !exact {
             key = entry.as_ref().unwrap().0.clone();
-            if !has_prefix(key.as_slice(), self.prefix.as_slice()) {
+
+            if let Some(stripped) = key.strip_prefix(&self.prefix[..]) {
+                key = stripped.to_vec();
+            } else {
                 self.stack.clear();
                 return Ok(());
             }
-            key.drain(0..self.prefix.len());
         }
 
-        let mut node: Option<Node> = None;
-        if entry.is_some() {
-            node = Some(unmarshal_node(entry.as_ref().unwrap().1.as_slice()).unwrap());
-            assert_ne!(node.as_ref().unwrap().state_mask(), 0);
-        }
+        let node = entry.as_ref().map(|(_, n)| {
+            assert_ne!(n.state_mask, 0);
+            n.clone()
+        });
 
         let mut nibble = 0i8;
-        if node.is_none() || node.as_ref().unwrap().root_hash().is_some() {
-            nibble = -1;
-        } else {
-            while node.as_ref().unwrap().state_mask() & (1u16 << nibble) == 0 {
-                nibble += 1;
+        if let Some(node) = &node {
+            if node.root_hash.is_some() {
+                nibble -= 1;
+            } else {
+                while node.state_mask & (1u16 << nibble) == 0 {
+                    nibble += 1;
+                }
             }
+        } else {
+            nibble = -1;
         }
 
-        if !key.is_empty() && !self.stack.is_empty() {
-            self.stack[0].nibble = key[0] as i8;
+        if let Some(&first_key_nibble) = key.first() {
+            if let Some(first_stack_cursor) = self.stack.first_mut() {
+                first_stack_cursor.nibble = first_key_nibble as i8;
+            }
         }
         self.stack.push(CursorSubNode { key, node, nibble });
 
         self.update_skip_state();
 
         if entry.is_some() && (!self.can_skip_state || nibble != -1) {
-            self.cursor.lock().await.delete_current().await?;
+            self.cursor.delete_current().await?;
         }
 
         Ok(())
@@ -242,52 +247,52 @@ where
         &mut self,
         allow_root_to_child_nibble_within_subnode: bool,
     ) -> Result<()> {
-        if self.stack.is_empty() {
-            return Ok(());
-        }
-
-        let sn = self.stack.last().unwrap();
-
-        if sn.nibble >= 15 || (sn.nibble < 0 && !allow_root_to_child_nibble_within_subnode) {
-            self.stack.pop();
-            self.move_to_next_sibling(false).await?;
-            return Ok(());
-        }
-
-        let sn = self.stack.last_mut().unwrap();
-
-        sn.nibble += 1;
-
-        if sn.node.is_none() {
-            let key = self.key().clone();
-            self.consume_node(key.as_ref().unwrap(), false).await?;
-            return Ok(());
-        }
-
-        while sn.nibble < 16 {
-            if sn.state_flag() {
+        if let Some(sn) = self.stack.last_mut() {
+            if sn.nibble >= 15 || (sn.nibble < 0 && !allow_root_to_child_nibble_within_subnode) {
+                self.stack.pop();
+                self.move_to_next_sibling(false).await?;
                 return Ok(());
             }
-            sn.nibble += 1;
-        }
 
-        self.stack.pop();
-        self.move_to_next_sibling(false).await?;
+            let sn = self.stack.last_mut().unwrap();
+
+            sn.nibble += 1;
+
+            if sn.node.is_none() {
+                let key = self.key().clone();
+                self.consume_node(key.as_ref().unwrap(), false).await?;
+                return Ok(());
+            }
+
+            while sn.nibble < 16 {
+                if sn.state_flag() {
+                    return Ok(());
+                }
+                sn.nibble += 1;
+            }
+
+            self.stack.pop();
+            self.move_to_next_sibling(false).await?;
+        }
         Ok(())
     }
 
     fn update_skip_state(&mut self) {
-        if self.key().is_none()
-            || self.changed.contains(
-                [self.prefix.as_slice(), self.key().unwrap().as_slice()]
-                    .concat()
-                    .as_slice(),
-            )
-        {
-            self.can_skip_state = false;
-        } else {
-            self.can_skip_state = self.stack.last().unwrap().hash_flag();
-        }
+        self.can_skip_state = {
+            if let Some(sn) = self.stack.last() {
+                if self.changed.contains(
+                    [self.prefix.as_slice(), sn.full_key().as_slice()]
+                        .concat()
+                        .as_slice(),
+                ) {
+                    false
+                } else {
+                    sn.hash_flag()
+                }
+            } else {
+                false
+            }
+        };
     }
 
     fn changed_mut(&mut self) -> &mut PrefixSet {
@@ -329,15 +334,11 @@ where
             _marker: PhantomData,
         };
 
-        let node_collector = |unpacked_key: &[u8], node: &Node| {
-            if unpacked_key.is_empty() {
-                return;
+        instance.hb.node_collector = Some(Box::new(|unpacked_key: &[u8], node: Node| {
+            if !unpacked_key.is_empty() {
+                account_collector.push(unpacked_key.to_vec(), node);
             }
-
-            account_collector.push(unpacked_key.to_vec(), marshal_node(node));
-        };
-
-        instance.hb.node_collector = Some(Box::new(node_collector));
+        }));
 
         instance
     }
@@ -346,46 +347,44 @@ where
         let mut state = self.txn.cursor(tables::HashedAccount).await?;
         let mut trie_db_cursor = self.txn.mutable_cursor(tables::TrieAccount).await?;
 
-        let mut trie = Cursor::new(&mut trie_db_cursor, changed, &[]).await?;
-        while trie.key().is_some() {
+        let mut trie = Cursor::new(&mut trie_db_cursor, changed, vec![]).await?;
+        while let Some(trie_key) = trie.key() {
             if trie.can_skip_state() {
-                assert!(trie.hash().is_some());
                 self.hb.add_branch_node(
-                    trie.key().unwrap(),
+                    trie_key,
                     trie.hash().as_ref().unwrap(),
                     trie.children_are_in_trie(),
                 );
             }
 
-            let uncovered = trie.first_uncovered_prefix();
-            if uncovered.is_none() {
-                break;
-            }
+            if let Some(uncovered) = trie.first_uncovered_prefix() {
+                trie.next().await?;
 
-            trie.next().await?;
+                let mut seek_key = uncovered;
+                seek_key.resize(32, 0);
 
-            let mut seek_key = uncovered.unwrap().to_vec();
-            seek_key.resize(32, 0);
+                let mut acc = state.seek(H256::from_slice(seek_key.as_slice())).await?;
+                while let Some((account_key, account)) = acc {
+                    let unpacked_key = unpack_nibbles(account_key.as_bytes());
+                    if let Some(trie_key) = trie.key() {
+                        if trie_key < unpacked_key {
+                            break;
+                        }
+                    }
 
-            let mut acc = state.seek(H256::from_slice(seek_key.as_slice())).await?;
-            while acc.is_some() {
-                let unpacked_key = unpack_nibbles(acc.unwrap().0.as_bytes());
-                if trie.key().is_some() && trie.key().unwrap() < unpacked_key {
-                    break;
+                    let storage_root = self
+                        .calculate_storage_root(account_key, trie.changed_mut())
+                        .await?;
+
+                    self.hb.add_leaf(
+                        unpacked_key,
+                        rlp::encode(&account.to_rlp(storage_root)).as_ref(),
+                    );
+
+                    acc = state.next().await?
                 }
-
-                let account = acc.unwrap().1;
-
-                let storage_root = self
-                    .calculate_storage_root(acc.unwrap().0.as_bytes(), trie.changed_mut())
-                    .await?;
-
-                self.hb.add_leaf(
-                    unpacked_key,
-                    rlp::encode(&account.to_rlp(storage_root)).as_ref(),
-                );
-
-                acc = state.next().await?
+            } else {
+                break;
             }
         }
 
@@ -394,57 +393,55 @@ where
 
     async fn calculate_storage_root(
         &self,
-        key_with_inc: &[u8],
+        account_key: H256,
         changed: &mut PrefixSet,
     ) -> Result<H256> {
         let mut state = self.txn.cursor_dup_sort(tables::HashedStorage).await?;
         let mut trie_db_cursor = self.txn.mutable_cursor(tables::TrieStorage).await?;
 
         let mut hb = HashBuilder::new();
-        hb.node_collector = Some(Box::new(|unpacked_storage_key: &[u8], node: &Node| {
-            let key = [key_with_inc, unpacked_storage_key].concat();
-            self.storage_collector
-                .lock()
-                .unwrap()
-                .push(key, marshal_node(node));
+        hb.node_collector = Some(Box::new(|unpacked_storage_key: &[u8], node: Node| {
+            let key = [account_key.as_bytes(), unpacked_storage_key].concat();
+            self.storage_collector.lock().unwrap().push(key, node);
         }));
 
-        let mut trie = Cursor::new(&mut trie_db_cursor, changed, key_with_inc).await?;
-        while trie.key().is_some() {
+        let mut trie = Cursor::new(
+            &mut trie_db_cursor,
+            changed,
+            account_key.as_bytes().to_vec(),
+        )
+        .await?;
+        while let Some(trie_key) = trie.key() {
             if trie.can_skip_state() {
-                assert!(trie.hash().is_some());
                 hb.add_branch_node(
-                    trie.key().unwrap(),
+                    trie_key,
                     trie.hash().as_ref().unwrap(),
                     trie.children_are_in_trie(),
                 );
             }
 
-            let uncovered = trie.first_uncovered_prefix();
-            if uncovered.is_none() {
-                break;
-            }
+            if let Some(uncovered) = trie.first_uncovered_prefix() {
+                trie.next().await?;
 
-            trie.next().await?;
+                let mut seek_key = uncovered;
+                seek_key.resize(32, 0);
 
-            let mut seek_key = uncovered.unwrap().to_vec();
-            seek_key.resize(32, 0);
-
-            let mut storage = state
-                .seek_both_range(
-                    H256::from_slice(key_with_inc),
-                    H256::from_slice(seek_key.as_slice()),
-                )
-                .await?;
-            while storage.is_some() {
-                let (storage_location, value) = storage.unwrap();
-                let unpacked_loc = unpack_nibbles(storage_location.as_bytes());
-                if trie.key().is_some() && trie.key().unwrap() < unpacked_loc {
-                    break;
+                let mut storage = state
+                    .seek_both_range(account_key, H256::from_slice(seek_key.as_slice()))
+                    .await?;
+                while let Some((storage_location, value)) = storage {
+                    let unpacked_loc = unpack_nibbles(storage_location.as_bytes());
+                    if let Some(trie_key) = trie.key() {
+                        if trie_key < unpacked_loc {
+                            break;
+                        }
+                    }
+                    let rlp = rlp::encode(&value);
+                    hb.add_leaf(unpacked_loc, rlp.as_ref());
+                    storage = state.next_dup().await?.map(|(_, v)| v);
                 }
-                let rlp = rlp::encode(&value);
-                hb.add_leaf(unpacked_loc, rlp.as_ref());
-                storage = state.next_dup().await?.map(|(_, v)| v);
+            } else {
+                break;
             }
         }
 
@@ -499,27 +496,20 @@ where
 
     let mut account_changes = txn.cursor_dup_sort(tables::AccountChangeSet).await?;
     let mut data = account_changes.seek(starting_key).await?;
-    while data.is_some() {
-        let address = data.unwrap().1.address;
-        let hashed_address = keccak256(address);
-        out.insert(unpack_nibbles(hashed_address.as_bytes()).as_slice());
+    while let Some((_, account_change)) = data {
+        out.insert(unpack_nibbles(keccak256(account_change.address).as_bytes()));
         data = account_changes.next().await?;
     }
 
     let mut storage_changes = txn.cursor_dup_sort(tables::StorageChangeSet).await?;
     let mut data = storage_changes.seek(starting_key).await?;
-    while data.is_some() {
-        let address = data.as_ref().unwrap().0.address;
-        let location = data.as_ref().unwrap().1.location;
-        let hashed_address = keccak256(address);
-        let hashed_location = keccak256(location);
-
+    while let Some((change_key, storage_change)) = data {
         let hashed_key = [
-            hashed_address.as_bytes(),
-            unpack_nibbles(hashed_location.as_bytes()).as_slice(),
+            keccak256(change_key.address).as_bytes(),
+            unpack_nibbles(keccak256(storage_change.location).as_bytes()).as_slice(),
         ]
         .concat();
-        out.insert(hashed_key.as_slice());
+        out.insert(hashed_key);
         data = storage_changes.next().await?;
     }
 
@@ -562,7 +552,6 @@ mod tests {
     use super::*;
     use crate::{
         kv::{new_mem_database, tables},
-        trie::node::marshal_node,
         u256_to_h256, upsert_hashed_storage_value,
     };
     use hex_literal::hex;
@@ -577,18 +566,18 @@ mod tests {
 
         let key1 = vec![0x1u8];
         let node1 = Node::new(0b1011, 0b1001, 0, vec![], None);
-        trie.upsert(key1, marshal_node(&node1)).await.unwrap();
+        trie.upsert(key1, node1).await.unwrap();
 
         let key2 = vec![0x1u8, 0x0, 0xB];
         let node2 = Node::new(0b1010, 0, 0, vec![], None);
-        trie.upsert(key2, marshal_node(&node2)).await.unwrap();
+        trie.upsert(key2, node2).await.unwrap();
 
         let key3 = vec![0x1u8, 0x3];
         let node3 = Node::new(0b1110, 0, 0, vec![], None);
-        trie.upsert(key3, marshal_node(&node3)).await.unwrap();
+        trie.upsert(key3, node3).await.unwrap();
 
         let mut changed = PrefixSet::new();
-        let mut cursor = Cursor::new(&mut trie, &mut changed, &[]).await.unwrap();
+        let mut cursor = Cursor::new(&mut trie, &mut changed, vec![]).await.unwrap();
 
         assert!(cursor.key().unwrap().is_empty());
 
@@ -626,32 +615,38 @@ mod tests {
         let txn = db.begin_mutable().await.unwrap();
         let mut trie = txn.mutable_cursor(tables::TrieAccount).await.unwrap();
 
-        let key1 = vec![0x4u8];
-        let node1 = Node::new(
-            0b10100,
-            0,
-            0b00100,
-            vec![H256::from(hex!(
-                "0384e6e2c2b33c4eb911a08a7ff57f83dc3eb86d8d0c92ec112f3b416d6685a9"
-            ))],
-            None,
-        );
-        trie.upsert(key1, marshal_node(&node1)).await.unwrap();
+        trie.upsert(
+            vec![0x4u8],
+            Node::new(
+                0b10100,
+                0,
+                0b00100,
+                vec![H256::from(hex!(
+                    "0384e6e2c2b33c4eb911a08a7ff57f83dc3eb86d8d0c92ec112f3b416d6685a9"
+                ))],
+                None,
+            ),
+        )
+        .await
+        .unwrap();
 
-        let key2 = vec![0x6u8];
-        let node2 = Node::new(
-            0b10010,
-            0,
-            0b00010,
-            vec![H256::from(hex!(
-                "7f9a58b00625a6e725559acf327baf88d90e4a5b65a2003acd24f110c0441df1"
-            ))],
-            None,
-        );
-        trie.upsert(key2, marshal_node(&node2)).await.unwrap();
+        trie.upsert(
+            vec![0x6u8],
+            Node::new(
+                0b10010,
+                0,
+                0b00010,
+                vec![H256::from(hex!(
+                    "7f9a58b00625a6e725559acf327baf88d90e4a5b65a2003acd24f110c0441df1"
+                ))],
+                None,
+            ),
+        )
+        .await
+        .unwrap();
 
         let mut changed = PrefixSet::new();
-        let mut cursor = Cursor::new(&mut trie, &mut changed, &[]).await.unwrap();
+        let mut cursor = Cursor::new(&mut trie, &mut changed, vec![]).await.unwrap();
 
         assert!(cursor.key().unwrap().is_empty());
 
@@ -681,60 +676,70 @@ mod tests {
         let prefix_b = vec![0xbu8, 0xb, 0x0, 0x5];
         let prefix_c = vec![0xcu8, 0xc, 0x0, 0x1];
 
-        let node_a = Node::new(
-            0b10100,
-            0,
-            0,
-            vec![],
-            Some(H256::from(hex!(
-                "2e1b81393448317fc1834241119c23f9e1763f7a662f8078949accc35b0d3b13"
-            ))),
-        );
-        trie.upsert(prefix_a.clone(), marshal_node(&node_a))
-            .await
-            .unwrap();
+        trie.upsert(
+            prefix_a.clone(),
+            Node::new(
+                0b10100,
+                0,
+                0,
+                vec![],
+                Some(H256::from(hex!(
+                    "2e1b81393448317fc1834241119c23f9e1763f7a662f8078949accc35b0d3b13"
+                ))),
+            ),
+        )
+        .await
+        .unwrap();
 
-        let node_b1 = Node::new(
-            0b10100,
-            0b00100,
-            0,
-            vec![],
-            Some(H256::from(hex!(
-                "c570b66136e99d07c6c6360769de1d9397805849879dd7c79cf0b8e6694bfb0e"
-            ))),
-        );
-        trie.upsert(prefix_b.clone(), marshal_node(&node_b1))
-            .await
-            .unwrap();
+        trie.upsert(
+            prefix_b.clone(),
+            Node::new(
+                0b10100,
+                0b00100,
+                0,
+                vec![],
+                Some(H256::from(hex!(
+                    "c570b66136e99d07c6c6360769de1d9397805849879dd7c79cf0b8e6694bfb0e"
+                ))),
+            ),
+        )
+        .await
+        .unwrap();
 
-        let node_b2 = Node::new(
-            0b00010,
-            0,
-            0b00010,
-            vec![H256::from(hex!(
-                "6fc81f58df057a25ca6b687a6db54aaa12fbea1baf03aa3db44d499fb8a7af65"
-            ))],
-            None,
-        );
         let mut key_b2 = prefix_b.clone();
         key_b2.push(0x2);
-        trie.upsert(key_b2, marshal_node(&node_b2)).await.unwrap();
+        trie.upsert(
+            key_b2,
+            Node::new(
+                0b00010,
+                0,
+                0b00010,
+                vec![H256::from(hex!(
+                    "6fc81f58df057a25ca6b687a6db54aaa12fbea1baf03aa3db44d499fb8a7af65"
+                ))],
+                None,
+            ),
+        )
+        .await
+        .unwrap();
 
-        let node_c = Node::new(
-            0b11110,
-            0,
-            0,
-            vec![],
-            Some(H256::from(hex!(
-                "0f12bed8e3cc4cce692d234e69a4d79c0e74ab05ecb808dad588212eab788c31"
-            ))),
-        );
-        trie.upsert(prefix_c.clone(), marshal_node(&node_c))
-            .await
-            .unwrap();
+        trie.upsert(
+            prefix_c.clone(),
+            Node::new(
+                0b11110,
+                0,
+                0,
+                vec![],
+                Some(H256::from(hex!(
+                    "0f12bed8e3cc4cce692d234e69a4d79c0e74ab05ecb808dad588212eab788c31"
+                ))),
+            ),
+        )
+        .await
+        .unwrap();
 
         let mut changed = PrefixSet::new();
-        let mut cursor = Cursor::new(&mut trie, &mut changed, prefix_b.as_slice())
+        let mut cursor = Cursor::new(&mut trie, &mut changed, prefix_b.clone())
             .await
             .unwrap();
 
@@ -745,9 +750,9 @@ mod tests {
         assert!(cursor.key().is_none());
 
         let mut changed = PrefixSet::new();
-        changed.insert([prefix_b.as_slice(), &[0xdu8, 0x5]].concat().as_slice());
-        changed.insert([prefix_c.as_slice(), &[0xbu8, 0x8]].concat().as_slice());
-        let mut cursor = Cursor::new(&mut trie, &mut changed, prefix_b.as_slice())
+        changed.insert(vec![prefix_b.clone(), vec![0xdu8, 0x5]].concat());
+        changed.insert(vec![prefix_c.clone(), vec![0xbu8, 0x8]].concat());
+        let mut cursor = Cursor::new(&mut trie, &mut changed, prefix_b)
             .await
             .unwrap();
 
@@ -772,59 +777,72 @@ mod tests {
 
         let mut trie = txn.mutable_cursor(tables::TrieStorage).await.unwrap();
 
-        let prefix_a: [u8; 4] = [0xa, 0xa, 0x0, 0x2];
-        let prefix_b: [u8; 4] = [0xb, 0xb, 0x0, 0x5];
-        let prefix_c: [u8; 4] = [0xc, 0xc, 0x0, 0x1];
+        let prefix_a = vec![0xa, 0xa, 0x0, 0x2];
+        let prefix_b = vec![0xb, 0xb, 0x0, 0x5];
+        let prefix_c = vec![0xc, 0xc, 0x0, 0x1];
 
-        let node_a = Node::new(
-            0b10100,
-            0,
-            0,
-            vec![],
-            Some(hex!("2e1b81393448317fc1834241119c23f9e1763f7a662f8078949accc35b0d3b13").into()),
-        );
-        trie.upsert(prefix_a.to_vec(), marshal_node(&node_a))
-            .await
-            .unwrap();
-
-        let node_b1 = Node::new(
-            0b10100,
-            0b00100,
-            0,
-            vec![],
-            Some(hex!("c570b66136e99d07c6c6360769de1d9397805849879dd7c79cf0b8e6694bfb0e").into()),
-        );
-        let node_b2 = Node::new(
-            0b00010,
-            0,
-            0b00010,
-            vec![hex!("6fc81f58df057a25ca6b687a6db54aaa12fbea1baf03aa3db44d499fb8a7af65").into()],
-            None,
-        );
-        trie.upsert(prefix_b.to_vec(), marshal_node(&node_b1))
-            .await
-            .unwrap();
         trie.upsert(
-            [&prefix_b as &[u8], &([0x2] as [u8; 1]) as &[u8]].concat(),
-            marshal_node(&node_b2),
+            prefix_a.clone(),
+            Node::new(
+                0b10100,
+                0,
+                0,
+                vec![],
+                Some(
+                    hex!("2e1b81393448317fc1834241119c23f9e1763f7a662f8078949accc35b0d3b13").into(),
+                ),
+            ),
         )
         .await
         .unwrap();
 
-        let node_c = Node::new(
-            0b11110,
-            0,
-            0,
-            vec![],
-            Some(hex!("0f12bed8e3cc4cce692d234e69a4d79c0e74ab05ecb808dad588212eab788c31").into()),
-        );
-        trie.upsert(prefix_c.to_vec(), marshal_node(&node_c))
-            .await
-            .unwrap();
+        trie.upsert(
+            prefix_b.clone(),
+            Node::new(
+                0b10100,
+                0b00100,
+                0,
+                vec![],
+                Some(
+                    hex!("c570b66136e99d07c6c6360769de1d9397805849879dd7c79cf0b8e6694bfb0e").into(),
+                ),
+            ),
+        )
+        .await
+        .unwrap();
+        trie.upsert(
+            vec![prefix_b.clone(), vec![0x2]].concat(),
+            Node::new(
+                0b00010,
+                0,
+                0b00010,
+                vec![
+                    hex!("6fc81f58df057a25ca6b687a6db54aaa12fbea1baf03aa3db44d499fb8a7af65").into(),
+                ],
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+
+        trie.upsert(
+            prefix_c.clone(),
+            Node::new(
+                0b11110,
+                0,
+                0,
+                vec![],
+                Some(
+                    hex!("0f12bed8e3cc4cce692d234e69a4d79c0e74ab05ecb808dad588212eab788c31").into(),
+                ),
+            ),
+        )
+        .await
+        .unwrap();
 
         // No changes
         let mut changed = PrefixSet::new();
-        let mut cursor = Cursor::new(&mut trie, &mut changed, &prefix_b)
+        let mut cursor = Cursor::new(&mut trie, &mut changed, prefix_b.clone())
             .await
             .unwrap();
 
@@ -835,9 +853,9 @@ mod tests {
 
         // Some changes
         let mut changed = PrefixSet::new();
-        changed.insert(&[&prefix_b as &[u8], &([0xD, 0x5] as [u8; 2]) as &[u8]].concat());
-        changed.insert(&[&prefix_c as &[u8], &([0xB, 0x8] as [u8; 2]) as &[u8]].concat());
-        let mut cursor = Cursor::new(&mut trie, &mut changed, &prefix_b)
+        changed.insert(vec![prefix_b.clone(), vec![0xD, 0x5]].concat());
+        changed.insert(vec![prefix_c.clone(), vec![0xB, 0x8]].concat());
+        let mut cursor = Cursor::new(&mut trie, &mut changed, prefix_b.clone())
             .await
             .unwrap();
 
@@ -896,17 +914,14 @@ mod tests {
     async fn read_all_nodes<
         'tx,
         C: crate::kv::traits::Cursor<'tx, T>,
-        T: Table<Key = Vec<u8>, Value = Vec<u8>>,
+        T: Table<Key = Vec<u8>, Value = Node>,
     >(
         cursor: &mut C,
     ) -> HashMap<Vec<u8>, Node> {
         walk(cursor, None)
-            .map(|res| {
-                let (k, v) = res.unwrap();
-                (k, unmarshal_node(&v).unwrap())
-            })
-            .collect::<Vec<_>>()
+            .collect::<anyhow::Result<Vec<_>>>()
             .await
+            .unwrap()
             .into_iter()
             .collect()
     }
@@ -1023,21 +1038,21 @@ mod tests {
 
         let node1a = &node_map[&vec![0xB]];
 
-        assert_eq!(node1a.state_mask(), 0b1011);
-        assert_eq!(node1a.tree_mask(), 0b0001);
-        assert_eq!(node1a.hash_mask(), 0b1001);
+        assert_eq!(node1a.state_mask, 0b1011);
+        assert_eq!(node1a.tree_mask, 0b0001);
+        assert_eq!(node1a.hash_mask, 0b1001);
 
-        assert_eq!(node1a.root_hash(), None);
-        assert_eq!(node1a.hashes().len(), 2);
+        assert_eq!(node1a.root_hash, None);
+        assert_eq!(node1a.hashes.len(), 2);
 
         let node2a = &node_map[&vec![0xB, 0x0]];
 
-        assert_eq!(node2a.state_mask(), 0b10001);
-        assert_eq!(node2a.tree_mask(), 0b00000);
-        assert_eq!(node2a.hash_mask(), 0b10000);
+        assert_eq!(node2a.state_mask, 0b10001);
+        assert_eq!(node2a.tree_mask, 0b00000);
+        assert_eq!(node2a.hash_mask, 0b10000);
 
-        assert_eq!(node2a.root_hash(), None);
-        assert_eq!(node2a.hashes().len(), 1);
+        assert_eq!(node2a.root_hash, None);
+        assert_eq!(node2a.hashes.len(), 1);
 
         // ----------------------------------------------------------------
         // Check storage trie
@@ -1050,12 +1065,12 @@ mod tests {
 
         let node3 = &node_map[&key3.0.to_vec()];
 
-        assert_eq!(node3.state_mask(), 0b1010);
-        assert_eq!(node3.tree_mask(), 0b0000);
-        assert_eq!(node3.hash_mask(), 0b0010);
+        assert_eq!(node3.state_mask, 0b1010);
+        assert_eq!(node3.tree_mask, 0b0000);
+        assert_eq!(node3.hash_mask, 0b0010);
 
-        assert_eq!(node3.root_hash(), Some(storage_root));
-        assert_eq!(node3.hashes().len(), 1);
+        assert_eq!(node3.root_hash, Some(storage_root));
+        assert_eq!(node3.hashes.len(), 1);
 
         // ----------------------------------------------------------------
         // Add an account
@@ -1098,15 +1113,15 @@ mod tests {
         assert_eq!(node_map.len(), 2);
 
         let node1b = &node_map[&vec![0xB]];
-        assert_eq!(node1b.state_mask(), 0b1011);
-        assert_eq!(node1b.tree_mask(), 0b0001);
-        assert_eq!(node1b.hash_mask(), 0b1011);
+        assert_eq!(node1b.state_mask, 0b1011);
+        assert_eq!(node1b.tree_mask, 0b0001);
+        assert_eq!(node1b.hash_mask, 0b1011);
 
-        assert_eq!(node1b.root_hash(), None);
+        assert_eq!(node1b.root_hash, None);
 
-        assert_eq!(node1b.hashes().len(), 3);
-        assert_eq!(node1a.hashes()[0], node1b.hashes()[0]);
-        assert_eq!(node1a.hashes()[1], node1b.hashes()[2]);
+        assert_eq!(node1b.hashes.len(), 3);
+        assert_eq!(node1a.hashes[0], node1b.hashes[0]);
+        assert_eq!(node1a.hashes[1], node1b.hashes[2]);
 
         let node2b = &node_map[&vec![0xB, 0x0]];
         assert_eq!(node2a, node2b);
@@ -1147,16 +1162,16 @@ mod tests {
             assert_eq!(node_map.len(), 1);
 
             let node1c = &node_map[&vec![0xB]];
-            assert_eq!(node1c.state_mask(), 0b1011);
-            assert_eq!(node1c.tree_mask(), 0b0000);
-            assert_eq!(node1c.hash_mask(), 0b1011);
+            assert_eq!(node1c.state_mask, 0b1011);
+            assert_eq!(node1c.tree_mask, 0b0000);
+            assert_eq!(node1c.hash_mask, 0b1011);
 
-            assert_eq!(node1c.root_hash(), None);
+            assert_eq!(node1c.root_hash, None);
 
-            assert_eq!(node1c.hashes().len(), 3);
-            assert_ne!(node1b.hashes()[0], node1c.hashes()[0]);
-            assert_eq!(node1b.hashes()[1], node1c.hashes()[1]);
-            assert_eq!(node1b.hashes()[2], node1c.hashes()[2]);
+            assert_eq!(node1c.hashes.len(), 3);
+            assert_ne!(node1b.hashes[0], node1c.hashes[0]);
+            assert_eq!(node1b.hashes[1], node1c.hashes[1]);
+            assert_eq!(node1b.hashes[2], node1c.hashes[2]);
         }
 
         // Delete several accounts
@@ -1188,7 +1203,7 @@ mod tests {
             assert_eq!(
                 read_all_nodes(&mut account_trie).await,
                 hashmap! {
-                    vec![0xB] => Node::new(0b1011, 0b0000, 0b1010, vec![node1b.hashes()[1], node1b.hashes()[2]], None)
+                    vec![0xB] => Node::new(0b1011, 0b0000, 0b1010, vec![node1b.hashes[1], node1b.hashes[2]], None)
                 }
             );
         }
@@ -1244,12 +1259,12 @@ mod tests {
 
         let node2 = &node_map[&vec![0x3, 0x0, 0xA, 0xF]];
 
-        assert_eq!(node2.state_mask(), 0b101100000);
-        assert_eq!(node2.tree_mask(), 0b000000000);
-        assert_eq!(node2.hash_mask(), 0b001000000);
+        assert_eq!(node2.state_mask, 0b101100000);
+        assert_eq!(node2.tree_mask, 0b000000000);
+        assert_eq!(node2.hash_mask, 0b001000000);
 
-        assert_eq!(node2.root_hash(), None);
-        assert_eq!(node2.hashes().len(), 1);
+        assert_eq!(node2.root_hash, None);
+        assert_eq!(node2.hashes.len(), 1);
     }
 
     fn int_to_address(i: u128) -> Address {
