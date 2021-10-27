@@ -1,5 +1,4 @@
 use crate::{kv::tables::VariableVec, models::*, util::*};
-use anyhow::bail;
 use arrayvec::ArrayVec;
 use bytes::{Buf, Bytes};
 use educe::*;
@@ -123,9 +122,6 @@ impl Account {
             enc.advance(KECCAK_LENGTH);
         }
 
-        if enc.len() > 32 {
-            bail!("balance cannot be longer than 32 bytes")
-        }
         a.balance = U256::from_be_bytes(static_left_pad(enc));
 
         Ok(Some(a))

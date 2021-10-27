@@ -2,7 +2,7 @@ pub mod stage;
 pub mod stages;
 
 use self::stage::{Stage, StageInput, UnwindInput};
-use crate::{kv::traits::*, models::BlockNumber, stagedsync::stage::*};
+use crate::{kv::traits::*, stagedsync::stage::ExecOutput};
 use std::time::{Duration, Instant};
 use tracing::*;
 
@@ -21,9 +21,6 @@ use tracing::*;
 pub struct StagedSync<'db, DB: MutableKV> {
     stages: Vec<Box<dyn Stage<'db, DB::MutableTx<'db>>>>,
     min_progress_to_commit_after_stage: u64,
-    max_block: Option<BlockNumber>,
-    exit_after_sync: bool,
-    delay_after_sync: Option<Duration>,
 }
 
 impl<'db, DB: MutableKV> Default for StagedSync<'db, DB> {
@@ -37,9 +34,6 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
         Self {
             stages: Vec::new(),
             min_progress_to_commit_after_stage: 0,
-            max_block: None,
-            exit_after_sync: false,
-            delay_after_sync: None,
         }
     }
 
@@ -55,26 +49,11 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
         self
     }
 
-    pub fn set_max_block(&mut self, v: Option<BlockNumber>) -> &mut Self {
-        self.max_block = v;
-        self
-    }
-
-    pub fn set_exit_after_sync(&mut self, v: bool) -> &mut Self {
-        self.exit_after_sync = v;
-        self
-    }
-
-    pub fn set_delay_after_sync(&mut self, v: Option<Duration>) -> &mut Self {
-        self.delay_after_sync = v;
-        self
-    }
-
     /// Run staged sync loop.
     /// Invokes each loaded stage, and does unwinds if necessary.
     ///
     /// NOTE: it should never return, except if the loop or any stage fails with error.
-    pub async fn run(&mut self, db: &'db DB) -> anyhow::Result<()> {
+    pub async fn run(&mut self, db: &'db DB) -> anyhow::Result<!> {
         let num_stages = self.stages.len();
 
         let mut unwind_to = None;
@@ -142,8 +121,6 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
 
                 let mut previous_stage = None;
                 let mut timings = vec![];
-
-                let mut minimum_progress = None;
 
                 // Execute each stage in direct order.
                 for (stage_index, stage) in self.stages.iter_mut().enumerate() {
@@ -247,12 +224,6 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                             } => {
                                 stage_id.save_progress(&tx, stage_progress).await?;
 
-                                if let Some(m) = &mut minimum_progress {
-                                    *m = std::cmp::min(*m, stage_progress);
-                                } else {
-                                    minimum_progress = Some(stage_progress);
-                                }
-
                                 // Check if we should commit now.
                                 if stage_progress
                                     .saturating_sub(start_progress.map(|v| v.0).unwrap_or(0))
@@ -294,18 +265,6 @@ impl<'db, DB: MutableKV> StagedSync<'db, DB> {
                         format!("{} {}={}", acc, stage_id, format_duration(time, true))
                     });
                 info!("Staged sync complete.{}", t);
-
-                if let Some(minimum_progress) = minimum_progress {
-                    if let Some(max_block) = self.max_block {
-                        if minimum_progress == max_block {
-                            return Ok(());
-                        }
-                    }
-                }
-
-                if let Some(delay_after_sync) = self.delay_after_sync {
-                    tokio::time::sleep(delay_after_sync).await
-                }
             }
         }
     }

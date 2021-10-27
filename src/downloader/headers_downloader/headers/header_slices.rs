@@ -28,6 +28,8 @@ pub enum HeaderSliceStatus {
     Invalid,
     // linking to the canonical chain failed, a potential fork
     Fork,
+    // request refetching to try linking an alternative slice
+    Refetch,
     // saved in the database
     Saved,
 }
@@ -522,6 +524,7 @@ impl From<HeaderSliceStatus> for char {
             HeaderSliceStatus::Verified => '#',
             HeaderSliceStatus::Invalid => 'x',
             HeaderSliceStatus::Fork => 'Y',
+            HeaderSliceStatus::Refetch => 'R',
             HeaderSliceStatus::Saved => '+',
         }
     }
@@ -539,6 +542,7 @@ impl TryFrom<char> for HeaderSliceStatus {
             '#' => Ok(HeaderSliceStatus::Verified),
             'x' => Ok(HeaderSliceStatus::Invalid),
             'Y' => Ok(HeaderSliceStatus::Fork),
+            'R' => Ok(HeaderSliceStatus::Refetch),
             '+' => Ok(HeaderSliceStatus::Saved),
             _ => Err(anyhow::format_err!(
                 "unrecognized status code '{:?}'",

@@ -1,3 +1,4 @@
+use crate::trie::util::has_prefix;
 use std::collections::BTreeSet;
 
 #[derive(Clone)]
@@ -12,12 +13,12 @@ impl PrefixSet {
         self.0
             .range(prefix.to_vec()..)
             .next()
-            .map(|s| s.starts_with(prefix))
+            .map(|s| has_prefix(s, prefix))
             .unwrap_or(false)
     }
 
-    pub(crate) fn insert(&mut self, key: Vec<u8>) {
-        self.0.insert(key);
+    pub(crate) fn insert(&mut self, key: &[u8]) {
+        self.0.insert(key.to_vec());
     }
 }
 
@@ -31,10 +32,10 @@ mod tests {
         assert!(!ps.contains(b""));
         assert!(!ps.contains(b"a"));
 
-        ps.insert(b"abc".to_vec());
-        ps.insert(b"fg".to_vec());
-        ps.insert(b"abc".to_vec()); // duplicate
-        ps.insert(b"ab".to_vec());
+        ps.insert(b"abc");
+        ps.insert(b"fg");
+        ps.insert(b"abc"); // duplicate
+        ps.insert(b"ab");
 
         assert!(ps.contains(b""));
         assert!(ps.contains(b"a"));
