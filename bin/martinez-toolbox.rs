@@ -137,6 +137,7 @@ async fn blockhashes(data_dir: MartinezDataDir) -> anyhow::Result<()> {
         temp_dir: etl_temp_dir.clone(),
     });
     staged_sync.run(&env).await?;
+    Ok(())
 }
 
 #[allow(unreachable_code)]
@@ -172,7 +173,9 @@ async fn header_download(data_dir: MartinezDataDir, opts: HeaderDownloadOpts) ->
     staged_sync.push(stage);
     staged_sync.run(&db).await?;
 
-    sentry.write().await.stop().await
+    let _ = sentry.write().await.stop().await;
+
+    Ok(())
 }
 
 fn open_db(
