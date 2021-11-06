@@ -28,7 +28,6 @@ pub struct Execution {
     pub exit_after_batch: bool,
     pub batch_until: Option<BlockNumber>,
     pub commit_every: Option<Duration>,
-    pub prune_from: BlockNumber,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -42,9 +41,8 @@ async fn execute_batch_of_blocks<'db, Tx: MutableTransaction<'db>>(
     commit_every: Option<Duration>,
     starting_block: BlockNumber,
     first_started_at: (Instant, Option<BlockNumber>),
-    prune_from: BlockNumber,
 ) -> anyhow::Result<BlockNumber> {
-    let mut buffer = Buffer::new(tx, prune_from, None);
+    let mut buffer = Buffer::new(tx, None);
     let mut consensus_engine = engine_factory(chain_config.clone())?;
     let mut analysis_cache = AnalysisCache::default();
 
@@ -223,7 +221,6 @@ impl<'db, RwTx: MutableTransaction<'db>> Stage<'db, RwTx> for Execution {
                 self.commit_every,
                 starting_block,
                 input.first_started_at,
-                self.prune_from,
             )
             .await?;
 

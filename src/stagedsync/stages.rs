@@ -60,4 +60,21 @@ impl StageId {
     ) -> anyhow::Result<()> {
         tx.set(tables::SyncStage, *self, block).await
     }
+
+    #[instrument]
+    pub async fn get_prune_progress<'db, Tx: Transaction<'db>>(
+        &self,
+        tx: &Tx,
+    ) -> anyhow::Result<Option<BlockNumber>> {
+        tx.get(tables::PruneProgress, *self).await
+    }
+
+    #[instrument]
+    pub async fn save_prune_progress<'db, RwTx: MutableTransaction<'db>>(
+        &self,
+        tx: &RwTx,
+        block: BlockNumber,
+    ) -> anyhow::Result<()> {
+        tx.set(tables::PruneProgress, *self, block).await
+    }
 }

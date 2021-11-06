@@ -72,7 +72,7 @@ where
         return Ok(false);
     }
 
-    let mut state_buffer = Buffer::new(txn, genesis, None);
+    let mut state_buffer = Buffer::new(txn, None);
     state_buffer.begin_block(genesis);
     // Allocate accounts
     if let Some(balances) = chainspec.balances.get(&genesis) {

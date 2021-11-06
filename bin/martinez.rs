@@ -60,6 +60,10 @@ pub struct Opt {
     #[clap(long)]
     pub max_block: Option<BlockNumber>,
 
+    /// Turn on pruning.
+    #[clap(long)]
+    pub prune: bool,
+
     /// Use incremental staged sync.
     #[clap(long)]
     pub increment: Option<u64>,
@@ -498,6 +502,62 @@ where
             stage_progress: input.unwind_to,
         })
     }
+
+    async fn prune<'tx>(&mut self, tx: &'tx mut RwTx, input: PruningInput) -> anyhow::Result<()>
+    where
+        'db: 'tx,
+    {
+        let mut block_body_cur = tx.mutable_cursor(tables::BlockBody).await?;
+        let mut block_tx_cur = tx.mutable_cursor(tables::BlockTransaction).await?;
+
+        let mut first = true;
+        while let Some(((block_num, _), body)) = if first {
+            first = false;
+            if let Some(prune_progress) = input.prune_progress {
+                block_body_cur.seek(prune_progress).await?
+            } else {
+                block_body_cur.first().await?
+            }
+        } else {
+            block_body_cur.next().await?
+        } {
+            if block_num >= input.prune_to {
+                break;
+            }
+
+            block_body_cur.delete_current().await?;
+
+            if body.tx_amount > 0 {
+                for i in 0..body.tx_amount {
+                    if i == 0 {
+                        block_tx_cur
+                            .seek_exact(body.base_tx_id)
+                            .await?
+                            .ok_or_else(|| {
+                                format_err!(
+                                    "tx with base id {} not found for block {}",
+                                    body.base_tx_id,
+                                    block_num
+                                )
+                            })?;
+                    } else {
+                        block_tx_cur.next().await?.ok_or_else(|| {
+                            format_err!(
+                                "tx with id base {}+{} not found for block {}",
+                                body.base_tx_id,
+                                i,
+                                block_num
+                            )
+                        })?;
+                    }
+
+                    block_tx_cur.delete_current().await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -627,6 +687,9 @@ fn main() -> anyhow::Result<()> {
                 // staged sync setup
                 let mut staged_sync = stagedsync::StagedSync::new();
                 staged_sync.set_min_progress_to_commit_after_stage(1024);
+                if opt.prune {
+                    staged_sync.set_pruning_interval(90_000);
+                }
                 staged_sync.set_max_block(opt.max_block);
                 staged_sync.set_exit_after_sync(opt.exit_after_sync);
                 staged_sync.set_delay_after_sync(Some(Duration::from_millis(opt.delay_after_sync)));
@@ -634,7 +697,13 @@ fn main() -> anyhow::Result<()> {
                     staged_sync.push(ConvertHeaders {
                         db: erigon_db,
                         max_block: opt.max_block,
-                        exit_after_progress: opt.increment,
+                        exit_after_progress: opt.increment.or_else(|| {
+                            if opt.prune {
+                                Some(90_000)
+                            } else {
+                                None
+                            }
+                        }),
                     });
                 } else {
                     // sentry setup
@@ -676,7 +745,6 @@ fn main() -> anyhow::Result<()> {
                     exit_after_batch: opt.execution_exit_after_batch,
                     batch_until: None,
                     commit_every: None,
-                    prune_from: BlockNumber(0),
                 });
                 if !opt.skip_commitment {
                     staged_sync.push(HashState::new(etl_temp_dir.clone(), None));
