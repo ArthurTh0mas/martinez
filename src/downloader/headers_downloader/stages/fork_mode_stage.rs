@@ -220,16 +220,14 @@ impl ForkModeStage {
 
     fn refetch_canonical_slice(&self, slice: &mut HeaderSlice) {
         self.header_slices
-            .set_slice_status(slice, HeaderSliceStatus::Empty);
+            .set_slice_status(slice, HeaderSliceStatus::Refetch);
         slice.headers = None;
-        slice.refetch_attempt += 1;
     }
 
     fn refetch_fork_slice(&self, slice: &mut HeaderSlice) {
         self.fork_header_slices
-            .set_slice_status(slice, HeaderSliceStatus::Empty);
+            .set_slice_status(slice, HeaderSliceStatus::Refetch);
         slice.headers = None;
-        slice.refetch_attempt += 1;
     }
 
     fn try_extend_canonical(&mut self, continuation_slice_lock: Arc<RwLock<HeaderSlice>>) -> bool {
