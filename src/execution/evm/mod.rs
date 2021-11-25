@@ -1,6 +1,6 @@
 use bytes::Bytes;
 pub use common::{
-    CallKind, CreateMessage, InterpreterMessage, Output, StatusCode, SuccessfulOutput,
+    CallKind, CreateMessage, Message, Output, Revision, StatusCode, SuccessfulOutput,
 };
 pub use host::Host;
 pub use interpreter::AnalyzedCode;

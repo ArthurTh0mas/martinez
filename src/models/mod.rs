@@ -5,12 +5,10 @@ mod chainspec;
 mod header;
 mod log;
 mod receipt;
-mod revision;
 mod transaction;
 
 pub use self::{
-    account::*, block::*, bloom::*, chainspec::*, header::*, log::*, receipt::*, revision::*,
-    transaction::*,
+    account::*, block::*, bloom::*, chainspec::*, header::*, log::*, receipt::*, transaction::*,
 };
 
 use derive_more::*;

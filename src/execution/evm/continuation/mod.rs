@@ -16,6 +16,10 @@ use std::{
     pin::Pin,
 };
 
+mod sealed {
+    pub trait Sealed {}
+}
+
 /// Interrupts.
 pub mod interrupt;
 /// Data attached to interrupts.
@@ -23,109 +27,74 @@ pub mod interrupt_data;
 /// Data required for resume.
 pub mod resume_data;
 
-pub(crate) type InnerCoroutine = Pin<
-    Box<
-        dyn Generator<
-                ResumeData,
-                Yield = InterruptData,
-                Return = Result<SuccessfulOutput, StatusCode>,
-            > + Send
-            + Sync,
-    >,
+/// Paused EVM with full state inside.
+pub trait Interrupt: sealed::Sealed {
+    /// Data required to resume execution.
+    type ResumeData;
+
+    /// Resume execution until the next interrupt.
+    fn resume(self, resume_data: Self::ResumeData) -> InterruptVariant;
+}
+
+pub(crate) type InnerCoroutine = Box<
+    dyn Generator<
+            ResumeDataVariant,
+            Yield = InterruptDataVariant,
+            Return = Result<SuccessfulOutput, StatusCode>,
+        > + Send
+        + Sync
+        + Unpin,
 >;
 
-fn resume_interrupt(mut inner: InnerCoroutine, resume_data: ResumeData) -> Interrupt {
-    match inner.as_mut().resume(resume_data) {
+fn resume_interrupt(mut inner: InnerCoroutine, resume_data: ResumeDataVariant) -> InterruptVariant {
+    match Pin::new(&mut *inner).resume(resume_data) {
         GeneratorState::Yielded(interrupt) => match interrupt {
-            InterruptData::InstructionStart { pc, opcode, state } => Interrupt::InstructionStart {
-                interrupt: InstructionStartInterrupt { inner },
-                pc,
-                opcode,
-                state,
-            },
-            InterruptData::AccountExists { address } => Interrupt::AccountExists {
-                interrupt: AccountExistsInterrupt { inner },
-                address,
-            },
-            InterruptData::GetStorage { address, location } => Interrupt::GetStorage {
-                interrupt: GetStorageInterrupt { inner },
-                address,
-                location,
-            },
-            InterruptData::SetStorage {
-                address,
-                location,
-                value,
-            } => Interrupt::SetStorage {
-                interrupt: SetStorageInterrupt { inner },
-                address,
-                location,
-                value,
-            },
-            InterruptData::GetBalance { address } => Interrupt::GetBalance {
-                interrupt: GetBalanceInterrupt { inner },
-                address,
-            },
-            InterruptData::GetCodeSize { address } => Interrupt::GetCodeSize {
-                interrupt: GetCodeSizeInterrupt { inner },
-                address,
-            },
-            InterruptData::GetCodeHash { address } => Interrupt::GetCodeHash {
-                interrupt: GetCodeHashInterrupt { inner },
-                address,
-            },
-            InterruptData::CopyCode {
-                address,
-                offset,
-                max_size,
-            } => Interrupt::CopyCode {
-                interrupt: CopyCodeInterrupt { inner },
-                address,
-                offset,
-                max_size,
-            },
-            InterruptData::Selfdestruct {
-                address,
-                beneficiary,
-            } => Interrupt::Selfdestruct {
-                interrupt: SelfdestructInterrupt { inner },
-                address,
-                beneficiary,
-            },
-            InterruptData::Call(call_data) => Interrupt::Call {
-                interrupt: CallInterrupt { inner },
-                call_data,
-            },
-            InterruptData::GetTxContext => Interrupt::GetTxContext {
-                interrupt: GetTxContextInterrupt { inner },
-            },
-            InterruptData::GetBlockHash { block_number } => Interrupt::GetBlockHash {
-                interrupt: GetBlockHashInterrupt { inner },
-                block_number,
-            },
-            InterruptData::EmitLog {
-                address,
-                data,
-                topics,
-            } => Interrupt::EmitLog {
-                interrupt: EmitLogInterrupt { inner },
-                address,
-                data,
-                topics,
-            },
-            InterruptData::AccessAccount { address } => Interrupt::AccessAccount {
-                interrupt: AccessAccountInterrupt { inner },
-                address,
-            },
-            InterruptData::AccessStorage { address, location } => Interrupt::AccessStorage {
-                interrupt: AccessStorageInterrupt { inner },
-                address,
-                location,
-            },
+            InterruptDataVariant::InstructionStart(data) => {
+                InterruptVariant::InstructionStart(data, InstructionStartInterrupt { inner })
+            }
+            InterruptDataVariant::AccountExists(data) => {
+                InterruptVariant::AccountExists(data, AccountExistsInterrupt { inner })
+            }
+            InterruptDataVariant::GetStorage(data) => {
+                InterruptVariant::GetStorage(data, GetStorageInterrupt { inner })
+            }
+            InterruptDataVariant::SetStorage(data) => {
+                InterruptVariant::SetStorage(data, SetStorageInterrupt { inner })
+            }
+            InterruptDataVariant::GetBalance(data) => {
+                InterruptVariant::GetBalance(data, GetBalanceInterrupt { inner })
+            }
+            InterruptDataVariant::GetCodeSize(data) => {
+                InterruptVariant::GetCodeSize(data, GetCodeSizeInterrupt { inner })
+            }
+            InterruptDataVariant::GetCodeHash(data) => {
+                InterruptVariant::GetCodeHash(data, GetCodeHashInterrupt { inner })
+            }
+            InterruptDataVariant::CopyCode(data) => {
+                InterruptVariant::CopyCode(data, CopyCodeInterrupt { inner })
+            }
+            InterruptDataVariant::Selfdestruct(data) => {
+                InterruptVariant::Selfdestruct(data, SelfdestructInterrupt { inner })
+            }
+            InterruptDataVariant::Call(data) => {
+                InterruptVariant::Call(data, CallInterrupt { inner })
+            }
+            InterruptDataVariant::GetTxContext => {
+                InterruptVariant::GetTxContext(GetTxContextInterrupt { inner })
+            }
+            InterruptDataVariant::GetBlockHash(data) => {
+                InterruptVariant::GetBlockHash(data, GetBlockHashInterrupt { inner })
+            }
+            InterruptDataVariant::EmitLog(data) => {
+                InterruptVariant::EmitLog(data, EmitLogInterrupt { inner })
+            }
+            InterruptDataVariant::AccessAccount(data) => {
+                InterruptVariant::AccessAccount(data, AccessAccountInterrupt { inner })
+            }
+            InterruptDataVariant::AccessStorage(data) => {
+                InterruptVariant::AccessStorage(data, AccessStorageInterrupt { inner })
+            }
         },
-        GeneratorState::Complete(result) => Interrupt::Complete {
-            interrupt: ExecutionComplete(inner),
-            result,
-        },
+        GeneratorState::Complete(res) => InterruptVariant::Complete(res, ExecutionComplete(inner)),
     }
 }

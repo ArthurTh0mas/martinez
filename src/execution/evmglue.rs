@@ -1,15 +1,16 @@
 use super::{
     address::*,
     analysis_cache::AnalysisCache,
+    evm::AnalyzedCode,
     precompiled,
     tracer::{CodeKind, MessageKind, Tracer},
 };
 use crate::{
     chain::protocol_param::{fee, param},
     execution::evm::{
-        continuation::{interrupt::*, interrupt_data::*, resume_data::*},
+        continuation::{interrupt::*, interrupt_data::*, resume_data::*, Interrupt},
         host::*,
-        AnalyzedCode, CallKind, CreateMessage, InterpreterMessage, Output, StatusCode,
+        CallKind, CreateMessage, Message as EvmMessage, Output, Revision, StatusCode,
     },
     h256_to_u256,
     models::*,
@@ -63,7 +64,7 @@ pub async fn execute<B: State>(
     };
 
     let res = if let TransactionAction::Call(to) = txn.action() {
-        evm.call(InterpreterMessage {
+        evm.call(EvmMessage {
             kind: CallKind::Call,
             is_static: false,
             depth: 0,
@@ -165,7 +166,7 @@ where
             .await?;
         self.state.add_to_balance(contract_addr, value).await?;
 
-        let deploy_message = InterpreterMessage {
+        let deploy_message = EvmMessage {
             kind: CallKind::Call,
             is_static: false,
             depth: message.depth,
@@ -177,7 +178,9 @@ where
             value: message.endowment,
         };
 
-        res = self.execute(deploy_message, message.initcode, None).await?;
+        res = self
+            .execute(deploy_message, message.initcode.as_ref().to_vec(), None)
+            .await?;
 
         if res.status_code == StatusCode::Success {
             let code_len = res.output_data.len();
@@ -217,7 +220,7 @@ where
     }
 
     #[async_recursion]
-    async fn call(&mut self, message: InterpreterMessage) -> anyhow::Result<Output> {
+    async fn call(&mut self, message: EvmMessage) -> anyhow::Result<Output> {
         let mut res = Output {
             status_code: StatusCode::Success,
             gas_left: message.gas,
@@ -320,7 +323,9 @@ where
 
             let code_hash = self.state.get_code_hash(message.code_address).await?;
 
-            res = self.execute(message, code, Some(code_hash)).await?;
+            res = self
+                .execute(message, code.as_ref().to_vec(), Some(code_hash))
+                .await?;
         }
 
         if res.status_code != StatusCode::Success {
@@ -335,8 +340,8 @@ where
 
     async fn execute(
         &mut self,
-        msg: InterpreterMessage,
-        code: Bytes,
+        msg: EvmMessage,
+        code: Vec<u8>,
         code_hash: Option<H256>,
     ) -> anyhow::Result<Output> {
         let a;
@@ -344,12 +349,12 @@ where
             if let Some(cache) = self.analysis_cache.get(code_hash) {
                 cache
             } else {
-                let analysis = AnalyzedCode::analyze(&code);
+                let analysis = AnalyzedCode::analyze(code);
                 self.analysis_cache.put(code_hash, analysis);
                 self.analysis_cache.get(code_hash).unwrap()
             }
         } else {
-            a = AnalyzedCode::analyze(&code);
+            a = AnalyzedCode::analyze(code);
             &a
         };
 
@@ -359,50 +364,52 @@ where
 
         let output = loop {
             interrupt = match interrupt {
-                Interrupt::InstructionStart { .. } => unreachable!("tracing is disabled"),
-                Interrupt::AccountExists { interrupt, address } => {
+                InterruptVariant::InstructionStart(_, _) => unreachable!("tracing is disabled"),
+                InterruptVariant::AccountExists(data, i) => {
+                    let address = data.address;
                     let exists = if self.block_spec.revision >= Revision::Spurious {
                         !self.state.is_dead(address).await?
                     } else {
                         self.state.exists(address).await?
                     };
-                    interrupt.resume(AccountExistsStatus { exists })
+                    i.resume(AccountExistsStatus { exists })
                 }
-                Interrupt::GetBalance { interrupt, address } => {
-                    let balance = self.state.get_balance(address).await?;
-                    interrupt.resume(Balance { balance })
+                InterruptVariant::GetBalance(data, i) => {
+                    let balance = self.state.get_balance(data.address).await?;
+                    i.resume(Balance { balance })
                 }
-                Interrupt::GetCodeSize { interrupt, address } => {
+                InterruptVariant::GetCodeSize(data, i) => {
                     let code_size = u64::try_from(
                         self.state
-                            .get_code(address)
+                            .get_code(data.address)
                             .await?
                             .map(|c| c.len())
                             .unwrap_or(0),
                     )?
                     .into();
-                    interrupt.resume(CodeSize { code_size })
+                    i.resume(CodeSize { code_size })
                 }
-                Interrupt::GetStorage {
-                    interrupt,
-                    address,
-                    location,
-                } => {
-                    let value = self.state.get_current_storage(address, location).await?;
-                    interrupt.resume(StorageValue { value })
+                InterruptVariant::GetStorage(data, i) => {
+                    let value = self
+                        .state
+                        .get_current_storage(data.address, data.key)
+                        .await?;
+                    i.resume(StorageValue { value })
                 }
-                Interrupt::SetStorage {
-                    interrupt,
-                    address,
-                    location,
-                    value: new_val,
-                } => {
-                    let current_val = self.state.get_current_storage(address, location).await?;
+                InterruptVariant::SetStorage(
+                    SetStorage {
+                        address,
+                        key,
+                        value: new_val,
+                    },
+                    i,
+                ) => {
+                    let current_val = self.state.get_current_storage(address, key).await?;
 
                     let status = if current_val == new_val {
                         StorageStatus::Unchanged
                     } else {
-                        self.state.set_storage(address, location, new_val).await?;
+                        self.state.set_storage(address, key, new_val).await?;
 
                         let eip1283 = self.block_spec.revision >= Revision::Istanbul
                             || self.block_spec.revision == Revision::Constantinople;
@@ -434,7 +441,7 @@ where
 
                             // https://eips.ethereum.org/EIPS/eip-1283
                             let original_val =
-                                self.state.get_original_storage(address, location).await?;
+                                self.state.get_original_storage(address, key).await?;
 
                             // https://eips.ethereum.org/EIPS/eip-3529
                             let sstore_clears_refund =
@@ -478,9 +485,10 @@ where
                         }
                     };
 
-                    interrupt.resume(StorageStatusInfo { status })
+                    i.resume(StorageStatusInfo { status })
                 }
-                Interrupt::GetCodeHash { interrupt, address } => {
+                InterruptVariant::GetCodeHash(data, i) => {
+                    let address = data.address;
                     let hash = h256_to_u256({
                         if self.state.is_dead(address).await? {
                             H256::zero()
@@ -488,14 +496,16 @@ where
                             self.state.get_code_hash(address).await?
                         }
                     });
-                    interrupt.resume(CodeHash { hash })
+                    i.resume(CodeHash { hash })
                 }
-                Interrupt::CopyCode {
-                    interrupt,
-                    address,
-                    offset,
-                    max_size,
-                } => {
+                InterruptVariant::CopyCode(
+                    CopyCode {
+                        address,
+                        offset,
+                        max_size,
+                    },
+                    i,
+                ) => {
                     let mut buffer = vec![0; max_size];
 
                     let code = self.state.get_code(address).await?.unwrap_or_default();
@@ -509,29 +519,22 @@ where
                     buffer.truncate(copied);
                     let code = buffer.into();
 
-                    interrupt.resume(Code { code })
+                    i.resume(Code { code })
                 }
-                Interrupt::Selfdestruct {
-                    interrupt,
-                    address,
-                    beneficiary,
-                } => {
-                    self.state.record_selfdestruct(address);
-                    let balance = self.state.get_balance(address).await?;
-                    self.state.add_to_balance(beneficiary, balance).await?;
-                    self.state.set_balance(address, 0).await?;
+                InterruptVariant::Selfdestruct(data, i) => {
+                    self.state.record_selfdestruct(data.address);
+                    let balance = self.state.get_balance(data.address).await?;
+                    self.state.add_to_balance(data.beneficiary, balance).await?;
+                    self.state.set_balance(data.address, 0).await?;
 
                     if let Some(tracer) = &mut self.tracer {
-                        tracer.capture_self_destruct(address, beneficiary);
+                        tracer.capture_self_destruct(data.address, data.beneficiary);
                     }
 
-                    interrupt.resume(())
+                    i.resume(())
                 }
-                Interrupt::Call {
-                    interrupt,
-                    call_data,
-                } => {
-                    let output = match call_data {
+                InterruptVariant::Call(data, i) => {
+                    let output = match data {
                         Call::Create(message) => {
                             let mut res = self.create(message).await?;
 
@@ -546,9 +549,9 @@ where
                         Call::Call(message) => self.call(message).await?,
                     };
 
-                    interrupt.resume(CallOutput { output })
+                    i.resume(CallOutput { output })
                 }
-                Interrupt::GetTxContext { interrupt } => {
+                InterruptVariant::GetTxContext(i) => {
                     let base_fee_per_gas = self.header.base_fee_per_gas.unwrap_or(U256::ZERO);
                     let tx_gas_price = self.txn.effective_gas_price(base_fee_per_gas);
                     let tx_origin = self.txn.sender;
@@ -572,14 +575,13 @@ where
                         block_base_fee,
                     };
 
-                    interrupt.resume(TxContextData { context })
+                    i.resume(TxContextData { context })
                 }
-                Interrupt::GetBlockHash {
-                    interrupt,
-                    block_number,
-                } => {
+                InterruptVariant::GetBlockHash(data, i) => {
+                    let n = data.block_number;
+
                     let base_number = self.header.number;
-                    let distance = base_number.0 - block_number;
+                    let distance = base_number.0 - n;
                     assert!(distance <= 256);
 
                     let mut hash = self.header.parent_hash;
@@ -595,40 +597,33 @@ where
                     }
 
                     let hash = h256_to_u256(hash);
-                    interrupt.resume(BlockHash { hash })
+                    i.resume(BlockHash { hash })
                 }
-                Interrupt::EmitLog {
-                    interrupt,
-                    address,
-                    topics,
-                    data,
-                } => {
+                InterruptVariant::EmitLog(data, i) => {
                     self.state.add_log(Log {
-                        address,
-                        topics: topics.into_iter().map(u256_to_h256).collect(),
-                        data,
+                        address: data.address,
+                        topics: data.topics.into_iter().map(u256_to_h256).collect(),
+                        data: data.data,
                     });
 
-                    interrupt.resume(())
+                    i.resume(())
                 }
-                Interrupt::AccessAccount { interrupt, address } => {
+                InterruptVariant::AccessAccount(data, i) => {
+                    let address = data.address;
+
                     let status = if self.is_precompiled(address) {
                         AccessStatus::Warm
                     } else {
                         self.state.access_account(address)
                     };
-                    interrupt.resume(AccessAccountStatus { status })
+                    i.resume(AccessAccountStatus { status })
                 }
-                Interrupt::AccessStorage {
-                    interrupt,
-                    address,
-                    location,
-                } => {
-                    let status = self.state.access_storage(address, location);
-                    interrupt.resume(AccessStorageStatus { status })
+                InterruptVariant::AccessStorage(data, i) => {
+                    let status = self.state.access_storage(data.address, data.key);
+                    i.resume(AccessStorageStatus { status })
                 }
-                Interrupt::Complete { result, .. } => {
-                    let output = match result {
+                InterruptVariant::Complete(res, _) => {
+                    let output = match res {
                         Ok(output) => output.into(),
                         Err(status_code) => Output {
                             status_code,

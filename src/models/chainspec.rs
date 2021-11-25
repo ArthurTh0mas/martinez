@@ -1,4 +1,4 @@
-use crate::{models::*, util::*};
+use crate::{execution::evm::Revision, models::*, util::*};
 use bytes::Bytes;
 use serde::*;
 use std::{

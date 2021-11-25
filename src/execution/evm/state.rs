@@ -1,4 +1,4 @@
-use super::common::InterpreterMessage;
+use super::common::Message;
 use arrayvec::ArrayVec;
 use bytes::{Bytes, BytesMut};
 use derive_more::{Deref, DerefMut};
@@ -99,14 +99,14 @@ pub struct ExecutionState {
     pub(crate) stack: Stack,
     #[getset(get = "pub", get_mut = "pub")]
     pub(crate) memory: Memory,
-    pub(crate) message: InterpreterMessage,
+    pub(crate) message: Message,
     #[getset(get = "pub", get_mut = "pub")]
     pub(crate) return_data: Bytes,
     pub(crate) output_data: Bytes,
 }
 
 impl ExecutionState {
-    pub fn new(message: InterpreterMessage) -> Self {
+    pub fn new(message: Message) -> Self {
         Self {
             gas_left: message.gas,
             stack: Stack::default(),

@@ -1,7 +1,4 @@
-use crate::{
-    execution::evm::{host::*, opcode::*, util::*, *},
-    models::*,
-};
+use crate::execution::evm::{host::*, opcode::*, util::*, *};
 use hex_literal::hex;
 
 #[test]

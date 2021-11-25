@@ -67,7 +67,7 @@ pub struct AccessStorageStatus {
 /// All resumed data variants.
 #[derive(Educe, EnumAsInner, From)]
 #[educe(Debug)]
-pub(crate) enum ResumeData {
+pub(crate) enum ResumeDataVariant {
     #[from(ignore)]
     Empty,
     StateModifier(#[educe(Debug(false))] StateModifier),
@@ -86,7 +86,7 @@ pub(crate) enum ResumeData {
     Done(Infallible),
 }
 
-impl From<()> for ResumeData {
+impl From<()> for ResumeDataVariant {
     fn from(_: ()) -> Self {
         Self::Empty
     }

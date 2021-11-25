@@ -59,7 +59,7 @@ pub struct Records {
 
     pub blockhashes: Vec<u64>,
     pub account_accesses: Vec<Address>,
-    pub calls: Vec<InterpreterMessage>,
+    pub calls: Vec<Message>,
     pub logs: Vec<LogRecord>,
     pub selfdestructs: Vec<SelfdestructRecord>,
 }
@@ -242,7 +242,7 @@ impl Host for MockedHost {
         });
     }
 
-    fn call(&mut self, msg: &InterpreterMessage) -> Output {
+    fn call(&mut self, msg: &Message) -> Output {
         let mut r = self.recorded.lock();
 
         r.record_account_access(msg.recipient);

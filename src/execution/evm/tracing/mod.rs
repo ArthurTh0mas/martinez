@@ -1,5 +1,4 @@
 use super::*;
-use crate::models::*;
 use serde::Serialize;
 
 /// Passed into execution context to collect metrics.
@@ -8,12 +7,7 @@ pub trait Tracer {
     const DUMMY: bool = false;
 
     /// Called when execution starts.
-    fn notify_execution_start(
-        &mut self,
-        revision: Revision,
-        message: InterpreterMessage,
-        code: Bytes,
-    );
+    fn notify_execution_start(&mut self, revision: Revision, message: Message, code: Bytes);
     /// Called on each instruction.
     fn notify_instruction_start(&mut self, pc: usize, opcode: OpCode, state: &ExecutionState);
     /// Called when execution ends.
@@ -26,7 +20,7 @@ pub struct NoopTracer;
 impl Tracer for NoopTracer {
     const DUMMY: bool = true;
 
-    fn notify_execution_start(&mut self, _: Revision, _: InterpreterMessage, _: Bytes) {}
+    fn notify_execution_start(&mut self, _: Revision, _: Message, _: Bytes) {}
 
     fn notify_instruction_start(&mut self, _: usize, _: OpCode, _: &ExecutionState) {}
 
@@ -62,7 +56,7 @@ pub(crate) struct ExecutionEnd {
 }
 
 struct TracerContext {
-    message: InterpreterMessage,
+    message: Message,
     code: Bytes,
 }
 
@@ -73,12 +67,7 @@ pub struct StdoutTracer {
 }
 
 impl Tracer for StdoutTracer {
-    fn notify_execution_start(
-        &mut self,
-        revision: Revision,
-        message: InterpreterMessage,
-        code: Bytes,
-    ) {
+    fn notify_execution_start(&mut self, revision: Revision, message: Message, code: Bytes) {
         println!(
             "{}",
             serde_json::to_string(&ExecutionStart {

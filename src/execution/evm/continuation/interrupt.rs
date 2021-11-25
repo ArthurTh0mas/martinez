@@ -7,8 +7,12 @@ macro_rules! interrupt {
             pub(crate) inner: InnerCoroutine,
         }
 
-        impl $name {
-            pub fn resume(self, resume_data: $resume_with) -> Interrupt {
+        impl sealed::Sealed for $name {}
+
+        impl Interrupt for $name {
+            type ResumeData = $resume_with;
+
+            fn resume(self, resume_data: Self::ResumeData) -> InterruptVariant {
                 resume_interrupt(self.inner, resume_data.into())
             }
         }
@@ -17,7 +21,7 @@ macro_rules! interrupt {
 
 interrupt! {
     /// EVM has just been created. Resume this interrupt to start execution.
-    StartedInterrupt => ()
+    ExecutionStartInterrupt => ()
 }
 interrupt! {
     /// New instruction has been encountered.
@@ -85,79 +89,21 @@ pub struct ExecutionComplete(pub(crate) InnerCoroutine);
 
 /// Collection of all possible interrupts. Match on this to get the specific interrupt returned.
 #[derive(From)]
-pub enum Interrupt {
-    InstructionStart {
-        interrupt: InstructionStartInterrupt,
-        pc: usize,
-        opcode: OpCode,
-        state: Box<ExecutionState>,
-    },
-    AccountExists {
-        interrupt: AccountExistsInterrupt,
-        address: Address,
-    },
-    GetStorage {
-        interrupt: GetStorageInterrupt,
-        address: Address,
-        location: U256,
-    },
-    SetStorage {
-        interrupt: SetStorageInterrupt,
-        address: Address,
-        location: U256,
-        value: U256,
-    },
-    GetBalance {
-        interrupt: GetBalanceInterrupt,
-        address: Address,
-    },
-    GetCodeSize {
-        interrupt: GetCodeSizeInterrupt,
-        address: Address,
-    },
-    GetCodeHash {
-        interrupt: GetCodeHashInterrupt,
-        address: Address,
-    },
-    CopyCode {
-        interrupt: CopyCodeInterrupt,
-        address: Address,
-        offset: usize,
-        max_size: usize,
-    },
-    Selfdestruct {
-        interrupt: SelfdestructInterrupt,
-        address: Address,
-        beneficiary: Address,
-    },
-    Call {
-        interrupt: CallInterrupt,
-        call_data: Call,
-    },
-    GetTxContext {
-        interrupt: GetTxContextInterrupt,
-    },
-    GetBlockHash {
-        interrupt: GetBlockHashInterrupt,
-        block_number: u64,
-    },
-    EmitLog {
-        interrupt: EmitLogInterrupt,
-        address: Address,
-        data: Bytes,
-        topics: ArrayVec<U256, 4>,
-    },
-    AccessAccount {
-        interrupt: AccessAccountInterrupt,
-        address: Address,
-    },
-    AccessStorage {
-        interrupt: AccessStorageInterrupt,
-        address: Address,
-        location: U256,
-    },
-    Complete {
-        interrupt: ExecutionComplete,
-        result: Result<SuccessfulOutput, StatusCode>,
-    },
+pub enum InterruptVariant {
+    InstructionStart(Box<InstructionStart>, InstructionStartInterrupt),
+    AccountExists(AccountExists, AccountExistsInterrupt),
+    GetStorage(GetStorage, GetStorageInterrupt),
+    SetStorage(SetStorage, SetStorageInterrupt),
+    GetBalance(GetBalance, GetBalanceInterrupt),
+    GetCodeSize(GetCodeSize, GetCodeSizeInterrupt),
+    GetCodeHash(GetCodeHash, GetCodeHashInterrupt),
+    CopyCode(CopyCode, CopyCodeInterrupt),
+    Selfdestruct(Selfdestruct, SelfdestructInterrupt),
+    Call(Call, CallInterrupt),
+    GetTxContext(GetTxContextInterrupt),
+    GetBlockHash(GetBlockHash, GetBlockHashInterrupt),
+    EmitLog(EmitLog, EmitLogInterrupt),
+    AccessAccount(AccessAccount, AccessAccountInterrupt),
+    AccessStorage(AccessStorage, AccessStorageInterrupt),
+    Complete(Result<SuccessfulOutput, StatusCode>, ExecutionComplete),
 }

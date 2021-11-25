@@ -5,7 +5,10 @@ use crate::{
         protocol_param::{fee, param},
     },
     consensus::*,
-    execution::{evm::StatusCode, evmglue},
+    execution::{
+        evm::{Revision, StatusCode},
+        evmglue,
+    },
     h256_to_u256,
     models::*,
     state::IntraBlockState,

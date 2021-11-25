@@ -1,7 +1,4 @@
-use crate::{
-    execution::evm::{opcode::*, util::*, *},
-    models::*,
-};
+use crate::execution::evm::{opcode::*, util::*, *};
 use bytes::Bytes;
 use core::iter::repeat_with;
 use ethereum_types::*;

@@ -1,15 +1,14 @@
 use self::instruction_table::*;
 use super::{
-    common::{InterpreterMessage, *},
-    continuation::{interrupt::*, interrupt_data::*, resume_data::*, InnerCoroutine},
+    common::*,
+    continuation::{interrupt::*, interrupt_data::*, resume_data::*, *},
     instructions::{control::*, stack_manip::*, *},
     state::*,
     tracing::Tracer,
     *,
 };
-use crate::models::*;
 use ethnum::U256;
-use std::sync::Arc;
+use std::{ops::Generator, sync::Arc};
 
 fn check_requirements(
     instruction_table: &InstructionTable,
@@ -56,7 +55,8 @@ pub struct AnalyzedCode {
 
 impl AnalyzedCode {
     /// Analyze code and prepare it for execution.
-    pub fn analyze(code: &[u8]) -> Self {
+    pub fn analyze(code: impl Into<Vec<u8>>) -> Self {
+        let code = code.into();
         let mut jumpdest_map = vec![false; code.len()];
 
         let mut i = 0;
@@ -105,7 +105,7 @@ impl AnalyzedCode {
 
         let code_len = code.len();
 
-        let mut padded_code = code.to_vec();
+        let mut padded_code = code;
         padded_code.resize(i + 1, OpCode::STOP.to_u8());
 
         let jumpdest_map = JumpdestMap(jumpdest_map.into());
@@ -126,7 +126,7 @@ impl AnalyzedCode {
         host: &mut H,
         tracer: &mut T,
         state_modifier: StateModifier,
-        message: InterpreterMessage,
+        message: Message,
         revision: Revision,
     ) -> Output {
         if !T::DUMMY {
@@ -148,164 +148,129 @@ impl AnalyzedCode {
     pub fn execute_resumable(
         &self,
         trace: bool,
-        message: InterpreterMessage,
+        message: Message,
         revision: Revision,
-    ) -> StartedInterrupt {
+    ) -> ExecutionStartInterrupt {
         let code = self.clone();
         let state = ExecutionState::new(message);
         let f = match (trace, revision) {
-            (true, Revision::Frontier) => gen_interpreter::<true, { Revision::Frontier }>,
-            (true, Revision::Homestead) => gen_interpreter::<true, { Revision::Homestead }>,
-            (true, Revision::Tangerine) => gen_interpreter::<true, { Revision::Tangerine }>,
-            (true, Revision::Spurious) => gen_interpreter::<true, { Revision::Spurious }>,
-            (true, Revision::Byzantium) => gen_interpreter::<true, { Revision::Byzantium }>,
+            (true, Revision::Frontier) => interpreter_producer::<true, { Revision::Frontier }>,
+            (true, Revision::Homestead) => interpreter_producer::<true, { Revision::Homestead }>,
+            (true, Revision::Tangerine) => interpreter_producer::<true, { Revision::Tangerine }>,
+            (true, Revision::Spurious) => interpreter_producer::<true, { Revision::Spurious }>,
+            (true, Revision::Byzantium) => interpreter_producer::<true, { Revision::Byzantium }>,
             (true, Revision::Constantinople) => {
-                gen_interpreter::<true, { Revision::Constantinople }>
+                interpreter_producer::<true, { Revision::Constantinople }>
             }
-            (true, Revision::Petersburg) => gen_interpreter::<true, { Revision::Petersburg }>,
-            (true, Revision::Istanbul) => gen_interpreter::<true, { Revision::Istanbul }>,
-            (true, Revision::Berlin) => gen_interpreter::<true, { Revision::Berlin }>,
-            (true, Revision::London) => gen_interpreter::<true, { Revision::London }>,
-            (true, Revision::Shanghai) => gen_interpreter::<true, { Revision::Shanghai }>,
-            (false, Revision::Frontier) => gen_interpreter::<false, { Revision::Frontier }>,
-            (false, Revision::Homestead) => gen_interpreter::<false, { Revision::Homestead }>,
-            (false, Revision::Tangerine) => gen_interpreter::<false, { Revision::Tangerine }>,
-            (false, Revision::Spurious) => gen_interpreter::<false, { Revision::Spurious }>,
-            (false, Revision::Byzantium) => gen_interpreter::<false, { Revision::Byzantium }>,
+            (true, Revision::Petersburg) => interpreter_producer::<true, { Revision::Petersburg }>,
+            (true, Revision::Istanbul) => interpreter_producer::<true, { Revision::Istanbul }>,
+            (true, Revision::Berlin) => interpreter_producer::<true, { Revision::Berlin }>,
+            (true, Revision::London) => interpreter_producer::<true, { Revision::London }>,
+            (true, Revision::Shanghai) => interpreter_producer::<true, { Revision::Shanghai }>,
+            (false, Revision::Frontier) => interpreter_producer::<false, { Revision::Frontier }>,
+            (false, Revision::Homestead) => interpreter_producer::<false, { Revision::Homestead }>,
+            (false, Revision::Tangerine) => interpreter_producer::<false, { Revision::Tangerine }>,
+            (false, Revision::Spurious) => interpreter_producer::<false, { Revision::Spurious }>,
+            (false, Revision::Byzantium) => interpreter_producer::<false, { Revision::Byzantium }>,
             (false, Revision::Constantinople) => {
-                gen_interpreter::<false, { Revision::Constantinople }>
+                interpreter_producer::<false, { Revision::Constantinople }>
             }
-            (false, Revision::Petersburg) => gen_interpreter::<false, { Revision::Petersburg }>,
-            (false, Revision::Istanbul) => gen_interpreter::<false, { Revision::Istanbul }>,
-            (false, Revision::Berlin) => gen_interpreter::<false, { Revision::Berlin }>,
-            (false, Revision::London) => gen_interpreter::<false, { Revision::London }>,
-            (false, Revision::Shanghai) => gen_interpreter::<false, { Revision::Shanghai }>,
+            (false, Revision::Petersburg) => {
+                interpreter_producer::<false, { Revision::Petersburg }>
+            }
+            (false, Revision::Istanbul) => interpreter_producer::<false, { Revision::Istanbul }>,
+            (false, Revision::Berlin) => interpreter_producer::<false, { Revision::Berlin }>,
+            (false, Revision::London) => interpreter_producer::<false, { Revision::London }>,
+            (false, Revision::Shanghai) => interpreter_producer::<false, { Revision::Shanghai }>,
         };
         let inner = (f)(code, state);
 
-        StartedInterrupt { inner }
+        ExecutionStartInterrupt { inner }
     }
 }
 
-impl StartedInterrupt {
-    pub fn run_to_completion_with_host<H: Host, T: Tracer>(
+impl ExecutionStartInterrupt {
+    #[doc(hidden)]
+    pub fn run_to_completion_with_host2<H: Host, T: Tracer>(
         self,
         host: &mut H,
         tracer: &mut T,
         state_modifier: StateModifier,
-    ) -> Output {
+    ) -> (Output, ExecutionComplete) {
         let mut interrupt = self.resume(());
 
         loop {
             interrupt = match interrupt {
-                Interrupt::InstructionStart {
-                    interrupt,
-                    pc,
-                    opcode,
-                    state,
-                } => {
-                    tracer.notify_instruction_start(pc, opcode, &state);
-                    interrupt.resume(state_modifier.clone())
+                InterruptVariant::InstructionStart(data, i) => {
+                    tracer.notify_instruction_start(data.pc, data.opcode, &data.state);
+                    i.resume(state_modifier.clone())
                 }
-                Interrupt::AccountExists { interrupt, address } => {
-                    let exists = host.account_exists(address);
-                    interrupt.resume(AccountExistsStatus { exists })
+                InterruptVariant::AccountExists(data, i) => {
+                    let exists = host.account_exists(data.address);
+                    i.resume(AccountExistsStatus { exists })
                 }
-                Interrupt::GetBalance { interrupt, address } => {
-                    let balance = host.get_balance(address);
-                    interrupt.resume(Balance { balance })
+                InterruptVariant::GetBalance(data, i) => {
+                    let balance = host.get_balance(data.address);
+                    i.resume(Balance { balance })
                 }
-                Interrupt::GetCodeSize { interrupt, address } => {
-                    let code_size = host.get_code_size(address);
-                    interrupt.resume(CodeSize { code_size })
+                InterruptVariant::GetCodeSize(data, i) => {
+                    let code_size = host.get_code_size(data.address);
+                    i.resume(CodeSize { code_size })
                 }
-                Interrupt::GetStorage {
-                    interrupt,
-                    address,
-                    location,
-                } => {
-                    let value = host.get_storage(address, location);
-                    interrupt.resume(StorageValue { value })
+                InterruptVariant::GetStorage(data, i) => {
+                    let value = host.get_storage(data.address, data.key);
+                    i.resume(StorageValue { value })
                 }
-                Interrupt::SetStorage {
-                    interrupt,
-                    address,
-                    location,
-                    value,
-                } => {
-                    let status = host.set_storage(address, location, value);
-                    interrupt.resume(StorageStatusInfo { status })
+                InterruptVariant::SetStorage(data, i) => {
+                    let status = host.set_storage(data.address, data.key, data.value);
+                    i.resume(StorageStatusInfo { status })
                 }
-                Interrupt::GetCodeHash { interrupt, address } => {
-                    let hash = host.get_code_hash(address);
-                    interrupt.resume(CodeHash { hash })
+                InterruptVariant::GetCodeHash(data, i) => {
+                    let hash = host.get_code_hash(data.address);
+                    i.resume(CodeHash { hash })
                 }
-                Interrupt::CopyCode {
-                    interrupt,
-                    address,
-                    offset,
-                    max_size,
-                } => {
-                    let mut code = vec![0; max_size];
-                    let copied = host.copy_code(address, offset, &mut code[..]);
+                InterruptVariant::CopyCode(data, i) => {
+                    let mut code = vec![0; data.max_size];
+                    let copied = host.copy_code(data.address, data.offset, &mut code[..]);
                     debug_assert!(copied <= code.len());
                     code.truncate(copied);
                     let code = code.into();
-                    interrupt.resume(Code { code })
+                    i.resume(Code { code })
                 }
-                Interrupt::Selfdestruct {
-                    interrupt,
-                    address,
-                    beneficiary,
-                } => {
-                    host.selfdestruct(address, beneficiary);
-                    interrupt.resume(())
+                InterruptVariant::Selfdestruct(data, i) => {
+                    host.selfdestruct(data.address, data.beneficiary);
+                    i.resume(())
                 }
-                Interrupt::Call {
-                    interrupt,
-                    call_data,
-                } => {
-                    let message = match call_data {
+                InterruptVariant::Call(data, i) => {
+                    let message = match data {
                         Call::Call(message) => message,
                         Call::Create(message) => message.into(),
                     };
                     let output = host.call(&message);
-                    interrupt.resume(CallOutput { output })
+                    i.resume(CallOutput { output })
                 }
-                Interrupt::GetTxContext { interrupt } => {
+                InterruptVariant::GetTxContext(i) => {
                     let context = host.get_tx_context();
-                    interrupt.resume(TxContextData { context })
+                    i.resume(TxContextData { context })
                 }
-                Interrupt::GetBlockHash {
-                    interrupt,
-                    block_number,
-                } => {
-                    let hash = host.get_block_hash(block_number);
-                    interrupt.resume(BlockHash { hash })
+                InterruptVariant::GetBlockHash(data, i) => {
+                    let hash = host.get_block_hash(data.block_number);
+                    i.resume(BlockHash { hash })
                 }
-                Interrupt::EmitLog {
-                    interrupt,
-                    address,
-                    data,
-                    topics,
-                } => {
-                    host.emit_log(address, &*data, topics.as_slice());
-                    interrupt.resume(())
+                InterruptVariant::EmitLog(data, i) => {
+                    host.emit_log(data.address, &*data.data, data.topics.as_slice());
+                    i.resume(())
                 }
-                Interrupt::AccessAccount { interrupt, address } => {
-                    let status = host.access_account(address);
-                    interrupt.resume(AccessAccountStatus { status })
+                InterruptVariant::AccessAccount(data, i) => {
+                    let status = host.access_account(data.address);
+                    i.resume(AccessAccountStatus { status })
                 }
-                Interrupt::AccessStorage {
-                    interrupt,
-                    address,
-                    location,
-                } => {
-                    let status = host.access_storage(address, location);
-                    interrupt.resume(AccessStorageStatus { status })
+                InterruptVariant::AccessStorage(data, i) => {
+                    let status = host.access_storage(data.address, data.key);
+                    i.resume(AccessStorageStatus { status })
                 }
-                Interrupt::Complete { result, .. } => {
-                    let output = match result {
+                InterruptVariant::Complete(i, c) => {
+                    let output = match i {
                         Ok(output) => output.into(),
                         Err(status_code) => Output {
                             status_code,
@@ -315,19 +280,37 @@ impl StartedInterrupt {
                         },
                     };
 
-                    return output;
+                    return (output, c);
                 }
             };
         }
     }
+
+    pub fn run_to_completion_with_host<H: Host, T: Tracer>(
+        self,
+        host: &mut H,
+        tracer: &mut T,
+        state_modifier: StateModifier,
+    ) -> Output {
+        self.run_to_completion_with_host2(host, tracer, state_modifier)
+            .0
+    }
 }
 
-fn gen_interpreter<const TRACE: bool, const REVISION: Revision>(
+fn interpreter_producer<const TRACE: bool, const REVISION: Revision>(
     s: AnalyzedCode,
     mut state: ExecutionState,
-) -> InnerCoroutine {
-    Box::pin(move |_: ResumeData| {
-        let instruction_table = get_instruction_table(REVISION);
+) -> Box<
+    dyn Generator<
+            ResumeDataVariant,
+            Yield = InterruptDataVariant,
+            Return = Result<SuccessfulOutput, StatusCode>,
+        > + Send
+        + Sync
+        + Unpin,
+> {
+    Box::new(move |_: ResumeDataVariant| {
+        let instruction_table = get_baseline_instruction_table(REVISION);
 
         let mut reverted = false;
 
@@ -340,11 +323,11 @@ fn gen_interpreter<const TRACE: bool, const REVISION: Revision>(
                 // Do not print stop on the final STOP
                 if pc < s.code.len() {
                     if let Some(modifier) = {
-                        yield InterruptData::InstructionStart {
+                        yield InterruptDataVariant::InstructionStart(Box::new(InstructionStart {
                             pc,
                             opcode: op,
-                            state: Box::new(state.clone()),
-                        }
+                            state: state.clone(),
+                        }))
                     }
                     .as_state_modifier()
                     .unwrap()
