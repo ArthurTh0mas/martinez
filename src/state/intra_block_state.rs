@@ -1,5 +1,6 @@
 use super::{delta::*, object::*, *};
-use crate::{crypto::*, execution::evm::host::AccessStatus, models::*};
+use crate::{crypto::*, models::*};
+use martinez_evm::host::AccessStatus;
 use bytes::Bytes;
 use hex_literal::hex;
 use std::{collections::*, fmt::Debug};

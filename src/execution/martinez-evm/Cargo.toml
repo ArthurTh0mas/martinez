@@ -1,0 +1,41 @@
+[package]
+name = "martinez-evm"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Annie Lai <ng8eke@163.com>"]
+
+[dependencies]
+arrayref = "0.3"
+arrayvec = { version = "0.7", default-features = false, features = ["serde"] }
+bytes = { version = "1", default-features = false, features = ["serde"] }
+derive_more = "0.99"
+educe = { version = "0.4", default-features = false, features = ["Debug"] }
+enum-as-inner = "0.3"
+ethnum = { git = "https://github.com/vorot93/ethnum-rs", branch = "staging", features = [
+    "serde",
+] }
+i256 = { git = "https://github.com/vorot93/rust-i256", branch = "ethnum" }
+ethereum-types = { version = "0.13", default-features = false }
+getset = "0.1"
+hex = "0.4"
+hex-literal = { version = "0.3", optional = true }
+num-traits = { version = "0.2", default-features = false }
+once_cell = "1"
+parking_lot = { version = "0.12", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha3 = "0.10"
+strum_macros = "0.23"
+
+[dev-dependencies]
+criterion = { version = "0.3", default-features = false }
+martinez-evm-test = { path = ".", package = "martinez-evm", features = ["util"] }
+hex-literal = "0.3"
+include_dir = "0.7"
+pprof = { version = "0.6", features = ["flamegraph"] }
+rand = { version = "0.8", features = ["std"] }
+toml = { version = "0.5", features = ["preserve_order"] }
+
+[features]
+util = ["hex-literal", "parking_lot"]

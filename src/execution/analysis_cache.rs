@@ -1,4 +1,4 @@
-use super::evm::AnalyzedCode;
+use martinez_evm::AnalyzedCode;
 use ethereum_types::H256;
 use lru::LruCache;
 

@@ -10,14 +10,14 @@ use crate::{
     models::*,
     u256_to_h256, IntraBlockState, State,
 };
-use anyhow::Context;
-use async_recursion::async_recursion;
-use bytes::Bytes;
-use evmodin::{
+use martinez_evm::{
     continuation::{interrupt::*, interrupt_data::*, resume_data::*, Interrupt},
     host::*,
     CallKind, CreateMessage, Message as EvmMessage, Output, Revision, StatusCode,
 };
+use anyhow::Context;
+use async_recursion::async_recursion;
+use bytes::Bytes;
 use sha3::{Digest, Keccak256};
 use std::{cmp::min, convert::TryFrom};
 
@@ -348,12 +348,12 @@ where
             if let Some(cache) = self.analysis_cache.get(code_hash) {
                 cache
             } else {
-                let analysis = evmodin::AnalyzedCode::analyze(code);
+                let analysis = martinez_evm::AnalyzedCode::analyze(code);
                 self.analysis_cache.put(code_hash, analysis);
                 self.analysis_cache.get(code_hash).unwrap()
             }
         } else {
-            a = evmodin::AnalyzedCode::analyze(code);
+            a = martinez_evm::AnalyzedCode::analyze(code);
             &a
         };
 

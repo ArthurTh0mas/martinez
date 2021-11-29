@@ -5,15 +5,13 @@ use crate::{
         protocol_param::{fee, param},
     },
     consensus::*,
-    execution::{
-        evm::{Revision, StatusCode},
-        evmglue,
-    },
+    execution::evm,
     h256_to_u256,
     models::*,
     state::IntraBlockState,
     State,
 };
+use martinez_evm::{Revision, StatusCode};
 use anyhow::Context;
 use std::cmp::min;
 use TransactionAction;
@@ -162,7 +160,7 @@ where
             .try_into()
             .unwrap();
 
-        let vm_res = evmglue::execute(
+        let vm_res = evm::execute(
             &mut self.state,
             // https://github.com/rust-lang/rust-clippy/issues/7846
             #[allow(clippy::needless_option_as_deref)]
