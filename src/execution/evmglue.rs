@@ -1,20 +1,19 @@
 use super::{
     address::*,
     analysis_cache::AnalysisCache,
-    evm::AnalyzedCode,
     precompiled,
     tracer::{CodeKind, MessageKind, Tracer},
 };
 use crate::{
     chain::protocol_param::{fee, param},
-    execution::evm::{
-        continuation::{interrupt::*, interrupt_data::*, resume_data::*, Interrupt},
-        host::*,
-        CallKind, CreateMessage, Message as EvmMessage, Output, Revision, StatusCode,
-    },
     h256_to_u256,
     models::*,
     u256_to_h256, IntraBlockState, State,
+};
+use martinez_evm::{
+    continuation::{interrupt::*, interrupt_data::*, resume_data::*, Interrupt},
+    host::*,
+    CallKind, CreateMessage, Message as EvmMessage, Output, Revision, StatusCode,
 };
 use anyhow::Context;
 use async_recursion::async_recursion;
@@ -349,12 +348,12 @@ where
             if let Some(cache) = self.analysis_cache.get(code_hash) {
                 cache
             } else {
-                let analysis = AnalyzedCode::analyze(code);
+                let analysis = martinez_evm::AnalyzedCode::analyze(code);
                 self.analysis_cache.put(code_hash, analysis);
                 self.analysis_cache.get(code_hash).unwrap()
             }
         } else {
-            a = AnalyzedCode::analyze(code);
+            a = martinez_evm::AnalyzedCode::analyze(code);
             &a
         };
 
