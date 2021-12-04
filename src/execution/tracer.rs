@@ -1,5 +1,7 @@
-use crate::models::*;
-use martinez_evm::{ExecutionState, OpCode, StatusCode};
+use crate::{
+    execution::evm::{ExecutionState, OpCode, StatusCode},
+    models::*,
+};
 use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap};
 

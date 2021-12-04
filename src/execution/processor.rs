@@ -5,13 +5,15 @@ use crate::{
         protocol_param::{fee, param},
     },
     consensus::*,
-    execution::evmglue,
+    execution::{
+        evm::{Revision, StatusCode},
+        evmglue,
+    },
     h256_to_u256,
     models::*,
     state::IntraBlockState,
     State,
 };
-use martinez_evm::{Revision, StatusCode};
 use anyhow::Context;
 use std::cmp::min;
 use TransactionAction;
