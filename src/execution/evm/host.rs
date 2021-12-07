@@ -1,6 +1,7 @@
 use super::common::{Message, Output};
 use ethereum_types::Address;
 use ethnum::U256;
+use std::future::Future;
 
 /// State access status (EIP-2929).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +99,80 @@ pub trait Host {
     ///
     /// Returns `Ok(AccessStatus::Cold)` if account does not exist.
     fn access_storage(&mut self, address: Address, key: U256) -> AccessStatus;
+}
+
+/// Abstraction that exposes host context to EVM.
+pub trait AsyncHost: Send + Sync {
+    type AccountExistsFut<'a>: Future<Output = anyhow::Result<bool>> + Send + 'a;
+    type GetStorageFut<'a>: Future<Output = anyhow::Result<U256>> + Send + 'a;
+    type SetStorageFut<'a>: Future<Output = anyhow::Result<StorageStatus>> + Send + 'a;
+    type GetBalanceFut<'a>: Future<Output = anyhow::Result<U256>> + Send + 'a;
+    type GetCodeSizeFut<'a>: Future<Output = anyhow::Result<U256>> + Send + 'a;
+    type GetCodeHashFut<'a>: Future<Output = anyhow::Result<U256>> + Send + 'a;
+    type CopyCodeFut<'a>: Future<Output = anyhow::Result<usize>> + Send + 'a;
+    type SelfdestructFut<'a>: Future<Output = anyhow::Result<()>> + Send + 'a;
+    type CallFut<'a>: Future<Output = anyhow::Result<Output>> + Send + 'a;
+    type GetTxContextFut<'a>: Future<Output = anyhow::Result<TxContext>> + Send + 'a;
+    type GetBlockHashFut<'a>: Future<Output = anyhow::Result<U256>> + Send + 'a;
+    type EmitLogFut<'a>: Future<Output = anyhow::Result<()>> + Send + 'a;
+    type AccessAccountFut<'a>: Future<Output = anyhow::Result<AccessStatus>> + Send + 'a;
+    type AccessStorageFut<'a>: Future<Output = anyhow::Result<AccessStatus>> + Send + 'a;
+
+    /// Check if an account exists.
+    fn account_exists(&mut self, address: Address) -> Self::AccountExistsFut<'_>;
+    /// Get value of a storage key.
+    ///
+    /// Returns `Ok(U256::zero())` if does not exist.
+    fn get_storage(&mut self, address: Address, key: U256) -> Self::GetStorageFut<'_>;
+    /// Set value of a storage key.
+    fn set_storage(&mut self, address: Address, key: U256, value: U256) -> Self::SetStorageFut<'_>;
+    /// Get balance of an account.
+    ///
+    /// Returns `Ok(0)` if account does not exist.
+    fn get_balance(&mut self, address: Address) -> Self::GetBalanceFut<'_>;
+    /// Get code size of an account.
+    ///
+    /// Returns `Ok(0)` if account does not exist.
+    fn get_code_size(&mut self, address: Address) -> Self::GetCodeSizeFut<'_>;
+    /// Get code hash of an account.
+    ///
+    /// Returns `Ok(0)` if account does not exist.
+    fn get_code_hash(&mut self, address: Address) -> Self::GetCodeHashFut<'_>;
+    /// Copy code of an account.
+    ///
+    /// Returns `Ok(0)` if offset is invalid.
+    fn copy_code<'a>(
+        &'a mut self,
+        address: Address,
+        offset: usize,
+        buffer: &'a mut [u8],
+    ) -> Self::CopyCodeFut<'a>;
+    /// Self-destruct account.
+    fn selfdestruct(&mut self, address: Address, beneficiary: Address)
+        -> Self::SelfdestructFut<'_>;
+    /// Call to another account.
+    fn call<'a>(&'a mut self, msg: &'a Message) -> Self::CallFut<'a>;
+    /// Retrieve transaction context.
+    fn get_tx_context(&mut self) -> Self::GetTxContextFut<'_>;
+    /// Get block hash.
+    ///
+    /// Returns `Ok(U256::zero())` if block does not exist.
+    fn get_block_hash(&mut self, block_number: u64) -> Self::GetBlockHashFut<'_>;
+    /// Emit a log.
+    fn emit_log<'a>(
+        &'a mut self,
+        address: Address,
+        data: &'a [u8],
+        topics: &'a [U256],
+    ) -> Self::EmitLogFut<'a>;
+    /// Mark account as warm, return previous access status.
+    ///
+    /// Returns `Ok(AccessStatus::Cold)` if account does not exist.
+    fn access_account(&mut self, address: Address) -> Self::AccessAccountFut<'_>;
+    /// Mark storage key as warm, return previous access status.
+    ///
+    /// Returns `Ok(AccessStatus::Cold)` if account does not exist.
+    fn access_storage(&mut self, address: Address, key: U256) -> Self::AccessStorageFut<'_>;
 }
 
 /// Host that does not support any ops.

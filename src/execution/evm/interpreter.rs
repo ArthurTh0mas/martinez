@@ -2,13 +2,14 @@ use self::instruction_table::*;
 use super::{
     common::*,
     continuation::{interrupt::*, interrupt_data::*, resume_data::*, *},
+    host::AsyncHost,
     instructions::{control::*, stack_manip::*, *},
     state::*,
     tracing::Tracer,
     *,
 };
 use ethnum::U256;
-use std::{ops::Generator, sync::Arc};
+use std::{future::Future, ops::Generator, sync::Arc};
 
 fn check_requirements(
     instruction_table: &InstructionTable,
@@ -142,6 +143,32 @@ impl AnalyzedCode {
         }
 
         output
+    }
+
+    pub async fn execute_async<'a, H: AsyncHost, T: Tracer>(
+        &'a self,
+        host: &'a mut H,
+        tracer: &'a mut T,
+        state_modifier: StateModifier,
+        message: Message,
+        revision: Revision,
+    ) -> impl Future<Output = anyhow::Result<Output>> + Send + 'a {
+        async move {
+            if !T::DUMMY {
+                tracer.notify_execution_start(revision, message.clone(), self.code.clone());
+            }
+
+            let output = self
+                .execute_resumable(!T::DUMMY || state_modifier.is_some(), message, revision)
+                .run_to_completion_with_host_async(host, tracer, state_modifier)
+                .await?;
+
+            if !T::DUMMY {
+                tracer.notify_execution_end(&output);
+            }
+
+            Ok(output)
+        }
     }
 
     /// Execute in resumable EVM.
@@ -294,6 +321,120 @@ impl ExecutionStartInterrupt {
     ) -> Output {
         self.run_to_completion_with_host2(host, tracer, state_modifier)
             .0
+    }
+
+    pub fn run_to_completion_with_host2_async<'a, H: AsyncHost, T: Tracer>(
+        self,
+        host: &'a mut H,
+        tracer: &'a mut T,
+        state_modifier: StateModifier,
+    ) -> impl Future<Output = anyhow::Result<(Output, ExecutionComplete)>> + Send + 'a {
+        async move {
+            let mut interrupt = self.resume(());
+
+            loop {
+                interrupt = match interrupt {
+                    InterruptVariant::InstructionStart(data, i) => {
+                        tracer.notify_instruction_start(data.pc, data.opcode, &data.state);
+                        i.resume(state_modifier.clone())
+                    }
+                    InterruptVariant::AccountExists(data, i) => {
+                        let exists = host.account_exists(data.address).await?;
+                        i.resume(AccountExistsStatus { exists })
+                    }
+                    InterruptVariant::GetBalance(data, i) => {
+                        let balance = host.get_balance(data.address).await?;
+                        i.resume(Balance { balance })
+                    }
+                    InterruptVariant::GetCodeSize(data, i) => {
+                        let code_size = host.get_code_size(data.address).await?;
+                        i.resume(CodeSize { code_size })
+                    }
+                    InterruptVariant::GetStorage(data, i) => {
+                        let value = host.get_storage(data.address, data.key).await?;
+                        i.resume(StorageValue { value })
+                    }
+                    InterruptVariant::SetStorage(data, i) => {
+                        let status = host.set_storage(data.address, data.key, data.value).await?;
+                        i.resume(StorageStatusInfo { status })
+                    }
+                    InterruptVariant::GetCodeHash(data, i) => {
+                        let hash = host.get_code_hash(data.address).await?;
+                        i.resume(CodeHash { hash })
+                    }
+                    InterruptVariant::CopyCode(data, i) => {
+                        let mut code = vec![0; data.max_size];
+                        let copied = host
+                            .copy_code(data.address, data.offset, &mut code[..])
+                            .await?;
+                        debug_assert!(copied <= code.len());
+                        code.truncate(copied);
+                        let code = code.into();
+                        i.resume(Code { code })
+                    }
+                    InterruptVariant::Selfdestruct(data, i) => {
+                        host.selfdestruct(data.address, data.beneficiary).await?;
+                        i.resume(())
+                    }
+                    InterruptVariant::Call(data, i) => {
+                        let message = match data {
+                            Call::Call(message) => message,
+                            Call::Create(message) => message.into(),
+                        };
+                        let output = host.call(&message).await?;
+                        i.resume(CallOutput { output })
+                    }
+                    InterruptVariant::GetTxContext(i) => {
+                        let context = host.get_tx_context().await?;
+                        i.resume(TxContextData { context })
+                    }
+                    InterruptVariant::GetBlockHash(data, i) => {
+                        let hash = host.get_block_hash(data.block_number).await?;
+                        i.resume(BlockHash { hash })
+                    }
+                    InterruptVariant::EmitLog(data, i) => {
+                        host.emit_log(data.address, &*data.data, data.topics.as_slice())
+                            .await?;
+                        i.resume(())
+                    }
+                    InterruptVariant::AccessAccount(data, i) => {
+                        let status = host.access_account(data.address).await?;
+                        i.resume(AccessAccountStatus { status })
+                    }
+                    InterruptVariant::AccessStorage(data, i) => {
+                        let status = host.access_storage(data.address, data.key).await?;
+                        i.resume(AccessStorageStatus { status })
+                    }
+                    InterruptVariant::Complete(i, c) => {
+                        let output = match i {
+                            Ok(output) => output.into(),
+                            Err(status_code) => Output {
+                                status_code,
+                                gas_left: 0,
+                                output_data: Bytes::new(),
+                                create_address: None,
+                            },
+                        };
+
+                        return Ok((output, c));
+                    }
+                };
+            }
+        }
+    }
+
+    pub fn run_to_completion_with_host_async<'a, H: AsyncHost, T: Tracer>(
+        self,
+        host: &'a mut H,
+        tracer: &'a mut T,
+        state_modifier: StateModifier,
+    ) -> impl Future<Output = anyhow::Result<Output>> + Send + 'a {
+        async move {
+            Ok(self
+                .run_to_completion_with_host2_async(host, tracer, state_modifier)
+                .await?
+                .0)
+        }
     }
 }
 
