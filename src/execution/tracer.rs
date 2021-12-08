@@ -29,7 +29,7 @@ pub enum MessageKind {
 }
 
 #[allow(unused, clippy::too_many_arguments)]
-pub trait Tracer: Send + 'static {
+pub trait Tracer: Send + Sync + 'static {
     fn capture_start(
         &mut self,
         depth: u16,

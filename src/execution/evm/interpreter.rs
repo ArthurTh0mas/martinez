@@ -145,7 +145,7 @@ impl AnalyzedCode {
         output
     }
 
-    pub async fn execute_async<'a, H: AsyncHost, T: Tracer>(
+    pub async fn execute_async<'a, H: AsyncHost<'a>, T: Tracer>(
         &'a self,
         host: &'a mut H,
         tracer: &'a mut T,
@@ -164,7 +164,7 @@ impl AnalyzedCode {
                 .await?;
 
             if !T::DUMMY {
-                tracer.notify_execution_end(&output);
+                // tracer.notify_execution_end(&output);
             }
 
             Ok(output)
@@ -323,7 +323,7 @@ impl ExecutionStartInterrupt {
             .0
     }
 
-    pub fn run_to_completion_with_host2_async<'a, H: AsyncHost, T: Tracer>(
+    pub fn run_to_completion_with_host2_async<'a, H: AsyncHost<'a>, T: Tracer>(
         self,
         host: &'a mut H,
         tracer: &'a mut T,
@@ -423,7 +423,7 @@ impl ExecutionStartInterrupt {
         }
     }
 
-    pub fn run_to_completion_with_host_async<'a, H: AsyncHost, T: Tracer>(
+    pub fn run_to_completion_with_host_async<'a, H: AsyncHost<'a>, T: Tracer>(
         self,
         host: &'a mut H,
         tracer: &'a mut T,

@@ -20,7 +20,7 @@ use anyhow::Context;
 use async_recursion::async_recursion;
 use bytes::Bytes;
 use sha3::{Digest, Keccak256};
-use std::{cmp::min, convert::TryFrom};
+use std::{cmp::min, convert::TryFrom, future::Future};
 
 pub struct CallResult {
     /// EVM exited with this status code.
@@ -42,6 +42,95 @@ where
     block_spec: &'c BlockExecutionSpec,
     txn: &'t MessageWithSender,
     beneficiary: Address,
+}
+
+struct EvmHost<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>
+where
+    B: State,
+{
+    inner: &'evm mut Evm<'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>,
+}
+
+impl<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B> AsyncHost<'evm>
+    for EvmHost<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>
+where
+    B: State,
+{
+    type AccountExistsFut = impl Future<Output = anyhow::Result<bool>> + Send + 'evm;
+    type GetStorageFut = impl Future<Output = anyhow::Result<U256>> + Send + 'evm;
+    type SetStorageFut = impl Future<Output = anyhow::Result<StorageStatus>> + Send + 'evm;
+    type GetBalanceFut = impl Future<Output = anyhow::Result<U256>> + Send + 'evm;
+    type GetCodeSizeFut = impl Future<Output = anyhow::Result<U256>> + Send + 'evm;
+    type GetCodeHashFut = impl Future<Output = anyhow::Result<U256>> + Send + 'evm;
+    type CopyCodeFut = impl Future<Output = anyhow::Result<usize>> + Send + 'evm;
+    type SelfdestructFut = impl Future<Output = anyhow::Result<()>> + Send + 'evm;
+    type CallFut = impl Future<Output = anyhow::Result<Output>> + Send + 'evm;
+    type GetTxContextFut = impl Future<Output = anyhow::Result<TxContext>> + Send + 'evm;
+    type GetBlockHashFut = impl Future<Output = anyhow::Result<U256>> + Send + 'evm;
+    type EmitLogFut = impl Future<Output = anyhow::Result<()>> + Send + 'evm;
+    type AccessAccountFut = impl Future<Output = anyhow::Result<AccessStatus>> + Send + 'evm;
+    type AccessStorageFut = impl Future<Output = anyhow::Result<AccessStatus>> + Send + 'evm;
+
+    fn account_exists(&mut self, address: Address) -> Self::AccountExistsFut {
+        async move { todo!() }
+    }
+
+    fn get_storage(&mut self, address: Address, key: U256) -> Self::GetStorageFut {
+        async move { todo!() }
+    }
+
+    fn set_storage(&mut self, address: Address, key: U256, value: U256) -> Self::SetStorageFut {
+        async move { todo!() }
+    }
+
+    fn get_balance(&mut self, address: Address) -> Self::GetBalanceFut {
+        async move { todo!() }
+    }
+
+    fn get_code_size(&mut self, address: Address) -> Self::GetCodeSizeFut {
+        async move { todo!() }
+    }
+
+    fn get_code_hash(&mut self, address: Address) -> Self::GetCodeHashFut {
+        async move { todo!() }
+    }
+
+    fn copy_code<'a>(
+        &'a mut self,
+        address: Address,
+        offset: usize,
+        buffer: &'a mut [u8],
+    ) -> Self::CopyCodeFut {
+        async move { todo!() }
+    }
+
+    fn selfdestruct(&mut self, address: Address, beneficiary: Address) -> Self::SelfdestructFut {
+        async move { todo!() }
+    }
+
+    fn call(&mut self, msg: &EvmMessage) -> Self::CallFut {
+        async move { todo!() }
+    }
+
+    fn get_tx_context(&mut self) -> Self::GetTxContextFut {
+        async move { todo!() }
+    }
+
+    fn get_block_hash(&mut self, block_number: u64) -> Self::GetBlockHashFut {
+        async move { todo!() }
+    }
+
+    fn emit_log(&mut self, address: Address, data: &[u8], topics: &[U256]) -> Self::EmitLogFut {
+        async move { todo!() }
+    }
+
+    fn access_account(&mut self, address: Address) -> Self::AccessAccountFut {
+        async move { todo!() }
+    }
+
+    fn access_storage(&mut self, address: Address, key: U256) -> Self::AccessStorageFut {
+        async move { todo!() }
+    }
 }
 
 pub async fn execute<B: State>(
