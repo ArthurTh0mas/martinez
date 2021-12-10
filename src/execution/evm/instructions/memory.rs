@@ -289,6 +289,59 @@ macro_rules! extcodecopy {
     };
 }
 
+#[doc(hidden)]
+#[macro_export]
+macro_rules! extcodecopy_async {
+    ($state:expr,$rev:expr,$host:expr) => {
+        use crate::execution::evm::{
+            common::*,
+            host::*,
+            instructions::{memory::*, properties::*},
+        };
+        use core::cmp::min;
+
+        let addr = u256_to_address($state.stack.pop());
+        let mem_index = $state.stack.pop();
+        let input_index = $state.stack.pop();
+        let size = $state.stack.pop();
+
+        let region =
+            get_memory_region(&mut $state, mem_index, size).map_err(|_| StatusCode::OutOfGas)?;
+
+        if let Some(region) = &region {
+            let copy_cost = num_words(region.size.get()) * 3;
+            $state.gas_left -= copy_cost;
+            if $state.gas_left < 0 {
+                return Err(StatusCode::OutOfGas.into());
+            }
+        }
+
+        if $rev >= Revision::Berlin {
+            if $host.access_account(addr).await? == AccessStatus::Cold {
+                $state.gas_left -= i64::from(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST);
+                if $state.gas_left < 0 {
+                    return Err(StatusCode::OutOfGas.into());
+                }
+            }
+        }
+
+        if let Some(region) = region {
+            let src = min(U256::from(MAX_BUFFER_SIZE), input_index).as_usize();
+
+            let mut code = vec![0; region.size.get()];
+            let copied = $host.copy_code(addr, src, &mut code[..]).await?;
+            debug_assert!(copied <= code.len());
+            code.truncate(copied);
+
+            $state.memory[region.offset..region.offset + code.len()].copy_from_slice(&code);
+            if region.size.get() > code.len() {
+                $state.memory[region.offset + code.len()..region.offset + region.size.get()]
+                    .fill(0);
+            }
+        }
+    };
+}
+
 pub(crate) fn returndatasize(state: &mut ExecutionState) {
     state
         .stack
@@ -348,7 +401,7 @@ macro_rules! extcodehash {
             {
                 $state.gas_left -= i64::from(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST);
                 if $state.gas_left < 0 {
-                    return Err(StatusCode::OutOfGas);
+                    return Err(StatusCode::OutOfGas.into());
                 }
             }
         }
@@ -358,6 +411,28 @@ macro_rules! extcodehash {
         })
         .unwrap()
         .hash;
+        $state.stack.push(code_hash);
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! extcodehash_async {
+    ($state:expr,$rev:expr,$host:expr) => {
+        use $crate::execution::evm::{common::*, host::*, instructions::properties::*};
+
+        let addr = u256_to_address($state.stack.pop());
+
+        if $rev >= Revision::Berlin {
+            if $host.access_account(addr).await? == AccessStatus::Cold {
+                $state.gas_left -= i64::from(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST);
+                if $state.gas_left < 0 {
+                    return Err(StatusCode::OutOfGas.into());
+                }
+            }
+        }
+
+        let code_hash = $host.get_code_hash(addr).await?;
         $state.stack.push(code_hash);
     };
 }
