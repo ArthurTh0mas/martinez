@@ -180,7 +180,7 @@ macro_rules! do_call_async {
         $state.stack.push(U256::ZERO); // Assume failure.
 
         if $rev >= Revision::Berlin {
-            if $host.access_account(dst).await? == AccessStatus::Cold {
+            if $host.access_account(dst) == AccessStatus::Cold {
                 $state.gas_left -= i64::from(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST);
                 if $state.gas_left < 0 {
                     return Err(StatusCode::OutOfGas.into());
@@ -259,7 +259,7 @@ macro_rules! do_call_async {
             && !(has_value && $host.get_balance($state.message.recipient).await? < value)
         {
             let msg_gas = msg.gas;
-            let result = $host.call(&msg).await?;
+            let result = $host.call(Call::Call(msg)).await?;
             $state.return_data = result.output_data.clone();
             *$state.stack.get_mut(0) = if matches!(result.status_code, StatusCode::Success) {
                 U256::ONE
@@ -431,7 +431,7 @@ macro_rules! do_create_async {
                 endowment,
             };
             let msg_gas = msg.gas;
-            let result = $host.call(&msg.into()).await?;
+            let result = $host.call(Call::Create(msg)).await?;
             $state.gas_left -= msg_gas - result.gas_left;
 
             $state.return_data = result.output_data;

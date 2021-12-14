@@ -317,7 +317,7 @@ macro_rules! extcodecopy_async {
         }
 
         if $rev >= Revision::Berlin {
-            if $host.access_account(addr).await? == AccessStatus::Cold {
+            if $host.access_account(addr) == AccessStatus::Cold {
                 $state.gas_left -= i64::from(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST);
                 if $state.gas_left < 0 {
                     return Err(StatusCode::OutOfGas.into());
@@ -424,7 +424,7 @@ macro_rules! extcodehash_async {
         let addr = u256_to_address($state.stack.pop());
 
         if $rev >= Revision::Berlin {
-            if $host.access_account(addr).await? == AccessStatus::Cold {
+            if $host.access_account(addr) == AccessStatus::Cold {
                 $state.gas_left -= i64::from(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST);
                 if $state.gas_left < 0 {
                     return Err(StatusCode::OutOfGas.into());

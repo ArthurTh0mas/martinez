@@ -102,21 +102,21 @@ pub trait Host {
 }
 
 /// Abstraction that exposes host context to EVM.
-pub trait AsyncHost<'a>: Send + Sync {
-    type AccountExistsFut: Future<Output = anyhow::Result<bool>> + Send + 'a;
-    type GetStorageFut: Future<Output = anyhow::Result<U256>> + Send + 'a;
-    type SetStorageFut: Future<Output = anyhow::Result<StorageStatus>> + Send + 'a;
-    type GetBalanceFut: Future<Output = anyhow::Result<U256>> + Send + 'a;
-    type GetCodeSizeFut: Future<Output = anyhow::Result<U256>> + Send + 'a;
-    type GetCodeHashFut: Future<Output = anyhow::Result<U256>> + Send + 'a;
-    type CopyCodeFut: Future<Output = anyhow::Result<usize>> + Send + 'a;
-    type SelfdestructFut: Future<Output = anyhow::Result<()>> + Send + 'a;
-    type CallFut: Future<Output = anyhow::Result<Output>> + Send + 'a;
-    type GetTxContextFut: Future<Output = anyhow::Result<TxContext>> + Send + 'a;
-    type GetBlockHashFut: Future<Output = anyhow::Result<U256>> + Send + 'a;
-    type EmitLogFut: Future<Output = anyhow::Result<()>> + Send + 'a;
-    type AccessAccountFut: Future<Output = anyhow::Result<AccessStatus>> + Send + 'a;
-    type AccessStorageFut: Future<Output = anyhow::Result<AccessStatus>> + Send + 'a;
+pub trait AsyncHost: Send + Sync {
+    type AccountExistsFut: Future<Output = anyhow::Result<bool>> + Send;
+    type GetStorageFut: Future<Output = anyhow::Result<U256>> + Send;
+    type SetStorageFut: Future<Output = anyhow::Result<StorageStatus>> + Send;
+    type GetBalanceFut: Future<Output = anyhow::Result<U256>> + Send;
+    type GetCodeSizeFut: Future<Output = anyhow::Result<U256>> + Send;
+    type GetCodeHashFut: Future<Output = anyhow::Result<U256>> + Send;
+    type CopyCodeFut: Future<Output = anyhow::Result<usize>> + Send;
+    type SelfdestructFut: Future<Output = anyhow::Result<()>> + Send;
+    type CallFut: Future<Output = anyhow::Result<Output>> + Send;
+    type GetTxContextFut: Future<Output = anyhow::Result<TxContext>> + Send;
+    type GetBlockHashFut: Future<Output = anyhow::Result<U256>> + Send;
+    type EmitLogFut: Future<Output = anyhow::Result<()>> + Send;
+    type AccessAccountFut: Future<Output = anyhow::Result<AccessStatus>> + Send;
+    type AccessStorageFut: Future<Output = anyhow::Result<AccessStatus>> + Send;
 
     /// Check if an account exists.
     fn account_exists(&mut self, address: Address) -> Self::AccountExistsFut;

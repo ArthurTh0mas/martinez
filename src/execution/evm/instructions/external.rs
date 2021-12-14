@@ -59,7 +59,7 @@ macro_rules! balance_async {
         let address = u256_to_address($state.stack.pop());
 
         if $rev >= Revision::Berlin {
-            if $host.access_account(address).await? == AccessStatus::Cold {
+            if $host.access_account(address) == AccessStatus::Cold {
                 $state.gas_left -= i64::from(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST);
                 if $state.gas_left < 0 {
                     return Err(StatusCode::OutOfGas.into());
@@ -118,8 +118,7 @@ macro_rules! extcodesize_async {
         let address = u256_to_address($state.stack.pop());
 
         if $rev >= Revision::Berlin {
-            let access_account = $host.access_account(address).await?;
-            if access_account == AccessStatus::Cold {
+            if $host.access_account(address) == AccessStatus::Cold {
                 $state.gas_left -= i64::from(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST);
                 if $state.gas_left < 0 {
                     return Err(StatusCode::OutOfGas.into());
@@ -151,7 +150,7 @@ macro_rules! push_txcontext {
 #[macro_export]
 macro_rules! push_txcontext_async {
     ($state:expr, $accessor:expr, $host:expr) => {
-        let tx_context = $host.get_tx_context().await?;
+        let tx_context = $host.get_tx_context();
 
         $state.stack.push($accessor(tx_context));
     };
@@ -258,7 +257,7 @@ macro_rules! blockhash_async {
     ($state:expr,$host:expr) => {
         let number = $state.stack.pop();
 
-        let upper_bound = $host.get_tx_context().await?.block_number;
+        let upper_bound = $host.get_tx_context().block_number;
         let lower_bound = upper_bound.saturating_sub(256);
 
         let mut header = U256::ZERO;
@@ -356,11 +355,10 @@ macro_rules! do_log_async {
         } else {
             &[]
         }
-        .to_vec();
+        .to_vec()
+        .into();
 
-        $host
-            .emit_log($state.message.recipient, &data, &*topics)
-            .await?;
+        $host.emit_log($state.message.recipient, data, topics);
     }};
 }
 
@@ -421,8 +419,7 @@ macro_rules! sload_async {
         let key = $state.stack.pop();
 
         if $rev >= Revision::Berlin {
-            let access_status = $host.access_storage($state.message.recipient, key).await?;
-            if access_status == AccessStatus::Cold {
+            if $host.access_storage($state.message.recipient, key) == AccessStatus::Cold {
                 // The warm storage access cost is already applied (from the cost table).
                 // Here we need to apply additional cold storage access cost.
                 const ADDITIONAL_COLD_SLOAD_COST: u16 = COLD_SLOAD_COST - WARM_STORAGE_READ_COST;
@@ -463,9 +460,7 @@ macro_rules! sstore_async {
 
         let mut cost = 0;
         if $rev >= Revision::Berlin {
-            let access_status = $host.access_storage($state.message.recipient, key).await?;
-
-            if access_status == AccessStatus::Cold {
+            if $host.access_storage($state.message.recipient, key) == AccessStatus::Cold {
                 cost = COLD_SLOAD_COST;
             }
         }
@@ -664,8 +659,7 @@ macro_rules! selfdestruct_async {
         let beneficiary = u256_to_address($state.stack.pop());
 
         if $rev >= Revision::Berlin {
-            let access_status = $host.access_account(beneficiary).await?;
-            if access_status == AccessStatus::Cold {
+            if $host.access_account(beneficiary) == AccessStatus::Cold {
                 $state.gas_left -= i64::from(COLD_ACCOUNT_ACCESS_COST);
                 if $state.gas_left < 0 {
                     return Err(StatusCode::OutOfGas.into());

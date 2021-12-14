@@ -17,6 +17,7 @@ use crate::{
     u256_to_h256, IntraBlockState, State,
 };
 use anyhow::Context;
+use arrayvec::ArrayVec;
 use async_recursion::async_recursion;
 use bytes::Bytes;
 use sha3::{Digest, Keccak256};
@@ -44,94 +45,363 @@ where
     beneficiary: Address,
 }
 
-struct EvmHost<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>
+pub struct EvmHost<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>
 where
     B: State,
 {
     inner: &'evm mut Evm<'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>,
 }
 
-impl<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B> AsyncHost<'evm>
-    for EvmHost<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>
+impl<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>
+    EvmHost<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>
 where
     B: State,
 {
-    type AccountExistsFut = impl Future<Output = anyhow::Result<bool>> + Send + 'evm;
-    type GetStorageFut = impl Future<Output = anyhow::Result<U256>> + Send + 'evm;
-    type SetStorageFut = impl Future<Output = anyhow::Result<StorageStatus>> + Send + 'evm;
-    type GetBalanceFut = impl Future<Output = anyhow::Result<U256>> + Send + 'evm;
-    type GetCodeSizeFut = impl Future<Output = anyhow::Result<U256>> + Send + 'evm;
-    type GetCodeHashFut = impl Future<Output = anyhow::Result<U256>> + Send + 'evm;
-    type CopyCodeFut = impl Future<Output = anyhow::Result<usize>> + Send + 'evm;
-    type SelfdestructFut = impl Future<Output = anyhow::Result<()>> + Send + 'evm;
-    type CallFut = impl Future<Output = anyhow::Result<Output>> + Send + 'evm;
-    type GetTxContextFut = impl Future<Output = anyhow::Result<TxContext>> + Send + 'evm;
-    type GetBlockHashFut = impl Future<Output = anyhow::Result<U256>> + Send + 'evm;
-    type EmitLogFut = impl Future<Output = anyhow::Result<()>> + Send + 'evm;
-    type AccessAccountFut = impl Future<Output = anyhow::Result<AccessStatus>> + Send + 'evm;
-    type AccessStorageFut = impl Future<Output = anyhow::Result<AccessStatus>> + Send + 'evm;
-
-    fn account_exists(&mut self, address: Address) -> Self::AccountExistsFut {
-        async move { todo!() }
+    pub async fn account_exists(&mut self, address: Address) -> anyhow::Result<bool> {
+        let exists = if self.inner.block_spec.revision >= Revision::Spurious {
+            !self.inner.state.is_dead(address).await?
+        } else {
+            self.inner.state.exists(address).await?
+        };
+        Ok(exists)
     }
 
-    fn get_storage(&mut self, address: Address, key: U256) -> Self::GetStorageFut {
-        async move { todo!() }
+    pub async fn get_storage(&mut self, address: Address, key: U256) -> anyhow::Result<U256> {
+        self.inner.state.get_current_storage(address, key).await
     }
 
-    fn set_storage(&mut self, address: Address, key: U256, value: U256) -> Self::SetStorageFut {
-        async move { todo!() }
+    pub async fn set_storage(
+        &mut self,
+        address: Address,
+        key: U256,
+        new_val: U256,
+    ) -> anyhow::Result<StorageStatus> {
+        let current_val = self.inner.state.get_current_storage(address, key).await?;
+
+        Ok(if current_val == new_val {
+            StorageStatus::Unchanged
+        } else {
+            self.inner.state.set_storage(address, key, new_val).await?;
+
+            let eip1283 = self.inner.block_spec.revision >= Revision::Istanbul
+                || self.inner.block_spec.revision == Revision::Constantinople;
+
+            if !eip1283 {
+                if current_val == 0 {
+                    StorageStatus::Added
+                } else if new_val == 0 {
+                    self.inner.state.add_refund(fee::R_SCLEAR);
+                    StorageStatus::Deleted
+                } else {
+                    StorageStatus::Modified
+                }
+            } else {
+                let sload_cost = {
+                    if self.inner.block_spec.revision >= Revision::Berlin {
+                        fee::WARM_STORAGE_READ_COST
+                    } else if self.inner.block_spec.revision >= Revision::Istanbul {
+                        fee::G_SLOAD_ISTANBUL
+                    } else {
+                        fee::G_SLOAD_TANGERINE_WHISTLE
+                    }
+                };
+
+                let mut sstore_reset_gas = fee::G_SRESET;
+                if self.inner.block_spec.revision >= Revision::Berlin {
+                    sstore_reset_gas -= fee::COLD_SLOAD_COST;
+                }
+
+                // https://eips.ethereum.org/EIPS/eip-1283
+                let original_val = self.inner.state.get_original_storage(address, key).await?;
+
+                // https://eips.ethereum.org/EIPS/eip-3529
+                let sstore_clears_refund = if self.inner.block_spec.revision >= Revision::London {
+                    sstore_reset_gas + fee::ACCESS_LIST_STORAGE_KEY_COST
+                } else {
+                    fee::R_SCLEAR
+                };
+
+                if original_val == current_val {
+                    if original_val == 0 {
+                        StorageStatus::Added
+                    } else {
+                        if new_val == 0 {
+                            self.inner.state.add_refund(sstore_clears_refund);
+                        }
+                        StorageStatus::Modified
+                    }
+                } else {
+                    if original_val != 0 {
+                        if current_val == 0 {
+                            self.inner.state.subtract_refund(sstore_clears_refund);
+                        }
+                        if new_val == 0 {
+                            self.inner.state.add_refund(sstore_clears_refund);
+                        }
+                    }
+                    if original_val == new_val {
+                        let refund = {
+                            if original_val == 0 {
+                                fee::G_SSET - sload_cost
+                            } else {
+                                sstore_reset_gas - sload_cost
+                            }
+                        };
+
+                        self.inner.state.add_refund(refund);
+                    }
+                    StorageStatus::ModifiedAgain
+                }
+            }
+        })
     }
 
-    fn get_balance(&mut self, address: Address) -> Self::GetBalanceFut {
-        async move { todo!() }
+    pub async fn get_balance(&mut self, address: Address) -> anyhow::Result<U256> {
+        self.inner.state.get_balance(address).await
     }
 
-    fn get_code_size(&mut self, address: Address) -> Self::GetCodeSizeFut {
-        async move { todo!() }
+    pub async fn get_code_size(&mut self, address: Address) -> anyhow::Result<U256> {
+        Ok(u64::try_from(
+            self.inner
+                .state
+                .get_code(address)
+                .await?
+                .map(|c| c.len())
+                .unwrap_or(0),
+        )?
+        .into())
     }
 
-    fn get_code_hash(&mut self, address: Address) -> Self::GetCodeHashFut {
-        async move { todo!() }
+    pub async fn get_code_hash(&mut self, address: Address) -> anyhow::Result<U256> {
+        Ok(h256_to_u256({
+            if self.inner.state.is_dead(address).await? {
+                H256::zero()
+            } else {
+                self.inner.state.get_code_hash(address).await?
+            }
+        }))
     }
 
-    fn copy_code<'a>(
-        &'a mut self,
+    pub async fn copy_code(
+        &mut self,
         address: Address,
         offset: usize,
-        buffer: &'a mut [u8],
-    ) -> Self::CopyCodeFut {
-        async move { todo!() }
+        buffer: &mut [u8],
+    ) -> anyhow::Result<usize> {
+        let code = self
+            .inner
+            .state
+            .get_code(address)
+            .await?
+            .unwrap_or_default();
+
+        let mut copied = 0;
+        if offset < code.len() {
+            copied = min(buffer.len(), code.len() - offset);
+            buffer[..copied].copy_from_slice(&code[offset..offset + copied]);
+        }
+
+        Ok(copied)
     }
 
-    fn selfdestruct(&mut self, address: Address, beneficiary: Address) -> Self::SelfdestructFut {
-        async move { todo!() }
+    pub async fn selfdestruct(
+        &mut self,
+        address: Address,
+        beneficiary: Address,
+    ) -> anyhow::Result<()> {
+        self.inner.state.record_selfdestruct(address);
+        let balance = self.inner.state.get_balance(address).await?;
+        self.inner
+            .state
+            .add_to_balance(beneficiary, balance)
+            .await?;
+        self.inner.state.set_balance(address, 0).await?;
+
+        if let Some(tracer) = &mut self.inner.tracer {
+            tracer.capture_self_destruct(address, beneficiary);
+        }
+
+        Ok(())
     }
 
-    fn call(&mut self, msg: &EvmMessage) -> Self::CallFut {
-        async move { todo!() }
+    pub async fn call(&mut self, data: Call) -> anyhow::Result<Output> {
+        let output = match data {
+            Call::Create(message) => {
+                let mut res = self.inner.create(message).await?;
+
+                // https://eips.ethereum.org/EIPS/eip-211
+                if res.status_code != StatusCode::Revert {
+                    // geth returns CREATE output only in case of REVERT
+                    res.output_data = Default::default();
+                }
+
+                res
+            }
+            Call::Call(message) => self.inner.call(message).await?,
+        };
+
+        Ok(output)
     }
 
-    fn get_tx_context(&mut self) -> Self::GetTxContextFut {
-        async move { todo!() }
+    pub fn get_tx_context(&mut self) -> TxContext {
+        let base_fee_per_gas = self.inner.header.base_fee_per_gas.unwrap_or(U256::ZERO);
+        let tx_gas_price = self.inner.txn.effective_gas_price(base_fee_per_gas);
+        let tx_origin = self.inner.txn.sender;
+        let block_coinbase = self.inner.beneficiary;
+        let block_number = self.inner.header.number.0;
+        let block_timestamp = self.inner.header.timestamp;
+        let block_gas_limit = self.inner.header.gas_limit;
+        let block_difficulty = self.inner.header.difficulty;
+        let chain_id = self.inner.block_spec.params.chain_id.0.into();
+        let block_base_fee = base_fee_per_gas;
+
+        TxContext {
+            tx_gas_price,
+            tx_origin,
+            block_coinbase,
+            block_number,
+            block_timestamp,
+            block_gas_limit,
+            block_difficulty,
+            chain_id,
+            block_base_fee,
+        }
     }
 
-    fn get_block_hash(&mut self, block_number: u64) -> Self::GetBlockHashFut {
-        async move { todo!() }
+    pub async fn get_block_hash(&mut self, block_number: u64) -> anyhow::Result<U256> {
+        let n = block_number;
+
+        let base_number = self.inner.header.number;
+        let distance = base_number.0 - n;
+        assert!(distance <= 256);
+
+        let mut hash = self.inner.header.parent_hash;
+
+        for i in 1..distance {
+            hash = self
+                .inner
+                .state
+                .db()
+                .read_header(BlockNumber(base_number.0 - i), hash)
+                .await?
+                .context("no header")?
+                .parent_hash;
+        }
+
+        let hash = h256_to_u256(hash);
+
+        Ok(hash)
     }
 
-    fn emit_log(&mut self, address: Address, data: &[u8], topics: &[U256]) -> Self::EmitLogFut {
-        async move { todo!() }
+    pub fn emit_log(&mut self, address: Address, data: Bytes, topics: ArrayVec<U256, 4>) {
+        self.inner.state.add_log(Log {
+            address,
+            topics: topics.into_iter().map(u256_to_h256).collect(),
+            data,
+        })
     }
 
-    fn access_account(&mut self, address: Address) -> Self::AccessAccountFut {
-        async move { todo!() }
+    pub fn access_account(&mut self, address: Address) -> AccessStatus {
+        if self.inner.is_precompiled(address) {
+            AccessStatus::Warm
+        } else {
+            self.inner.state.access_account(address)
+        }
     }
 
-    fn access_storage(&mut self, address: Address, key: U256) -> Self::AccessStorageFut {
-        async move { todo!() }
+    pub fn access_storage(&mut self, address: Address, key: U256) -> AccessStatus {
+        self.inner.state.access_storage(address, key)
     }
 }
+
+// impl<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B> AsyncHost
+//     for EvmHost<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>
+// where
+//     B: State,
+// {
+//     type AccountExistsFut = impl Future<Output = anyhow::Result<bool>> + Send;
+//     type GetStorageFut = impl Future<Output = anyhow::Result<U256>> + Send;
+//     type SetStorageFut = impl Future<Output = anyhow::Result<StorageStatus>> + Send;
+//     type GetBalanceFut = impl Future<Output = anyhow::Result<U256>> + Send;
+//     type GetCodeSizeFut = impl Future<Output = anyhow::Result<U256>> + Send;
+//     type GetCodeHashFut = impl Future<Output = anyhow::Result<U256>> + Send;
+//     type CopyCodeFut = impl Future<Output = anyhow::Result<usize>> + Send;
+//     type SelfdestructFut = impl Future<Output = anyhow::Result<()>> + Send;
+//     type CallFut = impl Future<Output = anyhow::Result<Output>> + Send;
+//     type GetTxContextFut = impl Future<Output = anyhow::Result<TxContext>> + Send;
+//     type GetBlockHashFut = impl Future<Output = anyhow::Result<U256>> + Send;
+//     type EmitLogFut = impl Future<Output = anyhow::Result<()>> + Send;
+//     type AccessAccountFut = impl Future<Output = anyhow::Result<AccessStatus>> + Send;
+//     type AccessStorageFut = impl Future<Output = anyhow::Result<AccessStatus>> + Send;
+
+//     fn account_exists(&mut self, address: Address) -> Self::AccountExistsFut {
+//         async move {
+//             let exists = if self.inner.block_spec.revision >= Revision::Spurious {
+//                 !self.inner.state.is_dead(address).await?
+//             } else {
+//                 self.inner.state.exists(address).await?
+//             };
+//             Ok(exists)
+//         }
+//     }
+
+//     fn get_storage(&mut self, address: Address, key: U256) -> Self::GetStorageFut {
+//         async move { todo!() }
+//     }
+
+//     fn set_storage(&mut self, address: Address, key: U256, value: U256) -> Self::SetStorageFut {
+//         async move { todo!() }
+//     }
+
+//     fn get_balance(&mut self, address: Address) -> Self::GetBalanceFut {
+//         async move { todo!() }
+//     }
+
+//     fn get_code_size(&mut self, address: Address) -> Self::GetCodeSizeFut {
+//         async move { todo!() }
+//     }
+
+//     fn get_code_hash(&mut self, address: Address) -> Self::GetCodeHashFut {
+//         async move { todo!() }
+//     }
+
+//     fn copy_code(
+//         &mut self,
+//         address: Address,
+//         offset: usize,
+//         buffer: &mut [u8],
+//     ) -> Self::CopyCodeFut {
+//         async move { todo!() }
+//     }
+
+//     fn selfdestruct(&mut self, address: Address, beneficiary: Address) -> Self::SelfdestructFut {
+//         async move { todo!() }
+//     }
+
+//     fn call(&mut self, msg: &EvmMessage) -> Self::CallFut {
+//         async move { todo!() }
+//     }
+
+//     fn get_tx_context(&mut self) -> Self::GetTxContextFut {
+//         async move { todo!() }
+//     }
+
+//     fn get_block_hash(&mut self, block_number: u64) -> Self::GetBlockHashFut {
+//         async move { todo!() }
+//     }
+
+//     fn emit_log(&mut self, address: Address, data: &[u8], topics: &[U256]) -> Self::EmitLogFut {
+//         async move { todo!() }
+//     }
+
+//     fn access_account(&mut self, address: Address) -> Self::AccessAccountFut {
+//         async move { todo!() }
+//     }
+
+//     fn access_storage(&mut self, address: Address, key: U256) -> Self::AccessStorageFut {
+//         async move { todo!() }
+//     }
+// }
 
 pub async fn execute<B: State>(
     state: &mut IntraBlockState<'_, B>,
