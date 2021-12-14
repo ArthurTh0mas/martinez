@@ -8,9 +8,8 @@ use super::{
 use crate::{
     chain::protocol_param::{fee, param},
     execution::evm::{
-        continuation::{interrupt::*, interrupt_data::*, resume_data::*, Interrupt},
-        host::*,
-        CallKind, CreateMessage, Message as EvmMessage, Output, Revision, StatusCode,
+        continuation::interrupt_data::*, host::*, CallKind, CreateMessage, Message as EvmMessage,
+        Output, Revision, StatusCode,
     },
     h256_to_u256,
     models::*,
@@ -21,7 +20,7 @@ use arrayvec::ArrayVec;
 use async_recursion::async_recursion;
 use bytes::Bytes;
 use sha3::{Digest, Keccak256};
-use std::{cmp::min, convert::TryFrom, future::Future};
+use std::{cmp::min, convert::TryFrom};
 
 pub struct CallResult {
     /// EVM exited with this status code.
@@ -48,6 +47,7 @@ where
 pub struct EvmHost<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>
 where
     B: State,
+    'tracer: 'evm,
 {
     inner: &'evm mut Evm<'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>,
 }
@@ -56,7 +56,12 @@ impl<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>
     EvmHost<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>
 where
     B: State,
+    'tracer: 'evm,
 {
+    pub fn tracer(&mut self) -> Option<&'tracer mut dyn Tracer> {
+        self.inner.tracer
+    }
+
     pub async fn account_exists(&mut self, address: Address) -> anyhow::Result<bool> {
         let exists = if self.inner.block_spec.revision >= Revision::Spurious {
             !self.inner.state.is_dead(address).await?
@@ -217,7 +222,7 @@ where
             .await?;
         self.inner.state.set_balance(address, 0).await?;
 
-        if let Some(tracer) = &mut self.inner.tracer {
+        if let Some(tracer) = self.tracer() {
             tracer.capture_self_destruct(address, beneficiary);
         }
 
@@ -314,95 +319,6 @@ where
     }
 }
 
-// impl<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B> AsyncHost
-//     for EvmHost<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>
-// where
-//     B: State,
-// {
-//     type AccountExistsFut = impl Future<Output = anyhow::Result<bool>> + Send;
-//     type GetStorageFut = impl Future<Output = anyhow::Result<U256>> + Send;
-//     type SetStorageFut = impl Future<Output = anyhow::Result<StorageStatus>> + Send;
-//     type GetBalanceFut = impl Future<Output = anyhow::Result<U256>> + Send;
-//     type GetCodeSizeFut = impl Future<Output = anyhow::Result<U256>> + Send;
-//     type GetCodeHashFut = impl Future<Output = anyhow::Result<U256>> + Send;
-//     type CopyCodeFut = impl Future<Output = anyhow::Result<usize>> + Send;
-//     type SelfdestructFut = impl Future<Output = anyhow::Result<()>> + Send;
-//     type CallFut = impl Future<Output = anyhow::Result<Output>> + Send;
-//     type GetTxContextFut = impl Future<Output = anyhow::Result<TxContext>> + Send;
-//     type GetBlockHashFut = impl Future<Output = anyhow::Result<U256>> + Send;
-//     type EmitLogFut = impl Future<Output = anyhow::Result<()>> + Send;
-//     type AccessAccountFut = impl Future<Output = anyhow::Result<AccessStatus>> + Send;
-//     type AccessStorageFut = impl Future<Output = anyhow::Result<AccessStatus>> + Send;
-
-//     fn account_exists(&mut self, address: Address) -> Self::AccountExistsFut {
-//         async move {
-//             let exists = if self.inner.block_spec.revision >= Revision::Spurious {
-//                 !self.inner.state.is_dead(address).await?
-//             } else {
-//                 self.inner.state.exists(address).await?
-//             };
-//             Ok(exists)
-//         }
-//     }
-
-//     fn get_storage(&mut self, address: Address, key: U256) -> Self::GetStorageFut {
-//         async move { todo!() }
-//     }
-
-//     fn set_storage(&mut self, address: Address, key: U256, value: U256) -> Self::SetStorageFut {
-//         async move { todo!() }
-//     }
-
-//     fn get_balance(&mut self, address: Address) -> Self::GetBalanceFut {
-//         async move { todo!() }
-//     }
-
-//     fn get_code_size(&mut self, address: Address) -> Self::GetCodeSizeFut {
-//         async move { todo!() }
-//     }
-
-//     fn get_code_hash(&mut self, address: Address) -> Self::GetCodeHashFut {
-//         async move { todo!() }
-//     }
-
-//     fn copy_code(
-//         &mut self,
-//         address: Address,
-//         offset: usize,
-//         buffer: &mut [u8],
-//     ) -> Self::CopyCodeFut {
-//         async move { todo!() }
-//     }
-
-//     fn selfdestruct(&mut self, address: Address, beneficiary: Address) -> Self::SelfdestructFut {
-//         async move { todo!() }
-//     }
-
-//     fn call(&mut self, msg: &EvmMessage) -> Self::CallFut {
-//         async move { todo!() }
-//     }
-
-//     fn get_tx_context(&mut self) -> Self::GetTxContextFut {
-//         async move { todo!() }
-//     }
-
-//     fn get_block_hash(&mut self, block_number: u64) -> Self::GetBlockHashFut {
-//         async move { todo!() }
-//     }
-
-//     fn emit_log(&mut self, address: Address, data: &[u8], topics: &[U256]) -> Self::EmitLogFut {
-//         async move { todo!() }
-//     }
-
-//     fn access_account(&mut self, address: Address) -> Self::AccessAccountFut {
-//         async move { todo!() }
-//     }
-
-//     fn access_storage(&mut self, address: Address, key: U256) -> Self::AccessStorageFut {
-//         async move { todo!() }
-//     }
-// }
-
 pub async fn execute<B: State>(
     state: &mut IntraBlockState<'_, B>,
     tracer: Option<&mut dyn Tracer>,
@@ -459,7 +375,6 @@ impl<'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>
 where
     B: State,
 {
-    #[async_recursion]
     async fn create(&mut self, message: CreateMessage) -> anyhow::Result<Output> {
         let mut res = Output {
             status_code: StatusCode::Success,
@@ -578,7 +493,6 @@ where
         Ok(res)
     }
 
-    #[async_recursion]
     async fn call(&mut self, message: EvmMessage) -> anyhow::Result<Output> {
         let mut res = Output {
             status_code: StatusCode::Success,
@@ -603,7 +517,7 @@ where
             None
         };
 
-        if let Some(tracer) = &mut self.tracer {
+        if let Some(tracer) = self.tracer.as_mut() {
             let call_kind = {
                 match (message.kind, message.is_static) {
                     (CallKind::Call, true) => super::tracer::CallKind::StaticCall,
@@ -703,301 +617,21 @@ where
         code: Vec<u8>,
         code_hash: Option<H256>,
     ) -> anyhow::Result<Output> {
-        let a;
         let analysis = if let Some(code_hash) = code_hash {
             if let Some(cache) = self.analysis_cache.get(code_hash) {
-                cache
+                cache.clone()
             } else {
                 let analysis = AnalyzedCode::analyze(code);
-                self.analysis_cache.put(code_hash, analysis);
-                self.analysis_cache.get(code_hash).unwrap()
+                self.analysis_cache.put(code_hash, analysis.clone());
+                analysis
             }
         } else {
-            a = AnalyzedCode::analyze(code);
-            &a
+            AnalyzedCode::analyze(code)
         };
 
-        let mut interrupt = analysis
-            .execute_resumable(false, msg, self.block_spec.revision)
-            .resume(());
-
-        let output = loop {
-            interrupt = match interrupt {
-                InterruptVariant::InstructionStart(_, _) => unreachable!("tracing is disabled"),
-                InterruptVariant::AccountExists(data, i) => {
-                    let address = data.address;
-                    let exists = if self.block_spec.revision >= Revision::Spurious {
-                        !self.state.is_dead(address).await?
-                    } else {
-                        self.state.exists(address).await?
-                    };
-                    i.resume(AccountExistsStatus { exists })
-                }
-                InterruptVariant::GetBalance(data, i) => {
-                    let balance = self.state.get_balance(data.address).await?;
-                    i.resume(Balance { balance })
-                }
-                InterruptVariant::GetCodeSize(data, i) => {
-                    let code_size = u64::try_from(
-                        self.state
-                            .get_code(data.address)
-                            .await?
-                            .map(|c| c.len())
-                            .unwrap_or(0),
-                    )?
-                    .into();
-                    i.resume(CodeSize { code_size })
-                }
-                InterruptVariant::GetStorage(data, i) => {
-                    let value = self
-                        .state
-                        .get_current_storage(data.address, data.key)
-                        .await?;
-                    i.resume(StorageValue { value })
-                }
-                InterruptVariant::SetStorage(
-                    SetStorage {
-                        address,
-                        key,
-                        value: new_val,
-                    },
-                    i,
-                ) => {
-                    let current_val = self.state.get_current_storage(address, key).await?;
-
-                    let status = if current_val == new_val {
-                        StorageStatus::Unchanged
-                    } else {
-                        self.state.set_storage(address, key, new_val).await?;
-
-                        let eip1283 = self.block_spec.revision >= Revision::Istanbul
-                            || self.block_spec.revision == Revision::Constantinople;
-
-                        if !eip1283 {
-                            if current_val == 0 {
-                                StorageStatus::Added
-                            } else if new_val == 0 {
-                                self.state.add_refund(fee::R_SCLEAR);
-                                StorageStatus::Deleted
-                            } else {
-                                StorageStatus::Modified
-                            }
-                        } else {
-                            let sload_cost = {
-                                if self.block_spec.revision >= Revision::Berlin {
-                                    fee::WARM_STORAGE_READ_COST
-                                } else if self.block_spec.revision >= Revision::Istanbul {
-                                    fee::G_SLOAD_ISTANBUL
-                                } else {
-                                    fee::G_SLOAD_TANGERINE_WHISTLE
-                                }
-                            };
-
-                            let mut sstore_reset_gas = fee::G_SRESET;
-                            if self.block_spec.revision >= Revision::Berlin {
-                                sstore_reset_gas -= fee::COLD_SLOAD_COST;
-                            }
-
-                            // https://eips.ethereum.org/EIPS/eip-1283
-                            let original_val =
-                                self.state.get_original_storage(address, key).await?;
-
-                            // https://eips.ethereum.org/EIPS/eip-3529
-                            let sstore_clears_refund =
-                                if self.block_spec.revision >= Revision::London {
-                                    sstore_reset_gas + fee::ACCESS_LIST_STORAGE_KEY_COST
-                                } else {
-                                    fee::R_SCLEAR
-                                };
-
-                            if original_val == current_val {
-                                if original_val == 0 {
-                                    StorageStatus::Added
-                                } else {
-                                    if new_val == 0 {
-                                        self.state.add_refund(sstore_clears_refund);
-                                    }
-                                    StorageStatus::Modified
-                                }
-                            } else {
-                                if original_val != 0 {
-                                    if current_val == 0 {
-                                        self.state.subtract_refund(sstore_clears_refund);
-                                    }
-                                    if new_val == 0 {
-                                        self.state.add_refund(sstore_clears_refund);
-                                    }
-                                }
-                                if original_val == new_val {
-                                    let refund = {
-                                        if original_val == 0 {
-                                            fee::G_SSET - sload_cost
-                                        } else {
-                                            sstore_reset_gas - sload_cost
-                                        }
-                                    };
-
-                                    self.state.add_refund(refund);
-                                }
-                                StorageStatus::ModifiedAgain
-                            }
-                        }
-                    };
-
-                    i.resume(StorageStatusInfo { status })
-                }
-                InterruptVariant::GetCodeHash(data, i) => {
-                    let address = data.address;
-                    let hash = h256_to_u256({
-                        if self.state.is_dead(address).await? {
-                            H256::zero()
-                        } else {
-                            self.state.get_code_hash(address).await?
-                        }
-                    });
-                    i.resume(CodeHash { hash })
-                }
-                InterruptVariant::CopyCode(
-                    CopyCode {
-                        address,
-                        offset,
-                        max_size,
-                    },
-                    i,
-                ) => {
-                    let mut buffer = vec![0; max_size];
-
-                    let code = self.state.get_code(address).await?.unwrap_or_default();
-
-                    let mut copied = 0;
-                    if offset < code.len() {
-                        copied = min(max_size, code.len() - offset);
-                        buffer[..copied].copy_from_slice(&code[offset..offset + copied]);
-                    }
-
-                    buffer.truncate(copied);
-                    let code = buffer.into();
-
-                    i.resume(Code { code })
-                }
-                InterruptVariant::Selfdestruct(data, i) => {
-                    self.state.record_selfdestruct(data.address);
-                    let balance = self.state.get_balance(data.address).await?;
-                    self.state.add_to_balance(data.beneficiary, balance).await?;
-                    self.state.set_balance(data.address, 0).await?;
-
-                    if let Some(tracer) = &mut self.tracer {
-                        tracer.capture_self_destruct(data.address, data.beneficiary);
-                    }
-
-                    i.resume(())
-                }
-                InterruptVariant::Call(data, i) => {
-                    let output = match data {
-                        Call::Create(message) => {
-                            let mut res = self.create(message).await?;
-
-                            // https://eips.ethereum.org/EIPS/eip-211
-                            if res.status_code != StatusCode::Revert {
-                                // geth returns CREATE output only in case of REVERT
-                                res.output_data = Default::default();
-                            }
-
-                            res
-                        }
-                        Call::Call(message) => self.call(message).await?,
-                    };
-
-                    i.resume(CallOutput { output })
-                }
-                InterruptVariant::GetTxContext(i) => {
-                    let base_fee_per_gas = self.header.base_fee_per_gas.unwrap_or(U256::ZERO);
-                    let tx_gas_price = self.txn.effective_gas_price(base_fee_per_gas);
-                    let tx_origin = self.txn.sender;
-                    let block_coinbase = self.beneficiary;
-                    let block_number = self.header.number.0;
-                    let block_timestamp = self.header.timestamp;
-                    let block_gas_limit = self.header.gas_limit;
-                    let block_difficulty = self.header.difficulty;
-                    let chain_id = self.block_spec.params.chain_id.0.into();
-                    let block_base_fee = base_fee_per_gas;
-
-                    let context = TxContext {
-                        tx_gas_price,
-                        tx_origin,
-                        block_coinbase,
-                        block_number,
-                        block_timestamp,
-                        block_gas_limit,
-                        block_difficulty,
-                        chain_id,
-                        block_base_fee,
-                    };
-
-                    i.resume(TxContextData { context })
-                }
-                InterruptVariant::GetBlockHash(data, i) => {
-                    let n = data.block_number;
-
-                    let base_number = self.header.number;
-                    let distance = base_number.0 - n;
-                    assert!(distance <= 256);
-
-                    let mut hash = self.header.parent_hash;
-
-                    for i in 1..distance {
-                        hash = self
-                            .state
-                            .db()
-                            .read_header(BlockNumber(base_number.0 - i), hash)
-                            .await?
-                            .context("no header")?
-                            .parent_hash;
-                    }
-
-                    let hash = h256_to_u256(hash);
-                    i.resume(BlockHash { hash })
-                }
-                InterruptVariant::EmitLog(data, i) => {
-                    self.state.add_log(Log {
-                        address: data.address,
-                        topics: data.topics.into_iter().map(u256_to_h256).collect(),
-                        data: data.data,
-                    });
-
-                    i.resume(())
-                }
-                InterruptVariant::AccessAccount(data, i) => {
-                    let address = data.address;
-
-                    let status = if self.is_precompiled(address) {
-                        AccessStatus::Warm
-                    } else {
-                        self.state.access_account(address)
-                    };
-                    i.resume(AccessAccountStatus { status })
-                }
-                InterruptVariant::AccessStorage(data, i) => {
-                    let status = self.state.access_storage(data.address, data.key);
-                    i.resume(AccessStorageStatus { status })
-                }
-                InterruptVariant::Complete(res, _) => {
-                    let output = match res {
-                        Ok(output) => output.into(),
-                        Err(status_code) => Output {
-                            status_code,
-                            gas_left: 0,
-                            output_data: bytes::Bytes::new(),
-                            create_address: None,
-                        },
-                    };
-
-                    break output;
-                }
-            };
-        };
-
-        Ok(output)
+        let revision = self.block_spec.revision;
+        let mut host = EvmHost { inner: self };
+        analysis.execute_async(&mut host, msg, revision).await
     }
 
     fn number_of_precompiles(&self) -> u8 {

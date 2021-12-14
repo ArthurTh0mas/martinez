@@ -4,7 +4,6 @@ use self::instruction_table::*;
 use super::{
     common::*,
     continuation::{interrupt::*, interrupt_data::*, resume_data::*, *},
-    host::AsyncHost,
     instructions::{control::*, stack_manip::*, *},
     state::*,
     tracing::Tracer,
@@ -12,7 +11,7 @@ use super::{
 };
 use derive_more::From;
 use ethnum::U256;
-use std::{future::Future, ops::Generator, sync::Arc};
+use std::{ops::Generator, sync::Arc};
 
 fn check_requirements(
     instruction_table: &InstructionTable,
@@ -148,89 +147,88 @@ impl AnalyzedCode {
         output
     }
 
-    pub async fn execute_async<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B, T>(
+    pub async fn execute_async<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>(
         self,
-        host: EvmHost<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>,
-        tracer: &mut T,
+        host: &mut EvmHost<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>,
         message: Message,
         revision: Revision,
     ) -> anyhow::Result<Output>
     where
         B: State,
-        T: Tracer,
     {
-        if !T::DUMMY {
-            tracer.notify_execution_start(revision, message.clone(), self.code.clone());
+        let mut enable_tracing = false;
+        if let Some(t) = &mut host.tracer() {
+            // t.notify_execution_start(revision, message.clone(), self.code.clone());
+            enable_tracing = true;
         }
 
         let state = ExecutionState::new(message);
-        let output = match (!T::DUMMY, revision) {
+        let output = match (enable_tracing, revision) {
             (true, Revision::Frontier) => {
-                execute::<_, _, true, { Revision::Frontier }>(self, state, host, tracer).await
+                execute::<_, true, { Revision::Frontier }>(self, state, host).await
             }
             (true, Revision::Homestead) => {
-                execute::<_, _, true, { Revision::Homestead }>(self, state, host, tracer).await
+                execute::<_, true, { Revision::Homestead }>(self, state, host).await
             }
             (true, Revision::Tangerine) => {
-                execute::<_, _, true, { Revision::Tangerine }>(self, state, host, tracer).await
+                execute::<_, true, { Revision::Tangerine }>(self, state, host).await
             }
             (true, Revision::Spurious) => {
-                execute::<_, _, true, { Revision::Spurious }>(self, state, host, tracer).await
+                execute::<_, true, { Revision::Spurious }>(self, state, host).await
             }
             (true, Revision::Byzantium) => {
-                execute::<_, _, true, { Revision::Byzantium }>(self, state, host, tracer).await
+                execute::<_, true, { Revision::Byzantium }>(self, state, host).await
             }
             (true, Revision::Constantinople) => {
-                execute::<_, _, true, { Revision::Constantinople }>(self, state, host, tracer).await
+                execute::<_, true, { Revision::Constantinople }>(self, state, host).await
             }
             (true, Revision::Petersburg) => {
-                execute::<_, _, true, { Revision::Petersburg }>(self, state, host, tracer).await
+                execute::<_, true, { Revision::Petersburg }>(self, state, host).await
             }
             (true, Revision::Istanbul) => {
-                execute::<_, _, true, { Revision::Istanbul }>(self, state, host, tracer).await
+                execute::<_, true, { Revision::Istanbul }>(self, state, host).await
             }
             (true, Revision::Berlin) => {
-                execute::<_, _, true, { Revision::Berlin }>(self, state, host, tracer).await
+                execute::<_, true, { Revision::Berlin }>(self, state, host).await
             }
             (true, Revision::London) => {
-                execute::<_, _, true, { Revision::London }>(self, state, host, tracer).await
+                execute::<_, true, { Revision::London }>(self, state, host).await
             }
             (true, Revision::Shanghai) => {
-                execute::<_, _, true, { Revision::Shanghai }>(self, state, host, tracer).await
+                execute::<_, true, { Revision::Shanghai }>(self, state, host).await
             }
             (false, Revision::Frontier) => {
-                execute::<_, _, false, { Revision::Frontier }>(self, state, host, tracer).await
+                execute::<_, false, { Revision::Frontier }>(self, state, host).await
             }
             (false, Revision::Homestead) => {
-                execute::<_, _, false, { Revision::Homestead }>(self, state, host, tracer).await
+                execute::<_, false, { Revision::Homestead }>(self, state, host).await
             }
             (false, Revision::Tangerine) => {
-                execute::<_, _, false, { Revision::Tangerine }>(self, state, host, tracer).await
+                execute::<_, false, { Revision::Tangerine }>(self, state, host).await
             }
             (false, Revision::Spurious) => {
-                execute::<_, _, false, { Revision::Spurious }>(self, state, host, tracer).await
+                execute::<_, false, { Revision::Spurious }>(self, state, host).await
             }
             (false, Revision::Byzantium) => {
-                execute::<_, _, false, { Revision::Byzantium }>(self, state, host, tracer).await
+                execute::<_, false, { Revision::Byzantium }>(self, state, host).await
             }
             (false, Revision::Constantinople) => {
-                execute::<_, _, false, { Revision::Constantinople }>(self, state, host, tracer)
-                    .await
+                execute::<_, false, { Revision::Constantinople }>(self, state, host).await
             }
             (false, Revision::Petersburg) => {
-                execute::<_, _, false, { Revision::Petersburg }>(self, state, host, tracer).await
+                execute::<_, false, { Revision::Petersburg }>(self, state, host).await
             }
             (false, Revision::Istanbul) => {
-                execute::<_, _, false, { Revision::Istanbul }>(self, state, host, tracer).await
+                execute::<_, false, { Revision::Istanbul }>(self, state, host).await
             }
             (false, Revision::Berlin) => {
-                execute::<_, _, false, { Revision::Berlin }>(self, state, host, tracer).await
+                execute::<_, false, { Revision::Berlin }>(self, state, host).await
             }
             (false, Revision::London) => {
-                execute::<_, _, false, { Revision::London }>(self, state, host, tracer).await
+                execute::<_, false, { Revision::London }>(self, state, host).await
             }
             (false, Revision::Shanghai) => {
-                execute::<_, _, false, { Revision::Shanghai }>(self, state, host, tracer).await
+                execute::<_, false, { Revision::Shanghai }>(self, state, host).await
             }
         };
 
@@ -245,8 +243,8 @@ impl AnalyzedCode {
             Err(DuoError::Error(e)) => return Err(e),
         };
 
-        if !T::DUMMY {
-            // tracer.notify_execution_end(&output);
+        if let Some(t) = host.tracer() {
+            // t.notify_execution_end(&output);
         }
 
         Ok(output)
@@ -767,14 +765,12 @@ async fn execute<
     'c,
     't,
     B: State,
-    T: Tracer,
     const TRACE: bool,
     const REVISION: Revision,
 >(
     s: AnalyzedCode,
     mut state: ExecutionState,
-    mut host: EvmHost<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>,
-    tracer: &mut T,
+    host: &mut EvmHost<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>,
 ) -> Result<SuccessfulOutput, DuoError> {
     let instruction_table = get_baseline_instruction_table(REVISION);
 
@@ -788,7 +784,9 @@ async fn execute<
         if TRACE {
             // Do not print stop on the final STOP
             if pc < s.code.len() {
-                tracer.notify_instruction_start(pc, op, &state);
+                if let Some(t) = host.tracer() {
+                    // t.notify_instruction_start(pc, op, &state);
+                }
             }
         }
 

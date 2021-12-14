@@ -2,6 +2,7 @@ use crate::{
     execution::evm::{ExecutionState, OpCode, StatusCode},
     models::*,
 };
+use auto_impl::auto_impl;
 use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap};
 
@@ -29,6 +30,7 @@ pub enum MessageKind {
 }
 
 #[allow(unused, clippy::too_many_arguments)]
+#[auto_impl(Box, &mut)]
 pub trait Tracer: Send + Sync + 'static {
     fn capture_start(
         &mut self,

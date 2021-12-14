@@ -1,7 +1,6 @@
 use super::common::{Message, Output};
 use ethereum_types::Address;
 use ethnum::U256;
-use std::future::Future;
 
 /// State access status (EIP-2929).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,74 +98,6 @@ pub trait Host {
     ///
     /// Returns `Ok(AccessStatus::Cold)` if account does not exist.
     fn access_storage(&mut self, address: Address, key: U256) -> AccessStatus;
-}
-
-/// Abstraction that exposes host context to EVM.
-pub trait AsyncHost: Send + Sync {
-    type AccountExistsFut: Future<Output = anyhow::Result<bool>> + Send;
-    type GetStorageFut: Future<Output = anyhow::Result<U256>> + Send;
-    type SetStorageFut: Future<Output = anyhow::Result<StorageStatus>> + Send;
-    type GetBalanceFut: Future<Output = anyhow::Result<U256>> + Send;
-    type GetCodeSizeFut: Future<Output = anyhow::Result<U256>> + Send;
-    type GetCodeHashFut: Future<Output = anyhow::Result<U256>> + Send;
-    type CopyCodeFut: Future<Output = anyhow::Result<usize>> + Send;
-    type SelfdestructFut: Future<Output = anyhow::Result<()>> + Send;
-    type CallFut: Future<Output = anyhow::Result<Output>> + Send;
-    type GetTxContextFut: Future<Output = anyhow::Result<TxContext>> + Send;
-    type GetBlockHashFut: Future<Output = anyhow::Result<U256>> + Send;
-    type EmitLogFut: Future<Output = anyhow::Result<()>> + Send;
-    type AccessAccountFut: Future<Output = anyhow::Result<AccessStatus>> + Send;
-    type AccessStorageFut: Future<Output = anyhow::Result<AccessStatus>> + Send;
-
-    /// Check if an account exists.
-    fn account_exists(&mut self, address: Address) -> Self::AccountExistsFut;
-    /// Get value of a storage key.
-    ///
-    /// Returns `Ok(U256::zero())` if does not exist.
-    fn get_storage(&mut self, address: Address, key: U256) -> Self::GetStorageFut;
-    /// Set value of a storage key.
-    fn set_storage(&mut self, address: Address, key: U256, value: U256) -> Self::SetStorageFut;
-    /// Get balance of an account.
-    ///
-    /// Returns `Ok(0)` if account does not exist.
-    fn get_balance(&mut self, address: Address) -> Self::GetBalanceFut;
-    /// Get code size of an account.
-    ///
-    /// Returns `Ok(0)` if account does not exist.
-    fn get_code_size(&mut self, address: Address) -> Self::GetCodeSizeFut;
-    /// Get code hash of an account.
-    ///
-    /// Returns `Ok(0)` if account does not exist.
-    fn get_code_hash(&mut self, address: Address) -> Self::GetCodeHashFut;
-    /// Copy code of an account.
-    ///
-    /// Returns `Ok(0)` if offset is invalid.
-    fn copy_code(
-        &mut self,
-        address: Address,
-        offset: usize,
-        buffer: &mut [u8],
-    ) -> Self::CopyCodeFut;
-    /// Self-destruct account.
-    fn selfdestruct(&mut self, address: Address, beneficiary: Address) -> Self::SelfdestructFut;
-    /// Call to another account.
-    fn call(&mut self, msg: &Message) -> Self::CallFut;
-    /// Retrieve transaction context.
-    fn get_tx_context(&mut self) -> Self::GetTxContextFut;
-    /// Get block hash.
-    ///
-    /// Returns `Ok(U256::zero())` if block does not exist.
-    fn get_block_hash(&mut self, block_number: u64) -> Self::GetBlockHashFut;
-    /// Emit a log.
-    fn emit_log(&mut self, address: Address, data: &[u8], topics: &[U256]) -> Self::EmitLogFut;
-    /// Mark account as warm, return previous access status.
-    ///
-    /// Returns `Ok(AccessStatus::Cold)` if account does not exist.
-    fn access_account(&mut self, address: Address) -> Self::AccessAccountFut;
-    /// Mark storage key as warm, return previous access status.
-    ///
-    /// Returns `Ok(AccessStatus::Cold)` if account does not exist.
-    fn access_storage(&mut self, address: Address, key: U256) -> Self::AccessStorageFut;
 }
 
 /// Host that does not support any ops.

@@ -7,11 +7,11 @@ pub trait Tracer: Send + Sync {
     const DUMMY: bool = false;
 
     /// Called when execution starts.
-    fn notify_execution_start(&mut self, revision: Revision, message: Message, code: Bytes);
+    fn notify_execution_start(&mut self, revision: Revision, message: Message, code: Bytes) {}
     /// Called on each instruction.
-    fn notify_instruction_start(&mut self, pc: usize, opcode: OpCode, state: &ExecutionState);
+    fn notify_instruction_start(&mut self, pc: usize, opcode: OpCode, state: &ExecutionState) {}
     /// Called when execution ends.
-    fn notify_execution_end(&mut self, output: &Output);
+    fn notify_execution_end(&mut self, output: &Output) {}
 }
 
 /// Tracer which does nothing.
