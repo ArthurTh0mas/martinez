@@ -71,7 +71,7 @@ impl Revision {
 
 /// Message status code.
 #[must_use]
-#[derive(Clone, Debug, Display, PartialEq)]
+#[derive(Clone, Copy, Debug, Display, PartialEq)]
 pub enum StatusCode {
     /// Execution finished with success.
     #[strum(serialize = "success")]
@@ -153,7 +153,7 @@ pub enum StatusCode {
 
     /// EVM implementation generic internal error.
     #[strum(serialize = "internal error")]
-    InternalError(String),
+    InternalError(&'static str),
 }
 
 /// The kind of call-like instruction.

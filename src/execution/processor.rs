@@ -15,15 +15,16 @@ use crate::{
     State,
 };
 use anyhow::Context;
-use std::cmp::min;
+use parking_lot::Mutex;
+use std::{cmp::min, sync::Arc};
 use TransactionAction;
 
-pub struct ExecutionProcessor<'r, 'tracer, 'analysis, 'e, 'h, 'b, 'c, S>
+pub struct ExecutionProcessor<'r, 'analysis, 'e, 'h, 'b, 'c, S>
 where
     S: State,
 {
     state: IntraBlockState<'r, S>,
-    tracer: Option<&'tracer mut dyn Tracer>,
+    tracer: Option<Arc<Mutex<dyn Tracer>>>,
     analysis_cache: &'analysis mut AnalysisCache,
     engine: &'e mut dyn Consensus,
     header: &'h PartialHeader,
@@ -32,14 +33,13 @@ where
     cumulative_gas_used: u64,
 }
 
-impl<'r, 'tracer, 'analysis, 'e, 'h, 'b, 'c, S>
-    ExecutionProcessor<'r, 'tracer, 'analysis, 'e, 'h, 'b, 'c, S>
+impl<'r, 'analysis, 'e, 'h, 'b, 'c, S> ExecutionProcessor<'r, 'analysis, 'e, 'h, 'b, 'c, S>
 where
     S: State,
 {
     pub fn new(
         state: &'r mut S,
-        tracer: Option<&'tracer mut dyn Tracer>,
+        tracer: Option<Arc<Mutex<dyn Tracer>>>,
         analysis_cache: &'analysis mut AnalysisCache,
         engine: &'e mut dyn Consensus,
         header: &'h PartialHeader,
@@ -166,7 +166,7 @@ where
             &mut self.state,
             // https://github.com/rust-lang/rust-clippy/issues/7846
             #[allow(clippy::needless_option_as_deref)]
-            self.tracer.as_deref_mut(),
+            self.tracer.clone(),
             self.analysis_cache,
             self.header,
             self.block_spec,

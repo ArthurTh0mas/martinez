@@ -7,11 +7,11 @@ pub trait Tracer: Send + Sync {
     const DUMMY: bool = false;
 
     /// Called when execution starts.
-    fn notify_execution_start(&mut self, revision: Revision, message: Message, code: Bytes) {}
+    fn notify_execution_start(&mut self, _revision: Revision, _message: Message, _code: Bytes) {}
     /// Called on each instruction.
-    fn notify_instruction_start(&mut self, pc: usize, opcode: OpCode, state: &ExecutionState) {}
+    fn notify_instruction_start(&mut self, _pc: usize, _opcode: OpCode, _state: &ExecutionState) {}
     /// Called when execution ends.
-    fn notify_execution_end(&mut self, output: &Output) {}
+    fn notify_execution_end(&mut self, _output: &Output) {}
 }
 
 /// Tracer which does nothing.
@@ -19,12 +19,6 @@ pub struct NoopTracer;
 
 impl Tracer for NoopTracer {
     const DUMMY: bool = true;
-
-    fn notify_execution_start(&mut self, _: Revision, _: Message, _: Bytes) {}
-
-    fn notify_instruction_start(&mut self, _: usize, _: OpCode, _: &ExecutionState) {}
-
-    fn notify_execution_end(&mut self, _: &Output) {}
 }
 
 #[derive(Serialize)]

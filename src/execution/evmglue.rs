@@ -19,8 +19,9 @@ use anyhow::Context;
 use arrayvec::ArrayVec;
 use async_recursion::async_recursion;
 use bytes::Bytes;
+use parking_lot::Mutex;
 use sha3::{Digest, Keccak256};
-use std::{cmp::min, convert::TryFrom};
+use std::{cmp::min, convert::TryFrom, sync::Arc};
 
 pub struct CallResult {
     /// EVM exited with this status code.
@@ -31,12 +32,12 @@ pub struct CallResult {
     pub output_data: Bytes,
 }
 
-struct Evm<'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>
+struct Evm<'r, 'state, 'analysis, 'h, 'c, 't, B>
 where
     B: State,
 {
     state: &'state mut IntraBlockState<'r, B>,
-    tracer: Option<&'tracer mut dyn Tracer>,
+    tracer: Option<Arc<Mutex<dyn Tracer>>>,
     analysis_cache: &'analysis mut AnalysisCache,
     header: &'h PartialHeader,
     block_spec: &'c BlockExecutionSpec,
@@ -44,22 +45,19 @@ where
     beneficiary: Address,
 }
 
-pub struct EvmHost<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>
+pub struct EvmHost<'evm, 'r, 'state, 'analysis, 'h, 'c, 't, B>
 where
     B: State,
-    'tracer: 'evm,
 {
-    inner: &'evm mut Evm<'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>,
+    inner: &'evm mut Evm<'r, 'state, 'analysis, 'h, 'c, 't, B>,
 }
 
-impl<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>
-    EvmHost<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>
+impl<'evm, 'r, 'state, 'analysis, 'h, 'c, 't, B> EvmHost<'evm, 'r, 'state, 'analysis, 'h, 'c, 't, B>
 where
     B: State,
-    'tracer: 'evm,
 {
-    pub fn tracer(&mut self) -> Option<&'tracer mut dyn Tracer> {
-        self.inner.tracer
+    pub fn tracer(&mut self) -> Option<Arc<Mutex<dyn Tracer>>> {
+        self.inner.tracer.clone()
     }
 
     pub async fn account_exists(&mut self, address: Address) -> anyhow::Result<bool> {
@@ -223,7 +221,7 @@ where
         self.inner.state.set_balance(address, 0).await?;
 
         if let Some(tracer) = self.tracer() {
-            tracer.capture_self_destruct(address, beneficiary);
+            tracer.lock().capture_self_destruct(address, beneficiary);
         }
 
         Ok(())
@@ -321,7 +319,7 @@ where
 
 pub async fn execute<B: State>(
     state: &mut IntraBlockState<'_, B>,
-    tracer: Option<&mut dyn Tracer>,
+    tracer: Option<Arc<Mutex<dyn Tracer>>>,
     analysis_cache: &mut AnalysisCache,
     header: &PartialHeader,
     block_spec: &BlockExecutionSpec,
@@ -370,11 +368,11 @@ pub async fn execute<B: State>(
     })
 }
 
-impl<'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>
-    Evm<'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>
+impl<'r, 'state, 'analysis, 'h, 'c, 't, B> Evm<'r, 'state, 'analysis, 'h, 'c, 't, B>
 where
     B: State,
 {
+    #[async_recursion]
     async fn create(&mut self, message: CreateMessage) -> anyhow::Result<Output> {
         let mut res = Output {
             status_code: StatusCode::Success,
@@ -407,7 +405,7 @@ where
         self.state.access_account(contract_addr);
 
         if let Some(tracer) = self.tracer.as_mut() {
-            tracer.capture_start(
+            tracer.lock().capture_start(
                 message.depth.try_into().unwrap(),
                 message.sender,
                 contract_addr,
@@ -493,6 +491,7 @@ where
         Ok(res)
     }
 
+    #[async_recursion]
     async fn call(&mut self, message: EvmMessage) -> anyhow::Result<Output> {
         let mut res = Output {
             status_code: StatusCode::Success,
@@ -527,7 +526,7 @@ where
                     _ => unreachable!(),
                 }
             };
-            tracer.capture_start(
+            tracer.lock().capture_start(
                 message.depth.try_into().unwrap(),
                 message.sender,
                 message.recipient,
@@ -631,7 +630,17 @@ where
 
         let revision = self.block_spec.revision;
         let mut host = EvmHost { inner: self };
-        analysis.execute_async(&mut host, msg, revision).await
+        let depth = msg.depth;
+        let output = analysis.execute_async(&mut host, msg, revision).await?;
+        if let Some(tracer) = &self.tracer {
+            tracer.lock().capture_end(
+                depth.try_into().unwrap(),
+                output.output_data.clone(),
+                output.gas_left.try_into().unwrap_or(0),
+                output.status_code,
+            );
+        }
+        Ok(output)
     }
 
     fn number_of_precompiles(&self) -> u8 {

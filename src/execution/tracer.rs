@@ -32,6 +32,9 @@ pub enum MessageKind {
 #[allow(unused, clippy::too_many_arguments)]
 #[auto_impl(Box, &mut)]
 pub trait Tracer: Send + Sync + 'static {
+    fn opcode_tracing(&self) -> bool {
+        false
+    }
     fn capture_start(
         &mut self,
         depth: u16,

@@ -1110,7 +1110,7 @@ fn returndatasize() {
 
     t.apply_host_fn(|host, _| {
         host.call_result.output_data = Bytes::new();
-        host.call_result.status_code = StatusCode::InternalError(String::new());
+        host.call_result.status_code = StatusCode::InternalError("");
     })
     .gas_used(735)
     .output_data([0])

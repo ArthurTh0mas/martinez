@@ -17,7 +17,7 @@ fn check_requirements(
     instruction_table: &InstructionTable,
     state: &mut ExecutionState,
     op: OpCode,
-) -> Result<(), StatusCode> {
+) -> Result<u16, StatusCode> {
     let metrics = instruction_table[op.to_usize()]
         .as_ref()
         .ok_or(StatusCode::UndefinedInstruction)?;
@@ -36,7 +36,7 @@ fn check_requirements(
         return Err(StatusCode::StackUnderflow);
     }
 
-    Ok(())
+    Ok(metrics.gas_cost)
 }
 
 #[derive(Clone, Debug)]
@@ -147,20 +147,20 @@ impl AnalyzedCode {
         output
     }
 
-    pub async fn execute_async<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>(
+    pub async fn execute_async<'evm, 'r, 'state, 'analysis, 'h, 'c, 't, B>(
         self,
-        host: &mut EvmHost<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>,
+        host: &mut EvmHost<'evm, 'r, 'state, 'analysis, 'h, 'c, 't, B>,
         message: Message,
         revision: Revision,
     ) -> anyhow::Result<Output>
     where
         B: State,
     {
-        let mut enable_tracing = false;
-        if let Some(t) = &mut host.tracer() {
-            // t.notify_execution_start(revision, message.clone(), self.code.clone());
-            enable_tracing = true;
-        }
+        let enable_tracing = host
+            .tracer()
+            .as_ref()
+            .map(|t| t.lock().opcode_tracing())
+            .unwrap_or(false);
 
         let state = ExecutionState::new(message);
         let output = match (enable_tracing, revision) {
@@ -242,10 +242,6 @@ impl AnalyzedCode {
             },
             Err(DuoError::Error(e)) => return Err(e),
         };
-
-        if let Some(t) = host.tracer() {
-            // t.notify_execution_end(&output);
-        }
 
         Ok(output)
     }
@@ -759,7 +755,6 @@ async fn execute<
     'evm,
     'r,
     'state,
-    'tracer,
     'analysis,
     'h,
     'c,
@@ -770,7 +765,7 @@ async fn execute<
 >(
     s: AnalyzedCode,
     mut state: ExecutionState,
-    host: &mut EvmHost<'evm, 'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>,
+    host: &mut EvmHost<'evm, 'r, 'state, 'analysis, 'h, 'c, 't, B>,
 ) -> Result<SuccessfulOutput, DuoError> {
     let instruction_table = get_baseline_instruction_table(REVISION);
 
@@ -781,16 +776,24 @@ async fn execute<
     loop {
         let op = OpCode(s.padded_code[pc]);
 
+        let gas_cost = check_requirements(instruction_table, &mut state, op)?;
+
         if TRACE {
             // Do not print stop on the final STOP
             if pc < s.code.len() {
                 if let Some(t) = host.tracer() {
-                    // t.notify_instruction_start(pc, op, &state);
+                    t.lock().capture_state(
+                        &state,
+                        pc.try_into().unwrap(),
+                        op,
+                        gas_cost.try_into().unwrap(),
+                        state.return_data.clone(),
+                        state.message.depth.try_into().unwrap(),
+                        StatusCode::Success,
+                    );
                 }
             }
         }
-
-        check_requirements(instruction_table, &mut state, op)?;
 
         match op {
             OpCode::STOP => {

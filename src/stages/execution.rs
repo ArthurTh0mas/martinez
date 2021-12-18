@@ -17,7 +17,11 @@ use crate::{
 };
 use anyhow::{format_err, Context};
 use async_trait::async_trait;
-use std::time::{Duration, Instant};
+use parking_lot::Mutex;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tracing::*;
 
 /// Execution of blocks through EVM
@@ -78,10 +82,10 @@ async fn execute_batch_of_blocks<'db, Tx: MutableTransaction<'db>>(
 
         let block_spec = chain_config.collect_block_spec(block_number);
 
-        let mut call_tracer = CallTracer::default();
+        let call_tracer = Arc::new(Mutex::new(CallTracer::default()));
         let receipts = ExecutionProcessor::new(
             &mut buffer,
-            Some(&mut call_tracer),
+            Some(call_tracer.clone()),
             &mut analysis_cache,
             &mut *consensus_engine,
             &header,
@@ -101,7 +105,8 @@ async fn execute_batch_of_blocks<'db, Tx: MutableTransaction<'db>>(
 
         {
             let mut c = tx.mutable_cursor_dupsort(tables::CallTraceSet).await?;
-            for (address, CallTracerFlags { from, to }) in call_tracer.into_sorted_iter() {
+            let it = call_tracer.lock().into_sorted_iter().collect::<Vec<_>>();
+            for (address, CallTracerFlags { from, to }) in it {
                 c.append_dup(header.number, CallTraceSetEntry { address, from, to })
                     .await?;
             }
