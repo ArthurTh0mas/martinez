@@ -1,4 +1,4 @@
-use super::common::{Message, Output};
+use super::{common::Message, CreateMessage};
 use ethereum_types::Address;
 use ethnum::U256;
 
@@ -52,111 +52,8 @@ pub struct TxContext {
     pub block_base_fee: U256,
 }
 
-/// Abstraction that exposes host context to EVM.
-pub trait Host {
-    /// Check if an account exists.
-    fn account_exists(&self, address: Address) -> bool;
-    /// Get value of a storage key.
-    ///
-    /// Returns `Ok(U256::zero())` if does not exist.
-    fn get_storage(&self, address: Address, key: U256) -> U256;
-    /// Set value of a storage key.
-    fn set_storage(&mut self, address: Address, key: U256, value: U256) -> StorageStatus;
-    /// Get balance of an account.
-    ///
-    /// Returns `Ok(0)` if account does not exist.
-    fn get_balance(&self, address: Address) -> U256;
-    /// Get code size of an account.
-    ///
-    /// Returns `Ok(0)` if account does not exist.
-    fn get_code_size(&self, address: Address) -> U256;
-    /// Get code hash of an account.
-    ///
-    /// Returns `Ok(0)` if account does not exist.
-    fn get_code_hash(&self, address: Address) -> U256;
-    /// Copy code of an account.
-    ///
-    /// Returns `Ok(0)` if offset is invalid.
-    fn copy_code(&self, address: Address, offset: usize, buffer: &mut [u8]) -> usize;
-    /// Self-destruct account.
-    fn selfdestruct(&mut self, address: Address, beneficiary: Address);
-    /// Call to another account.
-    fn call(&mut self, msg: &Message) -> Output;
-    /// Retrieve transaction context.
-    fn get_tx_context(&self) -> TxContext;
-    /// Get block hash.
-    ///
-    /// Returns `Ok(U256::zero())` if block does not exist.
-    fn get_block_hash(&self, block_number: u64) -> U256;
-    /// Emit a log.
-    fn emit_log(&mut self, address: Address, data: &[u8], topics: &[U256]);
-    /// Mark account as warm, return previous access status.
-    ///
-    /// Returns `Ok(AccessStatus::Cold)` if account does not exist.
-    fn access_account(&mut self, address: Address) -> AccessStatus;
-    /// Mark storage key as warm, return previous access status.
-    ///
-    /// Returns `Ok(AccessStatus::Cold)` if account does not exist.
-    fn access_storage(&mut self, address: Address, key: U256) -> AccessStatus;
-}
-
-/// Host that does not support any ops.
-pub struct DummyHost;
-
-impl Host for DummyHost {
-    fn account_exists(&self, _: Address) -> bool {
-        todo!()
-    }
-
-    fn get_storage(&self, _: Address, _: U256) -> U256 {
-        todo!()
-    }
-
-    fn set_storage(&mut self, _: Address, _: U256, _: U256) -> StorageStatus {
-        todo!()
-    }
-
-    fn get_balance(&self, _: Address) -> U256 {
-        todo!()
-    }
-
-    fn get_code_size(&self, _: Address) -> U256 {
-        todo!()
-    }
-
-    fn get_code_hash(&self, _: Address) -> U256 {
-        todo!()
-    }
-
-    fn copy_code(&self, _: Address, _: usize, _: &mut [u8]) -> usize {
-        todo!()
-    }
-
-    fn selfdestruct(&mut self, _: Address, _: Address) {
-        todo!()
-    }
-
-    fn call(&mut self, _: &Message) -> Output {
-        todo!()
-    }
-
-    fn get_tx_context(&self) -> TxContext {
-        todo!()
-    }
-
-    fn get_block_hash(&self, _: u64) -> U256 {
-        todo!()
-    }
-
-    fn emit_log(&mut self, _: Address, _: &[u8], _: &[U256]) {
-        todo!()
-    }
-
-    fn access_account(&mut self, _: Address) -> AccessStatus {
-        todo!()
-    }
-
-    fn access_storage(&mut self, _: Address, _: U256) -> AccessStatus {
-        todo!()
-    }
+#[derive(Clone, Debug)]
+pub enum Call {
+    Call(Message),
+    Create(CreateMessage),
 }

@@ -8,8 +8,7 @@ use super::{
 use crate::{
     chain::protocol_param::{fee, param},
     execution::evm::{
-        continuation::interrupt_data::*, host::*, CallKind, CreateMessage, Message as EvmMessage,
-        Output, Revision, StatusCode,
+        host::*, CallKind, CreateMessage, Message as EvmMessage, Output, Revision, StatusCode,
     },
     h256_to_u256,
     models::*,
