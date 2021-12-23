@@ -33,11 +33,13 @@ pub struct Execution {
     pub batch_until: Option<BlockNumber>,
     pub commit_every: Option<Duration>,
     pub prune_from: BlockNumber,
+    pub analysis_cache: AnalysisCache,
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_batch_of_blocks<'db, Tx: MutableTransaction<'db>>(
     tx: &Tx,
+    analysis_cache: &mut AnalysisCache,
     chain_config: ChainSpec,
     max_block: BlockNumber,
     batch_size: u64,
@@ -50,7 +52,6 @@ async fn execute_batch_of_blocks<'db, Tx: MutableTransaction<'db>>(
 ) -> anyhow::Result<BlockNumber> {
     let mut buffer = Buffer::new(tx, prune_from, None);
     let mut consensus_engine = engine_factory(chain_config.clone())?;
-    let mut analysis_cache = AnalysisCache::default();
 
     let mut block_number = starting_block;
     let mut gas_since_start = 0;
@@ -86,7 +87,7 @@ async fn execute_batch_of_blocks<'db, Tx: MutableTransaction<'db>>(
         let receipts = ExecutionProcessor::new(
             &mut buffer,
             Some(call_tracer.clone()),
-            &mut analysis_cache,
+            analysis_cache,
             &mut *consensus_engine,
             &header,
             &block,
@@ -220,6 +221,7 @@ impl<'db, RwTx: MutableTransaction<'db>> Stage<'db, RwTx> for Execution {
         Ok(if max_block >= starting_block {
             let executed_to = execute_batch_of_blocks(
                 tx,
+                &mut self.analysis_cache,
                 chain_config,
                 max_block,
                 self.batch_size,

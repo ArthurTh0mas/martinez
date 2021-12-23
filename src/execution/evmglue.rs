@@ -449,9 +449,7 @@ where
             value: message.endowment,
         };
 
-        res = self
-            .execute(deploy_message, message.initcode.as_ref().to_vec(), None)
-            .await?;
+        res = self.execute(deploy_message, message.initcode, None).await?;
 
         if res.status_code == StatusCode::Success {
             let code_len = res.output_data.len();
@@ -594,9 +592,7 @@ where
 
             let code_hash = self.state.get_code_hash(message.code_address).await?;
 
-            res = self
-                .execute(message, code.as_ref().to_vec(), Some(code_hash))
-                .await?;
+            res = self.execute(message, code, Some(code_hash)).await?;
         }
 
         if res.status_code != StatusCode::Success {
@@ -612,19 +608,19 @@ where
     async fn execute(
         &mut self,
         msg: EvmMessage,
-        code: Vec<u8>,
+        code: Bytes,
         code_hash: Option<H256>,
     ) -> anyhow::Result<Output> {
         let analysis = if let Some(code_hash) = code_hash {
             if let Some(cache) = self.analysis_cache.get(code_hash) {
                 cache.clone()
             } else {
-                let analysis = AnalyzedCode::analyze(code);
+                let analysis = AnalyzedCode::analyze(&code[..]);
                 self.analysis_cache.put(code_hash, analysis.clone());
                 analysis
             }
         } else {
-            AnalyzedCode::analyze(code)
+            AnalyzedCode::analyze(&code[..])
         };
 
         let revision = self.block_spec.revision;

@@ -1,6 +1,7 @@
 use martinez::{
     binutil::MartinezDataDir,
     downloader::sentry_status_provider::SentryStatusProvider,
+    execution::analysis_cache::AnalysisCache,
     kv::{
         tables::{self, ErasedTable},
         traits::*,
@@ -28,6 +29,25 @@ use tokio::pin;
 use tokio_stream::StreamExt;
 use tracing::*;
 use tracing_subscriber::{prelude::*, EnvFilter};
+
+#[derive(Parser)]
+pub struct ExecutionOpts {
+    /// Execution batch size (Ggas).
+    #[clap(long = "execution.batch-size", default_value = "5000")]
+    pub batch_size: u64,
+
+    /// Execution history batch size (Ggas).
+    #[clap(long = "execution.history-batch-size", default_value = "250")]
+    pub history_batch_size: u64,
+
+    /// Exit execution stage after batch.
+    #[clap(long = "execution.exit-after-batch")]
+    pub exit_after_batch: bool,
+
+    /// Contract analysis cache size (# contracts).
+    #[clap(long = "execution.analysis-cache-size", default_value = "5000")]
+    pub analysis_cache_size: usize,
+}
 
 #[derive(Parser)]
 #[clap(name = "Martinez", about = "Next-generation Ethereum implementation.")]
@@ -72,17 +92,9 @@ pub struct Opt {
     #[clap(long, default_value = "500000")]
     pub sender_recovery_batch_size: u64,
 
-    /// Execution batch size (Ggas).
-    #[clap(long, default_value = "5000")]
-    pub execution_batch_size: u64,
-
-    /// Execution history batch size (Ggas).
-    #[clap(long, default_value = "250")]
-    pub execution_history_batch_size: u64,
-
-    /// Exit execution stage after batch.
-    #[clap(long)]
-    pub execution_exit_after_batch: bool,
+    /// Execution options.
+    #[clap(flatten)]
+    pub execution_opts: ExecutionOpts,
 
     /// Skip commitment (state root) verification.
     #[clap(long)]
@@ -669,14 +681,19 @@ fn main() -> anyhow::Result<()> {
                     batch_size: opt.sender_recovery_batch_size.try_into().unwrap(),
                 });
                 staged_sync.push(Execution {
-                    batch_size: opt.execution_batch_size.saturating_mul(1_000_000_000_u64),
-                    history_batch_size: opt
-                        .execution_history_batch_size
+                    batch_size: opt
+                        .execution_opts
+                        .batch_size
                         .saturating_mul(1_000_000_000_u64),
-                    exit_after_batch: opt.execution_exit_after_batch,
+                    history_batch_size: opt
+                        .execution_opts
+                        .history_batch_size
+                        .saturating_mul(1_000_000_000_u64),
+                    exit_after_batch: opt.execution_opts.exit_after_batch,
                     batch_until: None,
                     commit_every: None,
                     prune_from: BlockNumber(0),
+                    analysis_cache: AnalysisCache::new(opt.execution_opts.analysis_cache_size),
                 });
                 if !opt.skip_commitment {
                     staged_sync.push(HashState::new(etl_temp_dir.clone(), None));
