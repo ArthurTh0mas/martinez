@@ -131,11 +131,7 @@ pub(crate) fn exp<const REVISION: Revision>(state: &mut ExecutionState) -> Resul
         };
         let additional_gas = factor * (log2floor(power) / 8 + 1);
 
-        state.gas_left -= additional_gas as i64;
-
-        if state.gas_left < 0 {
-            return Err(StatusCode::OutOfGas);
-        }
+        state.gasometer.subtract(additional_gas)?;
     }
 
     let mut v = U256::ONE;

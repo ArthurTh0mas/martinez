@@ -3,7 +3,7 @@ use once_cell::sync::Lazy;
 
 #[derive(Clone, Copy, Debug)]
 pub struct InstructionTableEntry {
-    pub gas_cost: u16,
+    pub gas_cost: u64,
     pub stack_height_required: u8,
     pub can_overflow_stack: bool,
 }

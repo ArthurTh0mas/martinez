@@ -1,9 +1,9 @@
-use super::common::Message;
+use super::{common::Message, StatusCode};
 use arrayvec::ArrayVec;
 use bytes::{Bytes, BytesMut};
 use derive_more::{Deref, DerefMut};
 use ethnum::U256;
-use getset::{Getters, MutGetters};
+use getset::*;
 use serde::Serialize;
 
 pub const STACK_SIZE: usize = 1024;
@@ -90,11 +90,44 @@ impl Default for Memory {
     }
 }
 
+#[derive(Clone, Debug, CopyGetters)]
+
+pub struct Gasometer {
+    #[getset(get_copy = "pub")]
+    gas_left: u64,
+}
+
+impl Gasometer {
+    pub fn new(gas: u64) -> Self {
+        Self { gas_left: gas }
+    }
+
+    #[inline(always)]
+    pub fn refund(&mut self, amount: u64) {
+        self.gas_left += amount;
+    }
+
+    #[inline(always)]
+    pub fn subtract(&mut self, amount: u64) -> Result<(), StatusCode> {
+        self.gas_left = self
+            .gas_left
+            .checked_sub(amount)
+            .ok_or(StatusCode::OutOfGas)?;
+
+        Ok(())
+    }
+
+    #[inline(always)]
+    pub fn subtract_unchecked(&mut self, amount: u64) {
+        self.gas_left -= amount
+    }
+}
+
 /// EVM execution state.
 #[derive(Clone, Debug, Getters, MutGetters)]
 pub struct ExecutionState {
     #[getset(get = "pub", get_mut = "pub")]
-    pub(crate) gas_left: i64,
+    pub(crate) gasometer: Gasometer,
     #[getset(get = "pub", get_mut = "pub")]
     pub(crate) stack: Stack,
     #[getset(get = "pub", get_mut = "pub")]
@@ -108,7 +141,7 @@ pub struct ExecutionState {
 impl ExecutionState {
     pub fn new(message: Message) -> Self {
         Self {
-            gas_left: message.gas,
+            gasometer: Gasometer::new(message.gas),
             stack: Stack::default(),
             memory: Memory::new(),
             message,

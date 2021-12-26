@@ -14,15 +14,12 @@ fn check_requirements(
     instruction_table: &InstructionTable,
     state: &mut ExecutionState,
     op: OpCode,
-) -> Result<u16, StatusCode> {
+) -> Result<u64, StatusCode> {
     let metrics = instruction_table[op.to_usize()]
         .as_ref()
         .ok_or(StatusCode::UndefinedInstruction)?;
 
-    state.gas_left -= metrics.gas_cost as i64;
-    if state.gas_left < 0 {
-        return Err(StatusCode::OutOfGas);
-    }
+    state.gasometer.subtract(metrics.gas_cost)?;
 
     let stack_size = state.stack.len();
     if stack_size == STACK_SIZE {
@@ -40,6 +37,7 @@ fn check_requirements(
 pub struct JumpdestMap(Arc<[bool]>);
 
 impl JumpdestMap {
+    #[inline(always)]
     pub fn contains(&self, dst: U256) -> bool {
         dst < u128::try_from(self.0.len()).unwrap() && self.0[dst.as_usize()]
     }
@@ -255,9 +253,9 @@ async fn execute<
                         &state,
                         pc.try_into().unwrap(),
                         op,
-                        gas_cost.try_into().unwrap(),
+                        gas_cost,
                         state.return_data.clone(),
-                        state.message.depth.try_into().unwrap(),
+                        state.message.depth,
                         StatusCode::Success,
                     );
                 }
@@ -449,9 +447,7 @@ async fn execute<
             OpCode::SSTORE => {
                 sstore_async!(state, REVISION, host);
             }
-            OpCode::GAS => state
-                .stack
-                .push(u128::try_from(state.gas_left).unwrap().into()),
+            OpCode::GAS => state.stack.push(state.gasometer.gas_left().into()),
             OpCode::JUMPDEST => {}
             OpCode::PUSH1 => {
                 push1(&mut state.stack, s.padded_code[pc + 1]);
@@ -568,7 +564,7 @@ async fn execute<
 
     let output = SuccessfulOutput {
         reverted,
-        gas_left: state.gas_left,
+        gas_left: state.gasometer.gas_left(),
         output_data: state.output_data.clone(),
     };
 

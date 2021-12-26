@@ -26,7 +26,7 @@ pub struct CallResult {
     /// EVM exited with this status code.
     pub status_code: StatusCode,
     /// How much gas was left after execution
-    pub gas_left: i64,
+    pub gas_left: u64,
     /// Output data returned.
     pub output_data: Bytes,
 }
@@ -108,10 +108,11 @@ where
                     }
                 };
 
-                let mut sstore_reset_gas = fee::G_SRESET;
-                if self.inner.block_spec.revision >= Revision::Berlin {
-                    sstore_reset_gas -= fee::COLD_SLOAD_COST;
-                }
+                let sstore_reset_gas = if self.inner.block_spec.revision >= Revision::Berlin {
+                    fee::G_SRESET - fee::COLD_SLOAD_COST
+                } else {
+                    fee::G_SRESET
+                };
 
                 // https://eips.ethereum.org/EIPS/eip-1283
                 let original_val = self.inner.state.get_original_storage(address, key).await?;
@@ -343,7 +344,7 @@ pub async fn execute<B: State>(
             sender: txn.sender,
             input_data: txn.input().clone(),
             value: txn.value(),
-            gas: gas as i64,
+            gas,
             recipient: to,
             code_address: to,
         })
@@ -351,7 +352,7 @@ pub async fn execute<B: State>(
     } else {
         evm.create(CreateMessage {
             depth: 0,
-            gas: gas as i64,
+            gas,
             sender: txn.sender,
             initcode: txn.input().clone(),
             endowment: txn.value(),
@@ -405,12 +406,12 @@ where
 
         if let Some(tracer) = self.tracer.as_mut() {
             tracer.lock().capture_start(
-                message.depth.try_into().unwrap(),
+                message.depth,
                 message.sender,
                 contract_addr,
                 MessageKind::Create,
                 message.initcode.clone(),
-                message.gas.try_into().unwrap(),
+                message.gas,
                 message.endowment,
             );
         };
@@ -466,8 +467,8 @@ where
             {
                 // https://eips.ethereum.org/EIPS/eip-170
                 res.status_code = StatusCode::OutOfGas;
-            } else if res.gas_left >= 0 && res.gas_left as u64 >= code_deploy_gas {
-                res.gas_left -= code_deploy_gas as i64;
+            } else if res.gas_left >= code_deploy_gas {
+                res.gas_left -= code_deploy_gas;
                 self.state
                     .set_code(contract_addr, res.output_data.clone())
                     .await?;
@@ -524,7 +525,7 @@ where
                 }
             };
             tracer.lock().capture_start(
-                message.depth.try_into().unwrap(),
+                message.depth,
                 message.sender,
                 message.recipient,
                 MessageKind::Call {
@@ -536,7 +537,7 @@ where
                     },
                 },
                 message.input_data.clone(),
-                message.gas.try_into().unwrap(),
+                message.gas,
                 value,
             )
         }
@@ -569,17 +570,17 @@ where
             let num = message.code_address.0[ADDRESS_LENGTH - 1] as usize;
             let contract = &precompiled::CONTRACTS[num - 1];
             let input = message.input_data;
-            if let Some(gas) = (contract.gas)(input.clone(), self.block_spec.revision)
-                .and_then(|g| i64::try_from(g).ok())
-            {
-                if gas > message.gas {
-                    res.status_code = StatusCode::OutOfGas;
-                } else if let Some(output) = (contract.run)(input) {
-                    res.status_code = StatusCode::Success;
-                    res.gas_left = message.gas - gas;
-                    res.output_data = output;
+            if let Some(gas) = (contract.gas)(input.clone(), self.block_spec.revision) {
+                if let Some(gas_left) = message.gas.checked_sub(gas) {
+                    if let Some(output) = (contract.run)(input) {
+                        res.status_code = StatusCode::Success;
+                        res.gas_left = gas_left;
+                        res.output_data = output;
+                    } else {
+                        res.status_code = StatusCode::PrecompileFailure;
+                    }
                 } else {
-                    res.status_code = StatusCode::PrecompileFailure;
+                    res.status_code = StatusCode::OutOfGas;
                 }
             } else {
                 res.status_code = StatusCode::OutOfGas;
@@ -629,9 +630,9 @@ where
         let output = analysis.execute_async(&mut host, msg, revision).await?;
         if let Some(tracer) = &self.tracer {
             tracer.lock().capture_end(
-                depth.try_into().unwrap(),
+                depth,
                 output.output_data.clone(),
-                output.gas_left.try_into().unwrap_or(0),
+                output.gas_left,
                 output.status_code,
             );
         }

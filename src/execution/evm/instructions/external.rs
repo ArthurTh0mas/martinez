@@ -23,10 +23,9 @@ macro_rules! balance_async {
 
         if $rev >= Revision::Berlin {
             if $host.access_account(address) == AccessStatus::Cold {
-                $state.gas_left -= i64::from(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST);
-                if $state.gas_left < 0 {
-                    return Err(StatusCode::OutOfGas.into());
-                }
+                $state
+                    .gasometer
+                    .subtract(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST)?;
             }
         }
 
@@ -46,10 +45,9 @@ macro_rules! extcodesize_async {
 
         if $rev >= Revision::Berlin {
             if $host.access_account(address) == AccessStatus::Cold {
-                $state.gas_left -= i64::from(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST);
-                if $state.gas_left < 0 {
-                    return Err(StatusCode::OutOfGas.into());
-                }
+                $state
+                    .gasometer
+                    .subtract(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST)?;
             }
         }
 
@@ -152,11 +150,8 @@ macro_rules! do_log_async {
             memory::get_memory_region($state, offset, size).map_err(|_| StatusCode::OutOfGas)?;
 
         if let Some(region) = &region {
-            let cost = region.size.get() as i64 * 8;
-            $state.gas_left -= cost;
-            if cost < 0 {
-                return Err(StatusCode::OutOfGas.into());
-            }
+            let cost = region.size.get() as u64 * 8;
+            $state.gasometer.subtract(cost)?;
         }
 
         let mut topics = ArrayVec::<_, 4>::new();
@@ -191,11 +186,8 @@ macro_rules! sload_async {
             if $host.access_storage($state.message.recipient, key) == AccessStatus::Cold {
                 // The warm storage access cost is already applied (from the cost table).
                 // Here we need to apply additional cold storage access cost.
-                const ADDITIONAL_COLD_SLOAD_COST: u16 = COLD_SLOAD_COST - WARM_STORAGE_READ_COST;
-                $state.gas_left -= i64::from(ADDITIONAL_COLD_SLOAD_COST);
-                if $state.gas_left < 0 {
-                    return Err(StatusCode::OutOfGas.into());
-                }
+                const ADDITIONAL_COLD_SLOAD_COST: u64 = COLD_SLOAD_COST - WARM_STORAGE_READ_COST;
+                $state.gasometer.subtract(ADDITIONAL_COLD_SLOAD_COST)?;
             }
         }
 
@@ -219,7 +211,7 @@ macro_rules! sstore_async {
         }
 
         if $rev >= Revision::Istanbul {
-            if $state.gas_left <= 2300 {
+            if $state.gasometer.gas_left() <= 2300 {
                 return Err(StatusCode::OutOfGas.into());
             }
         }
@@ -259,10 +251,7 @@ macro_rules! sstore_async {
             }
             StorageStatus::Added => cost + 20000,
         };
-        $state.gas_left -= i64::from(cost);
-        if $state.gas_left < 0 {
-            return Err(StatusCode::OutOfGas.into());
-        }
+        $state.gasometer.subtract(cost)?;
     }};
 }
 
@@ -280,10 +269,7 @@ macro_rules! selfdestruct_async {
 
         if $rev >= Revision::Berlin {
             if $host.access_account(beneficiary) == AccessStatus::Cold {
-                $state.gas_left -= i64::from(COLD_ACCOUNT_ACCESS_COST);
-                if $state.gas_left < 0 {
-                    return Err(StatusCode::OutOfGas.into());
-                }
+                $state.gasometer.subtract(COLD_ACCOUNT_ACCESS_COST)?;
             }
         }
 
@@ -294,10 +280,7 @@ macro_rules! selfdestruct_async {
                 // After TANGERINE_WHISTLE apply additional cost of
                 // sending value to a non-existing account.
                 if !$host.account_exists(beneficiary).await? {
-                    $state.gas_left -= 25000;
-                    if $state.gas_left < 0 {
-                        return Err(StatusCode::OutOfGas.into());
-                    }
+                    $state.gasometer.subtract(25_000)?;
                 }
             }
         }

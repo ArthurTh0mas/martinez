@@ -27,10 +27,9 @@ macro_rules! do_call_async {
 
         if $rev >= Revision::Berlin {
             if $host.access_account(dst) == AccessStatus::Cold {
-                $state.gas_left -= i64::from(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST);
-                if $state.gas_left < 0 {
-                    return Err(StatusCode::OutOfGas.into());
-                }
+                $state
+                    .gasometer
+                    .subtract(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST)?;
             }
         }
 
@@ -54,7 +53,7 @@ macro_rules! do_call_async {
             } else {
                 $state.message.recipient
             },
-            gas: i64::MAX,
+            gas: i64::MAX as u64,
             value: if matches!($kind, CallKind::DelegateCall) {
                 $state.message.value
             } else {
@@ -67,7 +66,7 @@ macro_rules! do_call_async {
                 .unwrap_or_default(),
         };
 
-        let mut cost = if has_value { 9000 } else { 0 };
+        let mut cost = if has_value { 9000_u64 } else { 0_u64 };
 
         if matches!($kind, CallKind::Call) {
             if has_value && $state.message.is_static {
@@ -78,25 +77,25 @@ macro_rules! do_call_async {
                 cost += 25000;
             }
         }
-        $state.gas_left -= cost;
-        if $state.gas_left < 0 {
-            return Err(StatusCode::OutOfGas.into());
-        }
+        $state.gasometer.subtract(cost)?;
 
-        if gas < u128::try_from(msg.gas).unwrap() {
-            msg.gas = gas.as_usize() as i64;
+        if gas < u128::from(msg.gas) {
+            msg.gas = gas.as_u64();
         }
 
         if $rev >= Revision::Tangerine {
             // TODO: Always true for STATICCALL.
-            msg.gas = min(msg.gas, $state.gas_left - $state.gas_left / 64);
-        } else if msg.gas > $state.gas_left {
+            msg.gas = min(
+                msg.gas,
+                $state.gasometer.gas_left() - $state.gasometer.gas_left() / 64,
+            );
+        } else if msg.gas > $state.gasometer.gas_left() {
             return Err(StatusCode::OutOfGas.into());
         }
 
         if has_value {
             msg.gas += 2300; // Add stipend.
-            $state.gas_left += 2300;
+            $state.gasometer.refund(2300);
         }
 
         $state.return_data.clear();
@@ -122,7 +121,7 @@ macro_rules! do_call_async {
             }
 
             let gas_used = msg_gas - result.gas_left;
-            $state.gas_left -= gas_used;
+            $state.gasometer.subtract_unchecked(gas_used);
         }
     }};
 }
@@ -150,10 +149,7 @@ macro_rules! do_create_async {
 
             if let Some(region) = &region {
                 let salt_cost = memory::num_words(region.size.get()) * 6;
-                $state.gas_left -= salt_cost;
-                if $state.gas_left < 0 {
-                    return Err(StatusCode::OutOfGas.into());
-                }
+                $state.gasometer.subtract(salt_cost)?;
             }
 
             Some(salt)
@@ -169,9 +165,9 @@ macro_rules! do_create_async {
         {
             let msg = CreateMessage {
                 gas: if $rev >= Revision::Tangerine {
-                    $state.gas_left - $state.gas_left / 64
+                    $state.gasometer.gas_left() - $state.gasometer.gas_left() / 64
                 } else {
-                    $state.gas_left
+                    $state.gasometer.gas_left()
                 },
 
                 salt,
@@ -189,7 +185,8 @@ macro_rules! do_create_async {
             };
             let msg_gas = msg.gas;
             let result = $host.call(Call::Create(msg)).await?;
-            $state.gas_left -= msg_gas - result.gas_left;
+            let gas_used = msg_gas - result.gas_left;
+            $state.gasometer.subtract_unchecked(gas_used);
 
             $state.return_data = result.output_data;
             if result.status_code == StatusCode::Success {

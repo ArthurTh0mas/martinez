@@ -6,13 +6,13 @@ use std::{cmp::min, num::NonZeroUsize};
 pub(crate) const MAX_BUFFER_SIZE: u128 = u32::MAX as u128;
 
 /// The size of the EVM 256-bit word.
-const WORD_SIZE: i64 = 32;
+const WORD_SIZE: u64 = 32;
 
 /// Returns number of words what would fit to provided number of bytes,
 /// i.e. it rounds up the number bytes to number of words.
 #[inline(always)]
-pub(crate) fn num_words(size_in_bytes: usize) -> i64 {
-    ((size_in_bytes as i64) + (WORD_SIZE - 1)) / WORD_SIZE
+pub(crate) fn num_words(size_in_bytes: usize) -> u64 {
+    ((size_in_bytes as u64) + (WORD_SIZE - 1)) / WORD_SIZE
 }
 
 #[inline(always)]
@@ -65,18 +65,14 @@ pub(crate) fn msize(state: &mut ExecutionState) {
 }
 
 #[inline(never)]
-fn grow_memory(state: &mut ExecutionState, new_size: usize) -> Result<(), ()> {
+fn grow_memory(state: &mut ExecutionState, new_size: usize) -> Result<(), StatusCode> {
     let new_words = num_words(new_size);
-    let current_words = (state.memory.len() / 32) as i64;
+    let current_words = (state.memory.len() / 32) as u64;
     let new_cost = 3 * new_words + new_words * new_words / 512;
     let current_cost = 3 * current_words + current_words * current_words / 512;
     let cost = new_cost - current_cost;
 
-    state.gas_left -= cost;
-
-    if state.gas_left < 0 {
-        return Err(());
-    }
+    state.gasometer.subtract(cost)?;
 
     state.memory.grow((new_words * WORD_SIZE) as usize);
 
@@ -88,9 +84,9 @@ pub(crate) fn get_memory_region_u64(
     state: &mut ExecutionState,
     offset: U256,
     size: NonZeroUsize,
-) -> Result<MemoryRegion, ()> {
+) -> Result<MemoryRegion, StatusCode> {
     if offset > MAX_BUFFER_SIZE {
-        return Err(());
+        return Err(StatusCode::OutOfGas);
     }
 
     let new_size = offset.as_usize() + size.get();
@@ -115,13 +111,13 @@ pub(crate) fn get_memory_region(
     state: &mut ExecutionState,
     offset: U256,
     size: U256,
-) -> Result<Option<MemoryRegion>, ()> {
+) -> Result<Option<MemoryRegion>, StatusCode> {
     if size == 0 {
         return Ok(None);
     }
 
     if size > MAX_BUFFER_SIZE {
-        return Err(());
+        return Err(StatusCode::OutOfGas);
     }
 
     get_memory_region_u64(state, offset, NonZeroUsize::new(size.as_usize()).unwrap()).map(Some)
@@ -132,14 +128,11 @@ pub(crate) fn calldatacopy(state: &mut ExecutionState) -> Result<(), StatusCode>
     let input_index = state.stack.pop();
     let size = state.stack.pop();
 
-    let region = get_memory_region(state, mem_index, size).map_err(|_| StatusCode::OutOfGas)?;
+    let region = get_memory_region(state, mem_index, size)?;
 
     if let Some(region) = &region {
         let copy_cost = num_words(region.size.get()) * 3;
-        state.gas_left -= copy_cost;
-        if state.gas_left < 0 {
-            return Err(StatusCode::OutOfGas);
-        }
+        state.gasometer.subtract(copy_cost)?;
 
         let input_len = u128::try_from(state.message.input_data.len())
             .unwrap()
@@ -166,16 +159,13 @@ pub(crate) fn keccak256(state: &mut ExecutionState) -> Result<(), StatusCode> {
     let index = state.stack.pop();
     let size = state.stack.pop();
 
-    let region = get_memory_region(state, index, size).map_err(|_| StatusCode::OutOfGas)?;
+    let region = get_memory_region(state, index, size)?;
 
     state.stack.push(u256_from_slice(&*Keccak256::digest(
         if let Some(region) = region {
             let w = num_words(region.size.get());
             let cost = w * 6;
-            state.gas_left -= cost;
-            if state.gas_left < 0 {
-                return Err(StatusCode::OutOfGas);
-            }
+            state.gasometer.subtract(cost)?;
 
             &state.memory[region.offset..region.offset + region.size.get()]
         } else {
@@ -205,10 +195,7 @@ pub(crate) fn codecopy(state: &mut ExecutionState, code: &[u8]) -> Result<(), St
         let copy_size = min(region.size.get(), code.len() - src);
 
         let copy_cost = num_words(region.size.get()) * 3;
-        state.gas_left -= copy_cost;
-        if state.gas_left < 0 {
-            return Err(StatusCode::OutOfGas);
-        }
+        state.gasometer.subtract(copy_cost)?;
 
         // TODO: Add unit tests for each combination of conditions.
         if copy_size > 0 {
@@ -245,18 +232,14 @@ macro_rules! extcodecopy_async {
 
         if let Some(region) = &region {
             let copy_cost = num_words(region.size.get()) * 3;
-            $state.gas_left -= copy_cost;
-            if $state.gas_left < 0 {
-                return Err(StatusCode::OutOfGas.into());
-            }
+            $state.gasometer.subtract(copy_cost)?;
         }
 
         if $rev >= Revision::Berlin {
             if $host.access_account(addr) == AccessStatus::Cold {
-                $state.gas_left -= i64::from(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST);
-                if $state.gas_left < 0 {
-                    return Err(StatusCode::OutOfGas.into());
-                }
+                $state
+                    .gasometer
+                    .subtract(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST)?;
             }
         }
 
@@ -301,10 +284,7 @@ pub(crate) fn returndatacopy(state: &mut ExecutionState) -> Result<(), StatusCod
 
     if let Some(region) = region {
         let copy_cost = num_words(region.size.get()) * 3;
-        state.gas_left -= copy_cost;
-        if state.gas_left < 0 {
-            return Err(StatusCode::OutOfGas);
-        }
+        state.gasometer.subtract(copy_cost)?;
 
         state.memory[region.offset..region.offset + region.size.get()]
             .copy_from_slice(&state.return_data[src..src + region.size.get()]);
@@ -323,10 +303,9 @@ macro_rules! extcodehash_async {
 
         if $rev >= Revision::Berlin {
             if $host.access_account(addr) == AccessStatus::Cold {
-                $state.gas_left -= i64::from(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST);
-                if $state.gas_left < 0 {
-                    return Err(StatusCode::OutOfGas.into());
-                }
+                $state
+                    .gasometer
+                    .subtract(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST)?;
             }
         }
 

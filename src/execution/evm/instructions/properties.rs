@@ -1,15 +1,15 @@
 use crate::execution::evm::{common::Revision, opcode::*};
 use once_cell::sync::Lazy;
 
-pub(crate) const COLD_SLOAD_COST: u16 = 2100;
-pub(crate) const COLD_ACCOUNT_ACCESS_COST: u16 = 2600;
-pub(crate) const WARM_STORAGE_READ_COST: u16 = 100;
+pub(crate) const COLD_SLOAD_COST: u64 = 2100;
+pub(crate) const COLD_ACCOUNT_ACCESS_COST: u64 = 2600;
+pub(crate) const WARM_STORAGE_READ_COST: u64 = 100;
 
 /// Additional cold account access cost.
 ///
 /// The warm access cost is unconditionally applied for every account access instruction.
 /// If the access turns out to be cold, this cost must be applied additionally.
-pub(crate) const ADDITIONAL_COLD_ACCOUNT_ACCESS_COST: u16 =
+pub(crate) const ADDITIONAL_COLD_ACCOUNT_ACCESS_COST: u64 =
     COLD_ACCOUNT_ACCESS_COST - WARM_STORAGE_READ_COST;
 
 /// EVM instruction properties
@@ -191,7 +191,7 @@ pub static PROPERTIES: Lazy<[Option<Properties>; 256]> = Lazy::new(|| {
 });
 
 #[allow(clippy::needless_range_loop)]
-static FRONTIER_GAS_COSTS: Lazy<[Option<u16>; 256]> = Lazy::new(|| {
+static FRONTIER_GAS_COSTS: Lazy<[Option<u64>; 256]> = Lazy::new(|| {
     let mut table = [None; 256];
 
     table[OpCode::STOP.to_usize()] = Some(0);
@@ -267,7 +267,7 @@ static FRONTIER_GAS_COSTS: Lazy<[Option<u16>; 256]> = Lazy::new(|| {
         .into_iter()
         .enumerate()
     {
-        table[op] = Some((1 + i as u16) * 375);
+        table[op] = Some((1 + i as u64) * 375);
     }
 
     table[OpCode::CREATE.to_usize()] = Some(32000);
@@ -280,13 +280,13 @@ static FRONTIER_GAS_COSTS: Lazy<[Option<u16>; 256]> = Lazy::new(|| {
     table
 });
 
-static HOMESTEAD_GAS_COSTS: Lazy<[Option<u16>; 256]> = Lazy::new(|| {
+static HOMESTEAD_GAS_COSTS: Lazy<[Option<u64>; 256]> = Lazy::new(|| {
     let mut table = *FRONTIER_GAS_COSTS;
     table[OpCode::DELEGATECALL.to_usize()] = Some(40);
     table
 });
 
-static TANGERINE_GAS_COSTS: Lazy<[Option<u16>; 256]> = Lazy::new(|| {
+static TANGERINE_GAS_COSTS: Lazy<[Option<u64>; 256]> = Lazy::new(|| {
     let mut table = *HOMESTEAD_GAS_COSTS;
     table[OpCode::BALANCE.to_usize()] = Some(400);
     table[OpCode::EXTCODESIZE.to_usize()] = Some(700);
@@ -299,9 +299,9 @@ static TANGERINE_GAS_COSTS: Lazy<[Option<u16>; 256]> = Lazy::new(|| {
     table
 });
 
-static SPURIOUS_GAS_COSTS: Lazy<[Option<u16>; 256]> = Lazy::new(|| *TANGERINE_GAS_COSTS);
+static SPURIOUS_GAS_COSTS: Lazy<[Option<u64>; 256]> = Lazy::new(|| *TANGERINE_GAS_COSTS);
 
-static BYZANTIUM_GAS_COSTS: Lazy<[Option<u16>; 256]> = Lazy::new(|| {
+static BYZANTIUM_GAS_COSTS: Lazy<[Option<u64>; 256]> = Lazy::new(|| {
     let mut table = *SPURIOUS_GAS_COSTS;
     table[OpCode::RETURNDATASIZE.to_usize()] = Some(2);
     table[OpCode::RETURNDATACOPY.to_usize()] = Some(3);
@@ -310,7 +310,7 @@ static BYZANTIUM_GAS_COSTS: Lazy<[Option<u16>; 256]> = Lazy::new(|| {
     table
 });
 
-static CONSTANTINOPLE_GAS_COSTS: Lazy<[Option<u16>; 256]> = Lazy::new(|| {
+static CONSTANTINOPLE_GAS_COSTS: Lazy<[Option<u64>; 256]> = Lazy::new(|| {
     let mut table = *BYZANTIUM_GAS_COSTS;
     table[OpCode::SHL.to_usize()] = Some(3);
     table[OpCode::SHR.to_usize()] = Some(3);
@@ -320,9 +320,9 @@ static CONSTANTINOPLE_GAS_COSTS: Lazy<[Option<u16>; 256]> = Lazy::new(|| {
     table
 });
 
-static PETERSBURG_GAS_COSTS: Lazy<[Option<u16>; 256]> = Lazy::new(|| *CONSTANTINOPLE_GAS_COSTS);
+static PETERSBURG_GAS_COSTS: Lazy<[Option<u64>; 256]> = Lazy::new(|| *CONSTANTINOPLE_GAS_COSTS);
 
-static ISTANBUL_GAS_COSTS: Lazy<[Option<u16>; 256]> = Lazy::new(|| {
+static ISTANBUL_GAS_COSTS: Lazy<[Option<u64>; 256]> = Lazy::new(|| {
     let mut table = *PETERSBURG_GAS_COSTS;
     table[OpCode::BALANCE.to_usize()] = Some(700);
     table[OpCode::CHAINID.to_usize()] = Some(2);
@@ -332,7 +332,7 @@ static ISTANBUL_GAS_COSTS: Lazy<[Option<u16>; 256]> = Lazy::new(|| {
     table
 });
 
-static BERLIN_GAS_COSTS: Lazy<[Option<u16>; 256]> = Lazy::new(|| {
+static BERLIN_GAS_COSTS: Lazy<[Option<u64>; 256]> = Lazy::new(|| {
     let mut table = *ISTANBUL_GAS_COSTS;
     table[OpCode::EXTCODESIZE.to_usize()] = Some(WARM_STORAGE_READ_COST);
     table[OpCode::EXTCODECOPY.to_usize()] = Some(WARM_STORAGE_READ_COST);
@@ -346,15 +346,15 @@ static BERLIN_GAS_COSTS: Lazy<[Option<u16>; 256]> = Lazy::new(|| {
     table
 });
 
-static LONDON_GAS_COSTS: Lazy<[Option<u16>; 256]> = Lazy::new(|| {
+static LONDON_GAS_COSTS: Lazy<[Option<u64>; 256]> = Lazy::new(|| {
     let mut table = *BERLIN_GAS_COSTS;
     table[OpCode::BASEFEE.to_usize()] = Some(2);
     table
 });
 
-static SHANGHAI_GAS_COSTS: Lazy<[Option<u16>; 256]> = Lazy::new(|| *LONDON_GAS_COSTS);
+static SHANGHAI_GAS_COSTS: Lazy<[Option<u64>; 256]> = Lazy::new(|| *LONDON_GAS_COSTS);
 
-pub fn gas_costs(revision: Revision) -> &'static [Option<u16>; 256] {
+pub fn gas_costs(revision: Revision) -> &'static [Option<u64>; 256] {
     match revision {
         Revision::Frontier => &FRONTIER_GAS_COSTS,
         Revision::Homestead => &HOMESTEAD_GAS_COSTS,
