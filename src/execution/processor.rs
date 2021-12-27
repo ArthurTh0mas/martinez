@@ -129,8 +129,6 @@ where
     async fn execute_transaction(&mut self, txn: &MessageWithSender) -> anyhow::Result<Receipt> {
         let rev = self.block_spec.revision;
 
-        self.state.clear_journal_and_substate();
-
         self.state.access_account(txn.sender);
 
         let base_fee_per_gas = self.header.base_fee_per_gas.unwrap_or(U256::ZERO);
@@ -195,12 +193,14 @@ where
 
         self.cumulative_gas_used += gas_used;
 
+        let logs = self.state.clear_journal_and_substate();
+
         Ok(Receipt {
             tx_type: txn.tx_type(),
             success: vm_res.status_code == StatusCode::Success,
             cumulative_gas_used: self.cumulative_gas_used,
-            bloom: logs_bloom(self.state.logs()),
-            logs: self.state.logs().to_vec(),
+            bloom: logs_bloom(&logs),
+            logs,
         })
     }
 

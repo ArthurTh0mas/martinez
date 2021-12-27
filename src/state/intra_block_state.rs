@@ -538,17 +538,19 @@ impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
     }
 
     // See Section 6.1 "Substate" of the Yellow Paper
-    pub fn clear_journal_and_substate(&mut self) {
+    pub fn clear_journal_and_substate(&mut self) -> Vec<Log> {
         self.journal.clear();
 
         // and the substate
         self.self_destructs.clear();
-        self.logs.clear();
+        let logs = std::mem::take(&mut self.logs);
         self.touched.clear();
         self.refund = 0;
         // EIP-2929
         self.accessed_addresses.clear();
         self.accessed_storage_keys.clear();
+
+        logs
     }
 
     pub fn add_log(&mut self, log: Log) {
