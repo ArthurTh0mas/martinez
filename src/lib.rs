@@ -9,8 +9,7 @@
     map_first_last,
     never_type,
     step_trait,
-    type_alias_impl_trait,
-    adt_const_params
+    type_alias_impl_trait
 )]
 #![recursion_limit = "256"]
 #![allow(

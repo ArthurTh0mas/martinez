@@ -17,11 +17,7 @@ use crate::{
 };
 use anyhow::{format_err, Context};
 use async_trait::async_trait;
-use parking_lot::Mutex;
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 use tracing::*;
 
 /// Execution of blocks through EVM
@@ -33,13 +29,11 @@ pub struct Execution {
     pub batch_until: Option<BlockNumber>,
     pub commit_every: Option<Duration>,
     pub prune_from: BlockNumber,
-    pub analysis_cache: AnalysisCache,
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_batch_of_blocks<'db, Tx: MutableTransaction<'db>>(
     tx: &Tx,
-    analysis_cache: &mut AnalysisCache,
     chain_config: ChainSpec,
     max_block: BlockNumber,
     batch_size: u64,
@@ -52,6 +46,7 @@ async fn execute_batch_of_blocks<'db, Tx: MutableTransaction<'db>>(
 ) -> anyhow::Result<BlockNumber> {
     let mut buffer = Buffer::new(tx, prune_from, None);
     let mut consensus_engine = engine_factory(chain_config.clone())?;
+    let mut analysis_cache = AnalysisCache::default();
 
     let mut block_number = starting_block;
     let mut gas_since_start = 0;
@@ -83,11 +78,11 @@ async fn execute_batch_of_blocks<'db, Tx: MutableTransaction<'db>>(
 
         let block_spec = chain_config.collect_block_spec(block_number);
 
-        let call_tracer = Arc::new(Mutex::new(CallTracer::default()));
+        let mut call_tracer = CallTracer::default();
         let receipts = ExecutionProcessor::new(
             &mut buffer,
-            Some(call_tracer.clone()),
-            analysis_cache,
+            Some(&mut call_tracer),
+            &mut analysis_cache,
             &mut *consensus_engine,
             &header,
             &block,
@@ -106,8 +101,7 @@ async fn execute_batch_of_blocks<'db, Tx: MutableTransaction<'db>>(
 
         {
             let mut c = tx.mutable_cursor_dupsort(tables::CallTraceSet).await?;
-            let it = call_tracer.lock().into_sorted_iter().collect::<Vec<_>>();
-            for (address, CallTracerFlags { from, to }) in it {
+            for (address, CallTracerFlags { from, to }) in call_tracer.into_sorted_iter() {
                 c.append_dup(header.number, CallTraceSetEntry { address, from, to })
                     .await?;
             }
@@ -221,7 +215,6 @@ impl<'db, RwTx: MutableTransaction<'db>> Stage<'db, RwTx> for Execution {
         Ok(if max_block >= starting_block {
             let executed_to = execute_batch_of_blocks(
                 tx,
-                &mut self.analysis_cache,
                 chain_config,
                 max_block,
                 self.batch_size,
