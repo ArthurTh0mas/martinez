@@ -1,6 +1,9 @@
-use crate::models::*;
+use crate::{
+    execution::evm::{ExecutionState, OpCode, StatusCode},
+    models::*,
+};
+use auto_impl::auto_impl;
 use bytes::Bytes;
-use evmodin::{ExecutionState, OpCode, StatusCode};
 use std::collections::{BTreeMap, HashMap};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -27,7 +30,11 @@ pub enum MessageKind {
 }
 
 #[allow(unused, clippy::too_many_arguments)]
-pub trait Tracer: Send + 'static {
+#[auto_impl(Box, &mut)]
+pub trait Tracer: Send + Sync + 'static {
+    fn opcode_tracing(&self) -> bool {
+        false
+    }
     fn capture_start(
         &mut self,
         depth: u16,

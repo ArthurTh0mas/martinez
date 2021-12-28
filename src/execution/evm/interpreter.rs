@@ -1,3 +1,5 @@
+#![allow(clippy::unnecessary_mut_passed)]
+
 use self::instruction_table::*;
 use super::{
     common::*,
@@ -10,16 +12,18 @@ use derive_more::From;
 use ethnum::U256;
 use std::sync::Arc;
 
+#[inline(always)]
 fn check_requirements(
     instruction_table: &InstructionTable,
     state: &mut ExecutionState,
+    gasometer: &mut Gasometer,
     op: OpCode,
 ) -> Result<u64, StatusCode> {
     let metrics = instruction_table[op.to_usize()]
         .as_ref()
         .ok_or(StatusCode::UndefinedInstruction)?;
 
-    state.gasometer.subtract(metrics.gas_cost)?;
+    gasometer.subtract(metrics.gas_cost)?;
 
     let stack_size = state.stack.len();
     if stack_size == STACK_SIZE {
@@ -133,73 +137,75 @@ impl AnalyzedCode {
             .map(|t| t.lock().opcode_tracing())
             .unwrap_or(false);
 
+        let gasometer = Gasometer::new(message.gas);
         let state = ExecutionState::new(message);
         let output = match (enable_tracing, revision) {
             (true, Revision::Frontier) => {
-                execute::<_, true, { Revision::Frontier }>(self, state, host).await
+                execute::<_, true, { Revision::Frontier }>(self, state, gasometer, host).await
             }
             (true, Revision::Homestead) => {
-                execute::<_, true, { Revision::Homestead }>(self, state, host).await
+                execute::<_, true, { Revision::Homestead }>(self, state, gasometer, host).await
             }
             (true, Revision::Tangerine) => {
-                execute::<_, true, { Revision::Tangerine }>(self, state, host).await
+                execute::<_, true, { Revision::Tangerine }>(self, state, gasometer, host).await
             }
             (true, Revision::Spurious) => {
-                execute::<_, true, { Revision::Spurious }>(self, state, host).await
+                execute::<_, true, { Revision::Spurious }>(self, state, gasometer, host).await
             }
             (true, Revision::Byzantium) => {
-                execute::<_, true, { Revision::Byzantium }>(self, state, host).await
+                execute::<_, true, { Revision::Byzantium }>(self, state, gasometer, host).await
             }
             (true, Revision::Constantinople) => {
-                execute::<_, true, { Revision::Constantinople }>(self, state, host).await
+                execute::<_, true, { Revision::Constantinople }>(self, state, gasometer, host).await
             }
             (true, Revision::Petersburg) => {
-                execute::<_, true, { Revision::Petersburg }>(self, state, host).await
+                execute::<_, true, { Revision::Petersburg }>(self, state, gasometer, host).await
             }
             (true, Revision::Istanbul) => {
-                execute::<_, true, { Revision::Istanbul }>(self, state, host).await
+                execute::<_, true, { Revision::Istanbul }>(self, state, gasometer, host).await
             }
             (true, Revision::Berlin) => {
-                execute::<_, true, { Revision::Berlin }>(self, state, host).await
+                execute::<_, true, { Revision::Berlin }>(self, state, gasometer, host).await
             }
             (true, Revision::London) => {
-                execute::<_, true, { Revision::London }>(self, state, host).await
+                execute::<_, true, { Revision::London }>(self, state, gasometer, host).await
             }
             (true, Revision::Shanghai) => {
-                execute::<_, true, { Revision::Shanghai }>(self, state, host).await
+                execute::<_, true, { Revision::Shanghai }>(self, state, gasometer, host).await
             }
             (false, Revision::Frontier) => {
-                execute::<_, false, { Revision::Frontier }>(self, state, host).await
+                execute::<_, false, { Revision::Frontier }>(self, state, gasometer, host).await
             }
             (false, Revision::Homestead) => {
-                execute::<_, false, { Revision::Homestead }>(self, state, host).await
+                execute::<_, false, { Revision::Homestead }>(self, state, gasometer, host).await
             }
             (false, Revision::Tangerine) => {
-                execute::<_, false, { Revision::Tangerine }>(self, state, host).await
+                execute::<_, false, { Revision::Tangerine }>(self, state, gasometer, host).await
             }
             (false, Revision::Spurious) => {
-                execute::<_, false, { Revision::Spurious }>(self, state, host).await
+                execute::<_, false, { Revision::Spurious }>(self, state, gasometer, host).await
             }
             (false, Revision::Byzantium) => {
-                execute::<_, false, { Revision::Byzantium }>(self, state, host).await
+                execute::<_, false, { Revision::Byzantium }>(self, state, gasometer, host).await
             }
             (false, Revision::Constantinople) => {
-                execute::<_, false, { Revision::Constantinople }>(self, state, host).await
+                execute::<_, false, { Revision::Constantinople }>(self, state, gasometer, host)
+                    .await
             }
             (false, Revision::Petersburg) => {
-                execute::<_, false, { Revision::Petersburg }>(self, state, host).await
+                execute::<_, false, { Revision::Petersburg }>(self, state, gasometer, host).await
             }
             (false, Revision::Istanbul) => {
-                execute::<_, false, { Revision::Istanbul }>(self, state, host).await
+                execute::<_, false, { Revision::Istanbul }>(self, state, gasometer, host).await
             }
             (false, Revision::Berlin) => {
-                execute::<_, false, { Revision::Berlin }>(self, state, host).await
+                execute::<_, false, { Revision::Berlin }>(self, state, gasometer, host).await
             }
             (false, Revision::London) => {
-                execute::<_, false, { Revision::London }>(self, state, host).await
+                execute::<_, false, { Revision::London }>(self, state, gasometer, host).await
             }
             (false, Revision::Shanghai) => {
-                execute::<_, false, { Revision::Shanghai }>(self, state, host).await
+                execute::<_, false, { Revision::Shanghai }>(self, state, gasometer, host).await
             }
         };
 
@@ -232,10 +238,12 @@ async fn execute<
 >(
     s: AnalyzedCode,
     mut state: ExecutionState,
+    mut gasometer: Gasometer,
     host: &mut EvmHost<'evm, 'r, 'state, 'analysis, 'h, 'c, 't, B>,
 ) -> Result<SuccessfulOutput, DuoError> {
     let instruction_table = get_baseline_instruction_table(REVISION);
 
+    let mut output_data = Bytes::new();
     let mut reverted = false;
 
     let mut pc = 0;
@@ -243,7 +251,7 @@ async fn execute<
     loop {
         let op = OpCode(s.padded_code[pc]);
 
-        let gas_cost = check_requirements(instruction_table, &mut state, op)?;
+        let gas_cost = check_requirements(instruction_table, &mut state, &mut gasometer, op)?;
 
         if TRACE {
             // Do not print stop on the final STOP
@@ -294,7 +302,7 @@ async fn execute<
                 arithmetic::mulmod(&mut state.stack);
             }
             OpCode::EXP => {
-                arithmetic::exp::<REVISION>(&mut state)?;
+                arithmetic::exp::<REVISION>(&mut state, &mut gasometer)?;
             }
             OpCode::SIGNEXTEND => {
                 arithmetic::signextend(&mut state.stack);
@@ -343,13 +351,13 @@ async fn execute<
             }
 
             OpCode::KECCAK256 => {
-                memory::keccak256(&mut state)?;
+                memory::keccak256(&mut state, &mut gasometer)?;
             }
             OpCode::ADDRESS => {
                 external::address(&mut state);
             }
             OpCode::BALANCE => {
-                balance_async!(&mut state, REVISION, host);
+                balance_async!(&mut state, &mut gasometer, REVISION, host);
             }
             OpCode::CALLER => {
                 external::caller(&mut state);
@@ -364,31 +372,31 @@ async fn execute<
                 calldatasize(&mut state);
             }
             OpCode::CALLDATACOPY => {
-                memory::calldatacopy(&mut state)?;
+                memory::calldatacopy(&mut state, &mut gasometer)?;
             }
             OpCode::CODESIZE => {
                 memory::codesize(&mut state.stack, &s.code[..]);
             }
             OpCode::CODECOPY => {
-                memory::codecopy(&mut state, &s.code[..])?;
+                memory::codecopy(&mut state, &mut gasometer, &s.code[..])?;
             }
             OpCode::EXTCODESIZE => {
-                extcodesize_async!(&mut state, REVISION, host);
+                extcodesize_async!(&mut state, &mut gasometer, REVISION, host);
             }
             OpCode::EXTCODECOPY => {
-                extcodecopy_async!(state, REVISION, host);
+                extcodecopy_async!(&mut state, &mut gasometer, REVISION, host);
             }
             OpCode::RETURNDATASIZE => {
                 memory::returndatasize(&mut state);
             }
             OpCode::RETURNDATACOPY => {
-                memory::returndatacopy(&mut state)?;
+                memory::returndatacopy(&mut state, &mut gasometer)?;
             }
             OpCode::EXTCODEHASH => {
-                extcodehash_async!(state, REVISION, host);
+                extcodehash_async!(&mut state, &mut gasometer, REVISION, host);
             }
             OpCode::BLOCKHASH => {
-                blockhash_async!(state, host);
+                blockhash_async!(&mut state, host);
             }
             OpCode::ORIGIN
             | OpCode::COINBASE
@@ -420,9 +428,9 @@ async fn execute<
                 selfbalance_async!(state, host);
             }
             OpCode::POP => pop(&mut state.stack),
-            OpCode::MLOAD => memory::mload(&mut state)?,
-            OpCode::MSTORE => memory::mstore(&mut state)?,
-            OpCode::MSTORE8 => memory::mstore8(&mut state)?,
+            OpCode::MLOAD => memory::mload(&mut state, &mut gasometer)?,
+            OpCode::MSTORE => memory::mstore(&mut state, &mut gasometer)?,
+            OpCode::MSTORE8 => memory::mstore8(&mut state, &mut gasometer)?,
             OpCode::JUMP => {
                 pc = op_jump(&mut state, &s.jumpdest_map)?;
 
@@ -442,12 +450,12 @@ async fn execute<
             OpCode::PC => state.stack.push(u128::try_from(pc).unwrap().into()),
             OpCode::MSIZE => memory::msize(&mut state),
             OpCode::SLOAD => {
-                sload_async!(state, REVISION, host);
+                sload_async!(state, gasometer, REVISION, host);
             }
             OpCode::SSTORE => {
-                sstore_async!(state, REVISION, host);
+                sstore_async!(state, gasometer, REVISION, host);
             }
-            OpCode::GAS => state.stack.push(state.gasometer.gas_left().into()),
+            OpCode::GAS => state.stack.push(gasometer.gas_left().into()),
             OpCode::JUMPDEST => {}
             OpCode::PUSH1 => {
                 push1(&mut state.stack, s.padded_code[pc + 1]);
@@ -523,14 +531,21 @@ async fn execute<
             OpCode::SWAP16 => swap::<16>(&mut state.stack),
 
             OpCode::LOG0 | OpCode::LOG1 | OpCode::LOG2 | OpCode::LOG3 | OpCode::LOG4 => {
-                do_log_async!(&mut state, op.0 - OpCode::LOG0.0, host);
+                do_log_async!(&mut state, &mut gasometer, op.0 - OpCode::LOG0.0, host);
             }
             OpCode::CREATE | OpCode::CREATE2 => {
-                do_create_async!(&mut state, REVISION, op == OpCode::CREATE2, host);
+                do_create_async!(
+                    &mut state,
+                    &mut gasometer,
+                    REVISION,
+                    op == OpCode::CREATE2,
+                    host
+                );
             }
             OpCode::CALL | OpCode::CALLCODE | OpCode::DELEGATECALL | OpCode::STATICCALL => {
                 do_call_async!(
                     &mut state,
+                    &mut gasometer,
                     REVISION,
                     match op {
                         OpCode::CALL | OpCode::STATICCALL => CallKind::Call,
@@ -543,7 +558,7 @@ async fn execute<
                 );
             }
             OpCode::RETURN | OpCode::REVERT => {
-                ret(&mut state)?;
+                ret(state, &mut gasometer, &mut output_data)?;
                 reverted = op == OpCode::REVERT;
                 break;
             }
@@ -551,7 +566,7 @@ async fn execute<
                 return Err(StatusCode::InvalidInstruction.into());
             }
             OpCode::SELFDESTRUCT => {
-                selfdestruct_async!(state, REVISION, host);
+                selfdestruct_async!(&mut state, &mut gasometer, REVISION, host);
                 break;
             }
             other => {
@@ -564,8 +579,8 @@ async fn execute<
 
     let output = SuccessfulOutput {
         reverted,
-        gas_left: state.gasometer.gas_left(),
-        output_data: state.output_data.clone(),
+        gas_left: gasometer.gas_left(),
+        output_data,
     };
 
     Ok(output)

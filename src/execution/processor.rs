@@ -5,23 +5,26 @@ use crate::{
         protocol_param::{fee, param},
     },
     consensus::*,
-    execution::evm,
+    execution::{
+        evm::{Revision, StatusCode},
+        evmglue,
+    },
     h256_to_u256,
     models::*,
     state::IntraBlockState,
     State,
 };
 use anyhow::Context;
-use evmodin::{Revision, StatusCode};
-use std::cmp::min;
+use parking_lot::Mutex;
+use std::{cmp::min, sync::Arc};
 use TransactionAction;
 
-pub struct ExecutionProcessor<'r, 'tracer, 'analysis, 'e, 'h, 'b, 'c, S>
+pub struct ExecutionProcessor<'r, 'analysis, 'e, 'h, 'b, 'c, S>
 where
     S: State,
 {
     state: IntraBlockState<'r, S>,
-    tracer: Option<&'tracer mut dyn Tracer>,
+    tracer: Option<Arc<Mutex<dyn Tracer>>>,
     analysis_cache: &'analysis mut AnalysisCache,
     engine: &'e mut dyn Consensus,
     header: &'h PartialHeader,
@@ -30,14 +33,13 @@ where
     cumulative_gas_used: u64,
 }
 
-impl<'r, 'tracer, 'analysis, 'e, 'h, 'b, 'c, S>
-    ExecutionProcessor<'r, 'tracer, 'analysis, 'e, 'h, 'b, 'c, S>
+impl<'r, 'analysis, 'e, 'h, 'b, 'c, S> ExecutionProcessor<'r, 'analysis, 'e, 'h, 'b, 'c, S>
 where
     S: State,
 {
     pub fn new(
         state: &'r mut S,
-        tracer: Option<&'tracer mut dyn Tracer>,
+        tracer: Option<Arc<Mutex<dyn Tracer>>>,
         analysis_cache: &'analysis mut AnalysisCache,
         engine: &'e mut dyn Consensus,
         header: &'h PartialHeader,
@@ -127,8 +129,6 @@ where
     async fn execute_transaction(&mut self, txn: &MessageWithSender) -> anyhow::Result<Receipt> {
         let rev = self.block_spec.revision;
 
-        self.state.clear_journal_and_substate();
-
         self.state.access_account(txn.sender);
 
         let base_fee_per_gas = self.header.base_fee_per_gas.unwrap_or(U256::ZERO);
@@ -160,11 +160,11 @@ where
             .try_into()
             .unwrap();
 
-        let vm_res = evm::execute(
+        let vm_res = evmglue::execute(
             &mut self.state,
             // https://github.com/rust-lang/rust-clippy/issues/7846
             #[allow(clippy::needless_option_as_deref)]
-            self.tracer.as_deref_mut(),
+            self.tracer.clone(),
             self.analysis_cache,
             self.header,
             self.block_spec,
@@ -193,12 +193,14 @@ where
 
         self.cumulative_gas_used += gas_used;
 
+        let logs = self.state.clear_journal_and_substate();
+
         Ok(Receipt {
             tx_type: txn.tx_type(),
             success: vm_res.status_code == StatusCode::Success,
             cumulative_gas_used: self.cumulative_gas_used,
-            bloom: logs_bloom(self.state.logs()),
-            logs: self.state.logs().to_vec(),
+            bloom: logs_bloom(&logs),
+            logs,
         })
     }
 

@@ -65,7 +65,7 @@ impl Stack {
 const PAGE_SIZE: usize = 4 * 1024;
 
 #[derive(Clone, Debug, Deref, DerefMut)]
-pub struct Memory(BytesMut);
+pub struct Memory(pub(crate) BytesMut);
 
 impl Memory {
     #[inline(always)]
@@ -127,26 +127,21 @@ impl Gasometer {
 #[derive(Clone, Debug, Getters, MutGetters)]
 pub struct ExecutionState {
     #[getset(get = "pub", get_mut = "pub")]
-    pub(crate) gasometer: Gasometer,
-    #[getset(get = "pub", get_mut = "pub")]
     pub(crate) stack: Stack,
     #[getset(get = "pub", get_mut = "pub")]
     pub(crate) memory: Memory,
     pub(crate) message: Message,
     #[getset(get = "pub", get_mut = "pub")]
     pub(crate) return_data: Bytes,
-    pub(crate) output_data: Bytes,
 }
 
 impl ExecutionState {
     pub fn new(message: Message) -> Self {
         Self {
-            gasometer: Gasometer::new(message.gas),
             stack: Stack::default(),
             memory: Memory::new(),
             message,
             return_data: Default::default(),
-            output_data: Bytes::new(),
         }
     }
 }

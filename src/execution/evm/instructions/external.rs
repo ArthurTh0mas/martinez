@@ -16,16 +16,14 @@ pub(crate) fn callvalue(state: &mut ExecutionState) {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! balance_async {
-    ($state:expr,$rev:expr,$host:expr) => {
+    ($state:expr,$gasometer:expr,$rev:expr,$host:expr) => {
         use $crate::execution::evm::{common::*, host::*, instructions::properties::*};
 
         let address = u256_to_address($state.stack.pop());
 
         if $rev >= Revision::Berlin {
             if $host.access_account(address) == AccessStatus::Cold {
-                $state
-                    .gasometer
-                    .subtract(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST)?;
+                $gasometer.subtract(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST)?;
             }
         }
 
@@ -38,16 +36,14 @@ macro_rules! balance_async {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! extcodesize_async {
-    ($state:expr,$rev:expr,$host:expr) => {
+    ($state:expr,$gasometer:expr,$rev:expr,$host:expr) => {
         use crate::execution::evm::{common::*, host::*, instructions::properties::*};
 
         let address = u256_to_address($state.stack.pop());
 
         if $rev >= Revision::Berlin {
             if $host.access_account(address) == AccessStatus::Cold {
-                $state
-                    .gasometer
-                    .subtract(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST)?;
+                $gasometer.subtract(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST)?;
             }
         }
 
@@ -136,7 +132,7 @@ macro_rules! blockhash_async {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! do_log_async {
-    ($state:expr, $num_topics:expr,$host:expr) => {{
+    ($state:expr, $gasometer:expr, $num_topics:expr,$host:expr) => {{
         use arrayvec::ArrayVec;
 
         if $state.message.is_static {
@@ -146,12 +142,11 @@ macro_rules! do_log_async {
         let offset = $state.stack.pop();
         let size = $state.stack.pop();
 
-        let region =
-            memory::get_memory_region($state, offset, size).map_err(|_| StatusCode::OutOfGas)?;
+        let region = memory::get_memory_region($state, $gasometer, offset, size)?;
 
         if let Some(region) = &region {
             let cost = region.size.get() as u64 * 8;
-            $state.gasometer.subtract(cost)?;
+            $gasometer.subtract(cost)?;
         }
 
         let mut topics = ArrayVec::<_, 4>::new();
@@ -174,7 +169,7 @@ macro_rules! do_log_async {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! sload_async {
-    ($state:expr,$rev:expr,$host:expr) => {{
+    ($state:expr,$gasometer:expr,$rev:expr,$host:expr) => {{
         use $crate::execution::evm::{
             host::*,
             instructions::properties::{COLD_SLOAD_COST, WARM_STORAGE_READ_COST},
@@ -187,7 +182,7 @@ macro_rules! sload_async {
                 // The warm storage access cost is already applied (from the cost table).
                 // Here we need to apply additional cold storage access cost.
                 const ADDITIONAL_COLD_SLOAD_COST: u64 = COLD_SLOAD_COST - WARM_STORAGE_READ_COST;
-                $state.gasometer.subtract(ADDITIONAL_COLD_SLOAD_COST)?;
+                $gasometer.subtract(ADDITIONAL_COLD_SLOAD_COST)?;
             }
         }
 
@@ -200,7 +195,7 @@ macro_rules! sload_async {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! sstore_async {
-    ($state:expr,$rev:expr,$host:expr) => {{
+    ($state:expr,$gasometer:expr,$rev:expr,$host:expr) => {{
         use $crate::execution::evm::{
             host::*,
             instructions::properties::{COLD_SLOAD_COST, WARM_STORAGE_READ_COST},
@@ -211,7 +206,7 @@ macro_rules! sstore_async {
         }
 
         if $rev >= Revision::Istanbul {
-            if $state.gasometer.gas_left() <= 2300 {
+            if $gasometer.gas_left() <= 2300 {
                 return Err(StatusCode::OutOfGas.into());
             }
         }
@@ -251,14 +246,14 @@ macro_rules! sstore_async {
             }
             StorageStatus::Added => cost + 20000,
         };
-        $state.gasometer.subtract(cost)?;
+        $gasometer.subtract(cost)?;
     }};
 }
 
 #[doc(hidden)]
 #[macro_export]
 macro_rules! selfdestruct_async {
-    ($state:expr,$rev:expr,$host:expr) => {{
+    ($state:expr,$gasometer:expr,$rev:expr,$host:expr) => {{
         use crate::execution::evm::{common::*, host::*, instructions::properties::*};
 
         if $state.message.is_static {
@@ -269,7 +264,7 @@ macro_rules! selfdestruct_async {
 
         if $rev >= Revision::Berlin {
             if $host.access_account(beneficiary) == AccessStatus::Cold {
-                $state.gasometer.subtract(COLD_ACCOUNT_ACCESS_COST)?;
+                $gasometer.subtract(COLD_ACCOUNT_ACCESS_COST)?;
             }
         }
 
@@ -280,7 +275,7 @@ macro_rules! selfdestruct_async {
                 // After TANGERINE_WHISTLE apply additional cost of
                 // sending value to a non-existing account.
                 if !$host.account_exists(beneficiary).await? {
-                    $state.gasometer.subtract(25_000)?;
+                    $gasometer.subtract(25_000)?;
                 }
             }
         }

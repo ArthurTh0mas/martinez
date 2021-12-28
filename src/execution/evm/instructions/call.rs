@@ -1,7 +1,7 @@
 #[doc(hidden)]
 #[macro_export]
 macro_rules! do_call_async {
-    ($state:expr, $rev:expr, $kind:expr, $is_static:expr, $host:expr) => {{
+    ($state:expr, $gasometer:expr, $rev:expr, $kind:expr, $is_static:expr, $host:expr) => {{
         use std::cmp::min;
         use $crate::execution::evm::{
             common::u256_to_address,
@@ -27,16 +27,13 @@ macro_rules! do_call_async {
 
         if $rev >= Revision::Berlin {
             if $host.access_account(dst) == AccessStatus::Cold {
-                $state
-                    .gasometer
-                    .subtract(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST)?;
+                $gasometer.subtract(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST)?;
             }
         }
 
-        let input_region = memory::get_memory_region($state, input_offset, input_size)
-            .map_err(|_| StatusCode::OutOfGas)?;
-        let output_region = memory::get_memory_region($state, output_offset, output_size)
-            .map_err(|_| StatusCode::OutOfGas)?;
+        let input_region = memory::get_memory_region($state, $gasometer, input_offset, input_size)?;
+        let output_region =
+            memory::get_memory_region($state, $gasometer, output_offset, output_size)?;
 
         let mut msg = Message {
             kind: $kind,
@@ -77,7 +74,7 @@ macro_rules! do_call_async {
                 cost += 25000;
             }
         }
-        $state.gasometer.subtract(cost)?;
+        $gasometer.subtract(cost)?;
 
         if gas < u128::from(msg.gas) {
             msg.gas = gas.as_u64();
@@ -85,17 +82,14 @@ macro_rules! do_call_async {
 
         if $rev >= Revision::Tangerine {
             // TODO: Always true for STATICCALL.
-            msg.gas = min(
-                msg.gas,
-                $state.gasometer.gas_left() - $state.gasometer.gas_left() / 64,
-            );
-        } else if msg.gas > $state.gasometer.gas_left() {
+            msg.gas = min(msg.gas, $gasometer.gas_left() - $gasometer.gas_left() / 64);
+        } else if msg.gas > $gasometer.gas_left() {
             return Err(StatusCode::OutOfGas.into());
         }
 
         if has_value {
             msg.gas += 2300; // Add stipend.
-            $state.gasometer.refund(2300);
+            $gasometer.refund(2300);
         }
 
         $state.return_data.clear();
@@ -121,7 +115,7 @@ macro_rules! do_call_async {
             }
 
             let gas_used = msg_gas - result.gas_left;
-            $state.gasometer.subtract_unchecked(gas_used);
+            $gasometer.subtract_unchecked(gas_used);
         }
     }};
 }
@@ -129,7 +123,7 @@ macro_rules! do_call_async {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! do_create_async {
-    ($state:expr, $rev:expr, $create2:expr, $host:expr) => {{
+    ($state:expr, $gasometer:expr, $rev:expr, $create2:expr, $host:expr) => {{
         use ethnum::U256;
         use $crate::execution::evm::{common::*, host::*, CreateMessage};
 
@@ -141,15 +135,15 @@ macro_rules! do_create_async {
         let init_code_offset = $state.stack.pop();
         let init_code_size = $state.stack.pop();
 
-        let region = memory::get_memory_region($state, init_code_offset, init_code_size)
-            .map_err(|_| StatusCode::OutOfGas)?;
+        let region =
+            memory::get_memory_region($state, $gasometer, init_code_offset, init_code_size)?;
 
         let salt = if $create2 {
             let salt = $state.stack.pop();
 
             if let Some(region) = &region {
                 let salt_cost = memory::num_words(region.size.get()) * 6;
-                $state.gasometer.subtract(salt_cost)?;
+                $gasometer.subtract(salt_cost)?;
             }
 
             Some(salt)
@@ -165,9 +159,9 @@ macro_rules! do_create_async {
         {
             let msg = CreateMessage {
                 gas: if $rev >= Revision::Tangerine {
-                    $state.gasometer.gas_left() - $state.gasometer.gas_left() / 64
+                    $gasometer.gas_left() - $gasometer.gas_left() / 64
                 } else {
-                    $state.gasometer.gas_left()
+                    $gasometer.gas_left()
                 },
 
                 salt,
@@ -186,7 +180,7 @@ macro_rules! do_create_async {
             let msg_gas = msg.gas;
             let result = $host.call(Call::Create(msg)).await?;
             let gas_used = msg_gas - result.gas_left;
-            $state.gasometer.subtract_unchecked(gas_used);
+            $gasometer.subtract_unchecked(gas_used);
 
             $state.return_data = result.output_data;
             if result.status_code == StatusCode::Success {
