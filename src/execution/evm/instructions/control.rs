@@ -1,22 +1,17 @@
-use crate::execution::evm::{interpreter::JumpdestMap, state::*, StatusCode};
-use bytes::Bytes;
+use crate::execution::evm::{interpreter::JumpdestMap, state::ExecutionState, StatusCode};
 use ethnum::U256;
 
 #[inline(always)]
-pub(crate) fn ret(
-    mut state: ExecutionState,
-    gasometer: &mut Gasometer,
-    output_data: &mut Bytes,
-) -> Result<(), StatusCode> {
+pub(crate) fn ret(state: &mut ExecutionState) -> Result<(), StatusCode> {
     let offset = *state.stack.get(0);
     let size = *state.stack.get(1);
 
-    if let Some(region) = super::memory::get_memory_region(&mut state, gasometer, offset, size)? {
-        *output_data = state
-            .memory
-            .0
-            .freeze()
-            .slice(region.offset..region.offset + region.size.get());
+    if let Some(region) =
+        super::memory::get_memory_region(state, offset, size).map_err(|_| StatusCode::OutOfGas)?
+    {
+        state.output_data = state.memory[region.offset..region.offset + region.size.get()]
+            .to_vec()
+            .into();
     }
 
     Ok(())

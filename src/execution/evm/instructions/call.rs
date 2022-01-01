@@ -1,11 +1,12 @@
 #[doc(hidden)]
 #[macro_export]
-macro_rules! do_call_async {
-    ($state:expr, $gasometer:expr, $rev:expr, $kind:expr, $is_static:expr, $host:expr) => {{
+macro_rules! do_call {
+    ($state:expr, $rev:expr, $kind:expr, $is_static:expr) => {{
         use std::cmp::min;
         use $crate::execution::evm::{
             common::u256_to_address,
-            host::*,
+            continuation::{interrupt_data::*, resume_data::*},
+            host::AccessStatus,
             instructions::{memory::MemoryRegion, properties::*},
             CallKind, Message,
         };
@@ -26,14 +27,24 @@ macro_rules! do_call_async {
         $state.stack.push(U256::ZERO); // Assume failure.
 
         if $rev >= Revision::Berlin {
-            if $host.access_account(dst) == AccessStatus::Cold {
-                $gasometer.subtract(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST)?;
+            if ResumeDataVariant::into_access_account_status(
+                yield InterruptData::AccessAccount { address: dst },
+            )
+            .unwrap()
+            .status
+                == AccessStatus::Cold
+            {
+                $state.gas_left -= i64::from(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST);
+                if $state.gas_left < 0 {
+                    return Err(StatusCode::OutOfGas);
+                }
             }
         }
 
-        let input_region = memory::get_memory_region($state, $gasometer, input_offset, input_size)?;
-        let output_region =
-            memory::get_memory_region($state, $gasometer, output_offset, output_size)?;
+        let input_region = memory::get_memory_region($state, input_offset, input_size)
+            .map_err(|_| StatusCode::OutOfGas)?;
+        let output_region = memory::get_memory_region($state, output_offset, output_size)
+            .map_err(|_| StatusCode::OutOfGas)?;
 
         let mut msg = Message {
             kind: $kind,
@@ -50,7 +61,7 @@ macro_rules! do_call_async {
             } else {
                 $state.message.recipient
             },
-            gas: i64::MAX as u64,
+            gas: i64::MAX,
             value: if matches!($kind, CallKind::DelegateCall) {
                 $state.message.value
             } else {
@@ -63,42 +74,62 @@ macro_rules! do_call_async {
                 .unwrap_or_default(),
         };
 
-        let mut cost = if has_value { 9000_u64 } else { 0_u64 };
+        let mut cost = if has_value { 9000 } else { 0 };
 
         if matches!($kind, CallKind::Call) {
             if has_value && $state.message.is_static {
-                return Err(StatusCode::StaticModeViolation.into());
+                return Err(StatusCode::StaticModeViolation);
             }
 
-            if (has_value || $rev < Revision::Spurious) && !$host.account_exists(dst).await? {
+            if (has_value || $rev < Revision::Spurious)
+                && !ResumeDataVariant::into_account_exists_status({
+                    yield InterruptData::AccountExists { address: dst }
+                })
+                .unwrap()
+                .exists
+            {
                 cost += 25000;
             }
         }
-        $gasometer.subtract(cost)?;
+        $state.gas_left -= cost;
+        if $state.gas_left < 0 {
+            return Err(StatusCode::OutOfGas);
+        }
 
-        if gas < u128::from(msg.gas) {
-            msg.gas = gas.as_u64();
+        if gas < u128::try_from(msg.gas).unwrap() {
+            msg.gas = gas.as_usize() as i64;
         }
 
         if $rev >= Revision::Tangerine {
             // TODO: Always true for STATICCALL.
-            msg.gas = min(msg.gas, $gasometer.gas_left() - $gasometer.gas_left() / 64);
-        } else if msg.gas > $gasometer.gas_left() {
-            return Err(StatusCode::OutOfGas.into());
+            msg.gas = min(msg.gas, $state.gas_left - $state.gas_left / 64);
+        } else if msg.gas > $state.gas_left {
+            return Err(StatusCode::OutOfGas);
         }
 
         if has_value {
             msg.gas += 2300; // Add stipend.
-            $gasometer.refund(2300);
+            $state.gas_left += 2300;
         }
 
         $state.return_data.clear();
 
         if $state.message.depth < 1024
-            && !(has_value && $host.get_balance($state.message.recipient).await? < value)
+            && !(has_value
+                && ResumeDataVariant::into_balance({
+                    yield InterruptData::GetBalance {
+                        address: $state.message.recipient,
+                    }
+                })
+                .unwrap()
+                .balance
+                    < value)
         {
             let msg_gas = msg.gas;
-            let result = $host.call(Call::Call(msg)).await?;
+            let result =
+                ResumeDataVariant::into_call_output({ yield InterruptData::Call(Call::Call(msg)) })
+                    .unwrap()
+                    .output;
             $state.return_data = result.output_data.clone();
             *$state.stack.get_mut(0) = if matches!(result.status_code, StatusCode::Success) {
                 U256::ONE
@@ -115,35 +146,42 @@ macro_rules! do_call_async {
             }
 
             let gas_used = msg_gas - result.gas_left;
-            $gasometer.subtract_unchecked(gas_used);
+            $state.gas_left -= gas_used;
         }
     }};
 }
 
 #[doc(hidden)]
 #[macro_export]
-macro_rules! do_create_async {
-    ($state:expr, $gasometer:expr, $rev:expr, $create2:expr, $host:expr) => {{
+macro_rules! do_create {
+    ($state:expr, $rev:expr, $create2:expr) => {{
         use ethnum::U256;
-        use $crate::execution::evm::{common::*, host::*, CreateMessage};
+        use $crate::execution::evm::{
+            common::*,
+            continuation::{interrupt_data::*, resume_data::*},
+            CreateMessage,
+        };
 
         if $state.message.is_static {
-            return Err(StatusCode::StaticModeViolation.into());
+            return Err(StatusCode::StaticModeViolation);
         }
 
         let endowment = $state.stack.pop();
         let init_code_offset = $state.stack.pop();
         let init_code_size = $state.stack.pop();
 
-        let region =
-            memory::get_memory_region($state, $gasometer, init_code_offset, init_code_size)?;
+        let region = memory::get_memory_region($state, init_code_offset, init_code_size)
+            .map_err(|_| StatusCode::OutOfGas)?;
 
         let salt = if $create2 {
             let salt = $state.stack.pop();
 
             if let Some(region) = &region {
                 let salt_cost = memory::num_words(region.size.get()) * 6;
-                $gasometer.subtract(salt_cost)?;
+                $state.gas_left -= salt_cost;
+                if $state.gas_left < 0 {
+                    return Err(StatusCode::OutOfGas);
+                }
             }
 
             Some(salt)
@@ -155,13 +193,21 @@ macro_rules! do_create_async {
         $state.return_data.clear();
 
         if $state.message.depth < 1024
-            && !(endowment != 0 && $host.get_balance($state.message.recipient).await? < endowment)
+            && !(endowment != 0
+                && ResumeDataVariant::into_balance({
+                    yield InterruptData::GetBalance {
+                        address: $state.message.recipient,
+                    }
+                })
+                .unwrap()
+                .balance
+                    < endowment)
         {
             let msg = CreateMessage {
                 gas: if $rev >= Revision::Tangerine {
-                    $gasometer.gas_left() - $gasometer.gas_left() / 64
+                    $state.gas_left - $state.gas_left / 64
                 } else {
-                    $gasometer.gas_left()
+                    $state.gas_left
                 },
 
                 salt,
@@ -178,9 +224,12 @@ macro_rules! do_create_async {
                 endowment,
             };
             let msg_gas = msg.gas;
-            let result = $host.call(Call::Create(msg)).await?;
-            let gas_used = msg_gas - result.gas_left;
-            $gasometer.subtract_unchecked(gas_used);
+            let result = ResumeDataVariant::into_call_output({
+                yield InterruptData::Call(Call::Create(msg))
+            })
+            .unwrap()
+            .output;
+            $state.gas_left -= msg_gas - result.gas_left;
 
             $state.return_data = result.output_data;
             if result.status_code == StatusCode::Success {

@@ -119,10 +119,7 @@ fn log2floor(value: U256) -> u64 {
     l
 }
 
-pub(crate) fn exp<const REVISION: Revision>(
-    state: &mut ExecutionState,
-    gasometer: &mut Gasometer,
-) -> Result<(), StatusCode> {
+pub(crate) fn exp<const REVISION: Revision>(state: &mut ExecutionState) -> Result<(), StatusCode> {
     let mut base = state.stack.pop();
     let mut power = state.stack.pop();
 
@@ -134,7 +131,11 @@ pub(crate) fn exp<const REVISION: Revision>(
         };
         let additional_gas = factor * (log2floor(power) / 8 + 1);
 
-        gasometer.subtract(additional_gas)?;
+        state.gas_left -= additional_gas as i64;
+
+        if state.gas_left < 0 {
+            return Err(StatusCode::OutOfGas);
+        }
     }
 
     let mut v = U256::ONE;

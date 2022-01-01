@@ -2,16 +2,16 @@ use super::*;
 use serde::Serialize;
 
 /// Passed into execution context to collect metrics.
-pub trait Tracer: Send + Sync {
+pub trait Tracer {
     #[doc(hidden)]
     const DUMMY: bool = false;
 
     /// Called when execution starts.
-    fn notify_execution_start(&mut self, _revision: Revision, _message: Message, _code: Bytes) {}
+    fn notify_execution_start(&mut self, revision: Revision, message: Message, code: Bytes);
     /// Called on each instruction.
-    fn notify_instruction_start(&mut self, _pc: usize, _opcode: OpCode, _state: &ExecutionState) {}
+    fn notify_instruction_start(&mut self, pc: usize, opcode: OpCode, state: &ExecutionState);
     /// Called when execution ends.
-    fn notify_execution_end(&mut self, _output: &Output) {}
+    fn notify_execution_end(&mut self, output: &Output);
 }
 
 /// Tracer which does nothing.
@@ -19,6 +19,12 @@ pub struct NoopTracer;
 
 impl Tracer for NoopTracer {
     const DUMMY: bool = true;
+
+    fn notify_execution_start(&mut self, _: Revision, _: Message, _: Bytes) {}
+
+    fn notify_instruction_start(&mut self, _: usize, _: OpCode, _: &ExecutionState) {}
+
+    fn notify_execution_end(&mut self, _: &Output) {}
 }
 
 #[derive(Serialize)]

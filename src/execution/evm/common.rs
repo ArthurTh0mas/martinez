@@ -71,7 +71,7 @@ impl Revision {
 
 /// Message status code.
 #[must_use]
-#[derive(Clone, Copy, Debug, Display, PartialEq)]
+#[derive(Clone, Debug, Display, PartialEq)]
 pub enum StatusCode {
     /// Execution finished with success.
     #[strum(serialize = "success")]
@@ -153,7 +153,7 @@ pub enum StatusCode {
 
     /// EVM implementation generic internal error.
     #[strum(serialize = "internal error")]
-    InternalError(&'static str),
+    InternalError(String),
 }
 
 /// The kind of call-like instruction.
@@ -177,10 +177,10 @@ pub struct Message {
     pub is_static: bool,
 
     /// The call depth.
-    pub depth: u16,
+    pub depth: i32,
 
     /// The amount of gas for message execution.
-    pub gas: u64,
+    pub gas: i64,
 
     /// The destination (recipient) of the message.
     pub recipient: Address,
@@ -204,8 +204,8 @@ pub struct Message {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateMessage {
     pub salt: Option<U256>,
-    pub gas: u64,
-    pub depth: u16,
+    pub gas: i64,
+    pub depth: i32,
     pub initcode: Bytes,
     pub sender: Address,
     pub endowment: U256,
@@ -237,7 +237,7 @@ pub struct Output {
     /// EVM exited with this status code.
     pub status_code: StatusCode,
     /// How much gas was left after execution
-    pub gas_left: u64,
+    pub gas_left: i64,
     /// Output data returned.
     pub output_data: Bytes,
     /// Contract creation address.
@@ -250,7 +250,7 @@ pub struct SuccessfulOutput {
     /// Indicates if revert was requested.
     pub reverted: bool,
     /// How much gas was left after execution.
-    pub gas_left: u64,
+    pub gas_left: i64,
     /// Output data returned.
     pub output_data: Bytes,
 }
