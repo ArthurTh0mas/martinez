@@ -3,6 +3,7 @@ use crate::{consensus, crypto::*, models::*, State};
 
 pub mod address;
 pub mod analysis_cache;
+pub mod continuation;
 pub mod evm;
 pub mod evmglue;
 pub mod precompiled;
