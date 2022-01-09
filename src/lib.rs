@@ -10,7 +10,8 @@
     never_type,
     step_trait,
     type_alias_impl_trait,
-    adt_const_params
+    integer_atomics,
+    async_closure
 )]
 #![recursion_limit = "256"]
 #![allow(
@@ -35,6 +36,7 @@ pub mod kv;
 pub mod models;
 pub mod res;
 pub mod sentry;
+pub mod sentry2;
 pub mod stagedsync;
 pub mod stages;
 mod state;
