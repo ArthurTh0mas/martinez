@@ -9,9 +9,7 @@
     map_first_last,
     never_type,
     step_trait,
-    type_alias_impl_trait,
-    integer_atomics,
-    async_closure
+    type_alias_impl_trait
 )]
 #![recursion_limit = "256"]
 #![allow(
@@ -36,7 +34,6 @@ pub mod kv;
 pub mod models;
 pub mod res;
 pub mod sentry;
-pub mod sentry2;
 pub mod stagedsync;
 pub mod stages;
 mod state;
