@@ -1,8 +1,14 @@
 use super::*;
-use crate::{chain::protocol_param::param, models::*, state::*};
+use crate::{
+    chain::protocol_param::param,
+    execution::continuation::{interrupt_data::InterruptData, resume_data::ResumeData},
+    gen_await,
+    models::*,
+    state::*,
+};
 use anyhow::Context;
 use async_recursion::*;
-use std::time::SystemTime;
+use std::{ops::Generator, time::SystemTime};
 
 #[derive(Debug)]
 pub struct ConsensusEngineBase {
@@ -18,22 +24,22 @@ impl ConsensusEngineBase {
         }
     }
 
-    pub async fn validate_block_header(
+    pub fn validate_block_header(
         &self,
         header: &BlockHeader,
         parent: &BlockHeader,
         with_future_timestamp_check: bool,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), ValidationError> {
         if with_future_timestamp_check {
             let now = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)?
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
                 .as_secs();
             if header.timestamp > now {
                 return Err(ValidationError::FutureBlock {
                     now,
                     got: header.timestamp,
-                }
-                .into());
+                });
             }
         }
 
@@ -41,30 +47,28 @@ impl ConsensusEngineBase {
             return Err(ValidationError::GasAboveLimit {
                 used: header.gas_used,
                 limit: header.gas_limit,
-            }
-            .into());
+            });
         }
 
         if header.gas_limit < 5000 {
-            return Err(ValidationError::InvalidGasLimit.into());
+            return Err(ValidationError::InvalidGasLimit);
         }
 
         // https://github.com/ethereum/go-ethereum/blob/v1.9.25/consensus/ethash/consensus.go#L267
         // https://eips.ethereum.org/EIPS/eip-1985
         if header.gas_limit > i64::MAX.try_into().unwrap() {
-            return Err(ValidationError::InvalidGasLimit.into());
+            return Err(ValidationError::InvalidGasLimit);
         }
 
         if header.extra_data.len() > 32 {
-            return Err(ValidationError::ExtraDataTooLong.into());
+            return Err(ValidationError::ExtraDataTooLong);
         }
 
         if header.timestamp <= parent.timestamp {
             return Err(ValidationError::InvalidTimestamp {
                 parent: parent.timestamp,
                 current: header.timestamp,
-            }
-            .into());
+            });
         }
 
         let mut parent_gas_limit = parent.gas_limit;
@@ -80,7 +84,7 @@ impl ConsensusEngineBase {
             parent_gas_limit - header.gas_limit
         };
         if gas_delta >= parent_gas_limit / 1024 {
-            return Err(ValidationError::InvalidGasLimit.into());
+            return Err(ValidationError::InvalidGasLimit);
         }
 
         let expected_base_fee_per_gas = self.expected_base_fee_per_gas(header, parent);
@@ -88,70 +92,75 @@ impl ConsensusEngineBase {
             return Err(ValidationError::WrongBaseFee {
                 expected: expected_base_fee_per_gas,
                 got: header.base_fee_per_gas,
-            }
-            .into());
+            });
         }
 
         Ok(())
     }
 
-    pub async fn get_parent_header(
-        &self,
-        state: &mut dyn State,
-        header: &BlockHeader,
-    ) -> anyhow::Result<Option<BlockHeader>> {
-        if let Some(parent_number) = header.number.0.checked_sub(1) {
-            return state
-                .read_header(parent_number.into(), header.parent_hash)
-                .await;
-        }
+    pub fn get_parent_header<'a>(
+        &'a self,
+        header: &'a BlockHeader,
+    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = Option<BlockHeader>> + 'a {
+        move |_| {
+            if let Some(parent_number) = header.number.0.checked_sub(1) {
+                return *ResumeData::into_header(
+                    yield InterruptData::ReadHeader {
+                        block_number: parent_number.into(),
+                        block_hash: header.parent_hash,
+                    },
+                )
+                .unwrap();
+            }
 
-        Ok(None)
+            None
+        }
     }
 
     // See [YP] Section 11.1 "Ommer Validation"
-    #[async_recursion]
-    async fn is_kin(
-        &self,
-        branch_header: &BlockHeader,
-        mainline_header: &BlockHeader,
+    fn is_kin<'a>(
+        &'a self,
+        branch_header: &'a BlockHeader,
+        mainline_header: BlockHeader,
         mainline_hash: H256,
         n: usize,
-        state: &mut dyn State,
-        old_ommers: &mut Vec<BlockHeader>,
-    ) -> anyhow::Result<bool> {
-        if n > 0 && branch_header != mainline_header {
-            if let Some(mainline_body) = state
-                .read_body(mainline_header.number, mainline_hash)
-                .await?
-            {
-                old_ommers.extend_from_slice(&mainline_body.ommers);
+        mut old_ommers: Vec<BlockHeader>,
+    ) -> StateGenerator<'a, (Vec<BlockHeader>, bool)> {
+        Box::pin(move |_| {
+            if n > 0 && *branch_header != mainline_header {
+                if let Some(mainline_body) = *ResumeData::into_body(
+                    yield InterruptData::ReadBody {
+                        block_number: mainline_header.number,
+                        block_hash: mainline_hash,
+                    },
+                )
+                .unwrap()
+                {
+                    old_ommers.extend_from_slice(&mainline_body.ommers);
 
-                let mainline_parent = self.get_parent_header(state, mainline_header).await?;
-                let branch_parent = self.get_parent_header(state, branch_header).await?;
+                    let mainline_parent = gen_await!(self.get_parent_header(&mainline_header));
+                    let branch_parent = gen_await!(self.get_parent_header(branch_header));
 
-                if let Some(mainline_parent) = mainline_parent {
-                    if let Some(branch_parent) = branch_parent {
-                        if branch_parent == mainline_parent {
-                            return Ok(true);
+                    if let Some(mainline_parent) = mainline_parent {
+                        if let Some(branch_parent) = branch_parent {
+                            if branch_parent == mainline_parent {
+                                return (old_ommers, true);
+                            }
                         }
-                    }
 
-                    return self
-                        .is_kin(
+                        return gen_await!(self.is_kin(
                             branch_header,
-                            &mainline_parent,
+                            mainline_parent,
                             mainline_header.parent_hash,
                             n - 1,
-                            state,
                             old_ommers,
-                        )
-                        .await;
+                        ));
+                    }
                 }
             }
-        }
 
-        Ok(false)
+            (old_ommers, false)
+        })
     }
 
     pub fn get_beneficiary(&self, header: &BlockHeader) -> Address {
@@ -202,77 +211,68 @@ impl ConsensusEngineBase {
         None
     }
 
-    pub async fn pre_validate_block(
-        &self,
-        block: &Block,
-        state: &mut dyn State,
-    ) -> anyhow::Result<()> {
-        let expected_ommers_hash = Block::ommers_hash(&block.ommers);
-        if block.header.ommers_hash != expected_ommers_hash {
-            return Err(ValidationError::WrongOmmersHash {
-                expected: expected_ommers_hash,
-                got: block.header.ommers_hash,
+    pub fn pre_validate_block<'a>(
+        &'a self,
+        block: &'a Block,
+    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = Result<(), ValidationError>> + 'a
+    {
+        move |_| {
+            let expected_ommers_hash = Block::ommers_hash(&block.ommers);
+            if block.header.ommers_hash != expected_ommers_hash {
+                return Err(ValidationError::WrongOmmersHash {
+                    expected: expected_ommers_hash,
+                    got: block.header.ommers_hash,
+                });
             }
-            .into());
-        }
 
-        let expected_transactions_root = Block::transactions_root(&block.transactions);
-        if block.header.transactions_root != expected_transactions_root {
-            return Err(ValidationError::WrongTransactionsRoot {
-                expected: expected_transactions_root,
-                got: block.header.transactions_root,
+            let expected_transactions_root = Block::transactions_root(&block.transactions);
+            if block.header.transactions_root != expected_transactions_root {
+                return Err(ValidationError::WrongTransactionsRoot {
+                    expected: expected_transactions_root,
+                    got: block.header.transactions_root,
+                });
             }
-            .into());
-        }
 
-        if block.ommers.len() > 2 {
-            return Err(ValidationError::TooManyOmmers.into());
-        }
+            if block.ommers.len() > 2 {
+                return Err(ValidationError::TooManyOmmers);
+            }
 
-        if block.ommers.len() == 2 && block.ommers[0] == block.ommers[1] {
-            return Err(ValidationError::DuplicateOmmer.into());
-        }
+            if block.ommers.len() == 2 && block.ommers[0] == block.ommers[1] {
+                return Err(ValidationError::DuplicateOmmer);
+            }
 
-        let parent = self
-            .get_parent_header(state, &block.header)
-            .await?
-            .ok_or(ValidationError::UnknownParent)?;
-
-        for ommer in &block.ommers {
-            let ommer_parent = self
-                .get_parent_header(state, ommer)
-                .await?
+            let parent = gen_await!(self.get_parent_header(&block.header))
                 .ok_or(ValidationError::UnknownParent)?;
 
-            self.validate_block_header(ommer, &ommer_parent, false)
-                .await
-                .context(ValidationError::InvalidOmmerHeader)?;
-            let mut old_ommers = vec![];
-            if !self
-                .is_kin(
+            for ommer in &block.ommers {
+                let ommer_parent = gen_await!(self.get_parent_header(ommer))
+                    .ok_or(ValidationError::UnknownParent)?;
+
+                self.validate_block_header(ommer, &ommer_parent, false)
+                    .map_err(|_| ValidationError::InvalidOmmerHeader)?;
+                let (old_ommers, is_kin) = gen_await!(self.is_kin(
                     ommer,
-                    &parent,
+                    parent.clone(),
                     block.header.parent_hash,
                     6,
-                    state,
-                    &mut old_ommers,
-                )
-                .await?
-            {
-                return Err(ValidationError::NotAnOmmer.into());
-            }
-            for oo in old_ommers {
-                if oo == *ommer {
-                    return Err(ValidationError::DuplicateOmmer.into());
+                    vec![],
+                ));
+                if !is_kin {
+                    return Err(ValidationError::NotAnOmmer);
+                }
+                for oo in old_ommers {
+                    if oo == *ommer {
+                        return Err(ValidationError::DuplicateOmmer);
+                    }
                 }
             }
-        }
 
-        for txn in &block.transactions {
-            pre_validate_transaction(txn, self.chain_id, block.header.base_fee_per_gas)?;
-        }
+            for txn in &block.transactions {
+                pre_validate_transaction(txn, self.chain_id, block.header.base_fee_per_gas)?;
+            }
 
-        Ok(())
+            Ok(())
+        }
     }
 }
 

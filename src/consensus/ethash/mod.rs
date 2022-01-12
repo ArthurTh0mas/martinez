@@ -1,6 +1,6 @@
 use self::difficulty::BlockDifficultyBombData;
 use super::{base::ConsensusEngineBase, *};
-use crate::{chain::protocol_param::param, h256_to_u256};
+use crate::{chain::protocol_param::param, gen_await, h256_to_u256};
 use ::ethash::LightDAG;
 use async_trait::async_trait;
 use std::collections::BTreeMap;
@@ -42,48 +42,50 @@ impl Ethash {
     }
 }
 
-#[async_trait]
 impl Consensus for Ethash {
-    async fn pre_validate_block(&self, block: &Block, state: &mut dyn State) -> anyhow::Result<()> {
-        self.base.pre_validate_block(block, state).await
+    fn pre_validate_block<'a>(
+        &'a self,
+        block: &'a Block,
+    ) -> StateGenerator<'a, Result<(), ValidationError>> {
+        Box::pin(self.base.pre_validate_block(block))
     }
 
-    async fn validate_block_header(
-        &self,
-        header: &BlockHeader,
-        state: &mut dyn State,
+    fn validate_block_header<'a>(
+        &'a self,
+        header: &'a BlockHeader,
         with_future_timestamp_check: bool,
-    ) -> anyhow::Result<()> {
-        let parent = self
-            .base
-            .get_parent_header(state, header)
-            .await?
-            .ok_or(ValidationError::UnknownParent)?;
+    ) -> StateGenerator<'a, Result<(), ValidationError>> {
+        Box::pin(move |_| {
+            let parent = gen_await!(self.base.get_parent_header(header))
+                .ok_or(ValidationError::UnknownParent)?;
 
-        self.base
-            .validate_block_header(header, &parent, with_future_timestamp_check)
-            .await?;
+            gen_await!(self.base.validate_block_header(
+                header,
+                &parent,
+                with_future_timestamp_check
+            ))?;
 
-        let parent_has_uncles = parent.ommers_hash != EMPTY_LIST_HASH;
-        let difficulty = difficulty::canonical_difficulty(
-            header.number,
-            header.timestamp,
-            parent.difficulty,
-            parent.timestamp,
-            parent_has_uncles,
-            switch_is_active(self.byzantium_formula, header.number),
-            switch_is_active(self.homestead_formula, header.number),
-            self.difficulty_bomb
-                .as_ref()
-                .map(|b| BlockDifficultyBombData {
-                    delay_to: b.get_delay_to(header.number),
-                }),
-        );
-        if difficulty != header.difficulty {
-            return Err(ValidationError::WrongDifficulty.into());
-        }
+            let parent_has_uncles = parent.ommers_hash != EMPTY_LIST_HASH;
+            let difficulty = difficulty::canonical_difficulty(
+                header.number,
+                header.timestamp,
+                parent.difficulty,
+                parent.timestamp,
+                parent_has_uncles,
+                switch_is_active(self.byzantium_formula, header.number),
+                switch_is_active(self.homestead_formula, header.number),
+                self.difficulty_bomb
+                    .as_ref()
+                    .map(|b| BlockDifficultyBombData {
+                        delay_to: b.get_delay_to(header.number),
+                    }),
+            );
+            if difficulty != header.difficulty {
+                return Err(ValidationError::WrongDifficulty);
+            }
 
-        Ok(())
+            Ok(())
+        })
     }
     async fn validate_seal(&self, header: &BlockHeader) -> anyhow::Result<()> {
         if !self.skip_pow_verification {
@@ -101,12 +103,12 @@ impl Consensus for Ethash {
         }
         Ok(())
     }
-    async fn finalize(
+    fn finalize(
         &self,
         header: &PartialHeader,
         ommers: &[BlockHeader],
         revision: Revision,
-    ) -> anyhow::Result<Vec<FinalizationChange>> {
+    ) -> Vec<FinalizationChange> {
         let mut changes = Vec::with_capacity(1 + ommers.len());
         let block_reward = {
             if revision >= Revision::Constantinople {
@@ -135,7 +137,7 @@ impl Consensus for Ethash {
             amount: miner_reward.into(),
         });
 
-        Ok(changes)
+        changes
     }
 
     async fn get_beneficiary(&self, header: &BlockHeader) -> anyhow::Result<Address> {

@@ -1,7 +1,8 @@
-use crate::{chain::protocol_param::param, crypto::*, models::*, util::*};
+use crate::{
+    chain::protocol_param::param, crypto::*, execution::evm::Revision, models::*, util::*,
+};
 use arrayref::array_ref;
 use bytes::{Buf, Bytes};
-use evmodin::Revision;
 use num_bigint::BigUint;
 use num_traits::Zero;
 use ripemd::*;

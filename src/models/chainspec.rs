@@ -1,6 +1,5 @@
-use crate::{models::*, util::*};
+use crate::{execution::evm::Revision, models::*, util::*};
 use bytes::Bytes;
-use evmodin::Revision;
 use serde::*;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},

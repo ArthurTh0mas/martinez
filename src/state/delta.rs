@@ -47,10 +47,7 @@ pub enum Delta {
 }
 
 impl Delta {
-    pub fn revert<R>(self, state: &mut IntraBlockState<'_, R>)
-    where
-        R: State,
-    {
+    pub fn revert(self, state: &mut IntraBlockState) {
         match self {
             Delta::Create { address } => {
                 state.objects.remove(&address);
