@@ -1,7 +1,10 @@
-use crate::execution::evm::{
-    tracing::*,
-    util::{mocked_host::*, *},
-    *,
+use crate::{
+    execution::evm::{
+        tracing::*,
+        util::{mocked_host::*, *},
+        *,
+    },
+    models::*,
 };
 use bytes::Bytes;
 use educe::Educe;
@@ -12,7 +15,7 @@ use std::sync::Arc;
 fn exec(
     host: &mut MockedHost,
     revision: Revision,
-    message: Message,
+    message: InterpreterMessage,
     code: Vec<u8>,
     collect_traces: bool,
 ) -> Output {
@@ -21,7 +24,7 @@ fn exec(
         host.access_account(message.sender);
         host.access_account(message.recipient);
     }
-    let code = AnalyzedCode::analyze(code);
+    let code = AnalyzedCode::analyze(&code);
 
     if collect_traces {
         code.execute(host, &mut StdoutTracer::default(), None, message, revision)
@@ -43,15 +46,15 @@ enum GasCheck {
 pub struct EvmTester {
     host: MockedHost,
     #[educe(Debug(ignore))]
-    apply_host_fns: Vec<Arc<dyn Fn(&mut MockedHost, &Message) + 'static>>,
+    apply_host_fns: Vec<Arc<dyn Fn(&mut MockedHost, &InterpreterMessage) + 'static>>,
     #[educe(Debug(ignore))]
     inspect_output_fn: Arc<dyn Fn(&[u8]) + 'static>,
     #[educe(Debug(ignore))]
-    inspect_host_fn: Arc<dyn Fn(&MockedHost, &Message) + 'static>,
+    inspect_host_fn: Arc<dyn Fn(&MockedHost, &InterpreterMessage) + 'static>,
     #[educe(Debug(ignore))]
-    inspect_fn: Arc<dyn Fn(&MockedHost, &Message, &[u8]) + 'static>,
+    inspect_fn: Arc<dyn Fn(&MockedHost, &InterpreterMessage, &[u8]) + 'static>,
     revision: Revision,
-    message: Message,
+    message: InterpreterMessage,
     code: Vec<u8>,
     gas_check: Option<GasCheck>,
     expected_status_codes: Option<Vec<StatusCode>>,
@@ -75,7 +78,7 @@ impl EvmTester {
             inspect_host_fn: Arc::new(|_, _| ()),
             inspect_fn: Arc::new(|_, _, _| ()),
             revision: Revision::Byzantium,
-            message: Message {
+            message: InterpreterMessage {
                 kind: CallKind::Call,
                 is_static: false,
                 depth: 0,
@@ -101,7 +104,10 @@ impl EvmTester {
     }
 
     /// Queue function that will modify the host before execution.
-    pub fn apply_host_fn(mut self, host_fn: impl Fn(&mut MockedHost, &Message) + 'static) -> Self {
+    pub fn apply_host_fn(
+        mut self,
+        host_fn: impl Fn(&mut MockedHost, &InterpreterMessage) + 'static,
+    ) -> Self {
         self.apply_host_fns.push(Arc::new(host_fn));
         self
     }
@@ -197,13 +203,16 @@ impl EvmTester {
     }
 
     /// Inspect host with provided function.
-    pub fn inspect_host(mut self, f: impl Fn(&MockedHost, &Message) + 'static) -> Self {
+    pub fn inspect_host(mut self, f: impl Fn(&MockedHost, &InterpreterMessage) + 'static) -> Self {
         self.inspect_host_fn = Arc::new(f);
         self
     }
 
     /// Inspect host and output with provided function.
-    pub fn inspect(mut self, f: impl Fn(&MockedHost, &Message, &[u8]) + 'static) -> Self {
+    pub fn inspect(
+        mut self,
+        f: impl Fn(&MockedHost, &InterpreterMessage, &[u8]) + 'static,
+    ) -> Self {
         self.inspect_fn = Arc::new(f);
         self
     }

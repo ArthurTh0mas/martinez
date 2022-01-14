@@ -1,4 +1,7 @@
-use crate::execution::evm::{state::*, Revision, StatusCode};
+use crate::{
+    execution::evm::{state::*, StatusCode},
+    models::*,
+};
 use ethereum_types::U512;
 use ethnum::U256;
 use i256::I256;

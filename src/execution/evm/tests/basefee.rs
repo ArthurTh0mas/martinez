@@ -1,4 +1,7 @@
-use crate::execution::evm::{opcode::*, util::*, *};
+use crate::{
+    execution::evm::{opcode::*, util::*, *},
+    models::*,
+};
 
 #[test]
 fn basefee_pre_london() {

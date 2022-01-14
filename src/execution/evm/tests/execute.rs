@@ -1,6 +1,9 @@
 #![allow(clippy::needless_range_loop)]
 
-use crate::execution::evm::{opcode::*, util::*, *};
+use crate::{
+    execution::evm::{opcode::*, util::*, *},
+    models::*,
+};
 use core::iter::repeat;
 use ethnum::U256;
 use hex_literal::hex;

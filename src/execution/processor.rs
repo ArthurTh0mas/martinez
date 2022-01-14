@@ -1,30 +1,25 @@
-use super::{
-    analysis_cache::AnalysisCache,
-    continuation::{interrupt_data::InterruptData, resume_data::ResumeData},
-    root_hash,
-    tracer::Tracer,
-};
+use super::{analysis_cache::AnalysisCache, root_hash, tracer::Tracer};
 use crate::{
     chain::{
         intrinsic_gas::*,
         protocol_param::{fee, param},
     },
     consensus::*,
-    execution::{
-        evm::{Revision, StatusCode},
-        evmglue,
-    },
-    gen_await, h256_to_u256,
+    execution::{evm::StatusCode, evmglue},
+    h256_to_u256,
     models::*,
     state::IntraBlockState,
-    State, UpdateCommand,
+    State,
 };
 use anyhow::Context;
-use std::{cmp::min, ops::Generator};
+use std::cmp::min;
 use TransactionAction;
 
-pub struct ExecutionProcessor<'tracer, 'analysis, 'e, 'h, 'b, 'c> {
-    state: IntraBlockState,
+pub struct ExecutionProcessor<'r, 'tracer, 'analysis, 'e, 'h, 'b, 'c, S>
+where
+    S: State,
+{
+    state: IntraBlockState<'r, S>,
     tracer: Option<&'tracer mut dyn Tracer>,
     analysis_cache: &'analysis mut AnalysisCache,
     engine: &'e mut dyn Consensus,
@@ -34,8 +29,13 @@ pub struct ExecutionProcessor<'tracer, 'analysis, 'e, 'h, 'b, 'c> {
     cumulative_gas_used: u64,
 }
 
-impl<'tracer, 'analysis, 'e, 'h, 'b, 'c> ExecutionProcessor<'tracer, 'analysis, 'e, 'h, 'b, 'c> {
+impl<'r, 'tracer, 'analysis, 'e, 'h, 'b, 'c, S>
+    ExecutionProcessor<'r, 'tracer, 'analysis, 'e, 'h, 'b, 'c, S>
+where
+    S: State,
+{
     pub fn new(
+        state: &'r mut S,
         tracer: Option<&'tracer mut dyn Tracer>,
         analysis_cache: &'analysis mut AnalysisCache,
         engine: &'e mut dyn Consensus,
@@ -44,7 +44,7 @@ impl<'tracer, 'analysis, 'e, 'h, 'b, 'c> ExecutionProcessor<'tracer, 'analysis, 
         block_spec: &'c BlockExecutionSpec,
     ) -> Self {
         Self {
-            state: IntraBlockState::new(),
+            state: IntraBlockState::new(state),
             tracer,
             analysis_cache,
             engine,
@@ -59,338 +59,258 @@ impl<'tracer, 'analysis, 'e, 'h, 'b, 'c> ExecutionProcessor<'tracer, 'analysis, 
         self.header.gas_limit - self.cumulative_gas_used
     }
 
-    pub(crate) fn state(&mut self) -> &mut IntraBlockState {
+    pub(crate) fn state(&mut self) -> &mut IntraBlockState<'r, S> {
         &mut self.state
     }
 
-    pub(crate) fn into_state(self) -> IntraBlockState {
+    pub(crate) fn into_state(self) -> IntraBlockState<'r, S> {
         self.state
     }
 
-    pub fn validate_transaction(
-        &mut self,
-        tx: MessageWithSender,
-    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = Result<(), ValidationError>> + '_
-    {
-        move |_| {
-            pre_validate_transaction(
-                &tx,
-                self.block_spec.params.chain_id,
-                self.header.base_fee_per_gas,
-            )
-            .expect("Tx must have been prevalidated");
+    pub async fn validate_transaction(&mut self, tx: &MessageWithSender) -> anyhow::Result<()> {
+        pre_validate_transaction(
+            tx,
+            self.block_spec.params.chain_id,
+            self.header.base_fee_per_gas,
+        )
+        .expect("Tx must have been prevalidated");
 
-            if gen_await!(self.state.get_code_hash(tx.sender)) != EMPTY_HASH {
-                return Err(ValidationError::SenderNoEOA { sender: tx.sender }.into());
-            }
-
-            let expected_nonce = gen_await!(self.state.get_nonce(tx.sender));
-            if expected_nonce != tx.nonce() {
-                return Err(ValidationError::WrongNonce {
-                    account: tx.sender,
-                    expected: expected_nonce,
-                    got: tx.nonce(),
-                }
-                .into());
-            }
-
-            // https://github.com/ethereum/EIPs/pull/3594
-            let max_gas_cost = U512::from(tx.gas_limit())
-                * U512::from(ethereum_types::U256::from(
-                    tx.max_fee_per_gas().to_be_bytes(),
-                ));
-            // See YP, Eq (57) in Section 6.2 "Execution"
-            let v0 =
-                max_gas_cost + U512::from(ethereum_types::U256::from(tx.value().to_be_bytes()));
-            let available_balance = ethereum_types::U256::from(
-                gen_await!(self.state.get_balance(tx.sender)).to_be_bytes(),
-            )
-            .into();
-            if available_balance < v0 {
-                return Err(ValidationError::InsufficientFunds {
-                    account: tx.sender,
-                    available: available_balance,
-                    required: v0,
-                }
-                .into());
-            }
-
-            let available_gas = self.available_gas();
-            if available_gas < tx.gas_limit() {
-                // Corresponds to the final condition of Eq (58) in Yellow Paper Section 6.2 "Execution".
-                // The sum of the transaction’s gas limit and the gas utilized in this block prior
-                // must be no greater than the block’s gas limit.
-                return Err(ValidationError::BlockGasLimitExceeded {
-                    available: available_gas,
-                    required: tx.gas_limit(),
-                }
-                .into());
-            }
-
-            Ok(())
+        if self.state.get_code_hash(tx.sender).await? != EMPTY_HASH {
+            return Err(ValidationError::SenderNoEOA { sender: tx.sender }.into());
         }
+
+        let expected_nonce = self.state.get_nonce(tx.sender).await?;
+        if expected_nonce != tx.nonce() {
+            return Err(ValidationError::WrongNonce {
+                account: tx.sender,
+                expected: expected_nonce,
+                got: tx.nonce(),
+            }
+            .into());
+        }
+
+        // https://github.com/ethereum/EIPs/pull/3594
+        let max_gas_cost = U512::from(tx.gas_limit())
+            * U512::from(ethereum_types::U256::from(
+                tx.max_fee_per_gas().to_be_bytes(),
+            ));
+        // See YP, Eq (57) in Section 6.2 "Execution"
+        let v0 = max_gas_cost + U512::from(ethereum_types::U256::from(tx.value().to_be_bytes()));
+        let available_balance =
+            ethereum_types::U256::from(self.state.get_balance(tx.sender).await?.to_be_bytes())
+                .into();
+        if available_balance < v0 {
+            return Err(ValidationError::InsufficientFunds {
+                account: tx.sender,
+                available: available_balance,
+                required: v0,
+            }
+            .into());
+        }
+
+        let available_gas = self.available_gas();
+        if available_gas < tx.gas_limit() {
+            // Corresponds to the final condition of Eq (58) in Yellow Paper Section 6.2 "Execution".
+            // The sum of the transaction’s gas limit and the gas utilized in this block prior
+            // must be no greater than the block’s gas limit.
+            return Err(ValidationError::BlockGasLimitExceeded {
+                available: available_gas,
+                required: tx.gas_limit(),
+            }
+            .into());
+        }
+
+        Ok(())
     }
 
-    fn execute_transaction(
-        &mut self,
-        txn: MessageWithSender,
-    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = Result<Receipt, ValidationError>> + '_
-    {
-        move |_| {
-            let rev = self.block_spec.revision;
+    async fn execute_transaction(&mut self, txn: &MessageWithSender) -> anyhow::Result<Receipt> {
+        let rev = self.block_spec.revision;
 
-            self.state.clear_journal_and_substate();
+        self.state.clear_journal_and_substate();
 
-            self.state.access_account(txn.sender);
+        self.state.access_account(txn.sender);
 
-            let base_fee_per_gas = self.header.base_fee_per_gas.unwrap_or(U256::ZERO);
-            let effective_gas_price = txn.effective_gas_price(base_fee_per_gas);
-            gen_await!(self.state.subtract_from_balance(
+        let base_fee_per_gas = self.header.base_fee_per_gas.unwrap_or(U256::ZERO);
+        let effective_gas_price = txn.effective_gas_price(base_fee_per_gas);
+        self.state
+            .subtract_from_balance(
                 txn.sender,
                 U256::from(txn.gas_limit()) * effective_gas_price,
-            ));
+            )
+            .await?;
 
-            if let TransactionAction::Call(to) = txn.action() {
-                self.state.access_account(to);
-                // EVM itself increments the nonce for contract creation
-                gen_await!(self.state.set_nonce(txn.sender, txn.nonce() + 1));
+        if let TransactionAction::Call(to) = txn.action() {
+            self.state.access_account(to);
+            // EVM itself increments the nonce for contract creation
+            self.state.set_nonce(txn.sender, txn.nonce() + 1).await?;
+        }
+
+        for entry in &*txn.access_list() {
+            self.state.access_account(entry.address);
+            for &key in &entry.slots {
+                self.state.access_storage(entry.address, h256_to_u256(key));
             }
+        }
 
-            for entry in &*txn.access_list() {
-                self.state.access_account(entry.address);
-                for &key in &entry.slots {
-                    self.state.access_storage(entry.address, h256_to_u256(key));
-                }
-            }
+        let g0 = intrinsic_gas(txn, rev >= Revision::Homestead, rev >= Revision::Istanbul);
+        let gas = u128::from(txn.gas_limit())
+            .checked_sub(g0)
+            .ok_or(ValidationError::IntrinsicGas)?
+            .try_into()
+            .unwrap();
 
-            let g0 = intrinsic_gas(&txn, rev >= Revision::Homestead, rev >= Revision::Istanbul);
-            let gas = u128::from(txn.gas_limit())
-                .checked_sub(g0)
-                .ok_or(ValidationError::IntrinsicGas)?
-                .try_into()
-                .unwrap();
+        let vm_res = evmglue::execute(
+            &mut self.state,
+            // https://github.com/rust-lang/rust-clippy/issues/7846
+            #[allow(clippy::needless_option_as_deref)]
+            self.tracer.as_deref_mut(),
+            self.analysis_cache,
+            self.header,
+            self.block_spec,
+            txn,
+            gas,
+        )
+        .await?;
 
-            let vm_res = gen_await!(evmglue::execute(
-                &mut self.state,
-                // https://github.com/rust-lang/rust-clippy/issues/7846
-                #[allow(clippy::needless_option_as_deref)]
-                self.tracer.as_deref_mut(),
-                self.analysis_cache,
-                self.header,
-                self.block_spec,
-                &txn,
-                gas,
-            ));
+        let gas_used = txn.gas_limit() - self.refund_gas(txn, vm_res.gas_left as u64).await?;
 
-            let gas_used =
-                txn.gas_limit() - gen_await!(self.refund_gas(txn.clone(), vm_res.gas_left as u64));
-
-            // award the miner
-            let priority_fee_per_gas = txn.priority_fee_per_gas(base_fee_per_gas);
-            gen_await!(self.state.add_to_balance(
+        // award the miner
+        let priority_fee_per_gas = txn.priority_fee_per_gas(base_fee_per_gas);
+        self.state
+            .add_to_balance(
                 self.header.beneficiary,
                 U256::from(gas_used) * priority_fee_per_gas,
-            ));
+            )
+            .await?;
 
-            gen_await!(self.state.destruct_selfdestructs());
-            if rev >= Revision::Spurious {
-                gen_await!(self.state.destruct_touched_dead());
-            }
-
-            self.state.finalize_transaction();
-
-            self.cumulative_gas_used += gas_used;
-
-            Ok(Receipt {
-                tx_type: txn.tx_type(),
-                success: vm_res.status_code == StatusCode::Success,
-                cumulative_gas_used: self.cumulative_gas_used,
-                bloom: logs_bloom(self.state.logs()),
-                logs: self.state.logs().to_vec(),
-            })
+        self.state.destruct_selfdestructs().await?;
+        if rev >= Revision::Spurious {
+            self.state.destruct_touched_dead().await?;
         }
+
+        self.state.finalize_transaction();
+
+        self.cumulative_gas_used += gas_used;
+
+        Ok(Receipt {
+            tx_type: txn.tx_type(),
+            success: vm_res.status_code == StatusCode::Success,
+            cumulative_gas_used: self.cumulative_gas_used,
+            bloom: logs_bloom(self.state.logs()),
+            logs: self.state.logs().to_vec(),
+        })
     }
 
-    pub fn execute_block_no_post_validation<'a>(
-        &'a mut self,
-    ) -> impl Generator<
-        ResumeData,
-        Yield = InterruptData,
-        Return = Result<Vec<Receipt>, ValidationError>,
-    > + 'analysis + 'tracer
-    where
-        'tracer: 'a,
-        'analysis: 'a,
-    {
-        static move |_| {
-            let mut receipts = Vec::with_capacity(self.block.transactions.len());
+    pub async fn execute_block_no_post_validation(&mut self) -> anyhow::Result<Vec<Receipt>> {
+        let mut receipts = Vec::with_capacity(self.block.transactions.len());
 
-            for (&address, &balance) in &self.block_spec.balance_changes {
-                gen_await!(self.state.set_balance(address, balance));
-            }
+        for (&address, &balance) in &self.block_spec.balance_changes {
+            self.state.set_balance(address, balance).await?;
+        }
 
-            for (i, txn) in self.block.transactions.iter().enumerate() {
-                gen_await!(self.validate_transaction(txn.clone()));
-                receipts.push(gen_await!(self.execute_transaction(txn.clone()))?);
-            }
+        for (i, txn) in self.block.transactions.iter().enumerate() {
+            self.validate_transaction(txn)
+                .await
+                .with_context(|| format!("Failed to validate tx #{}", i))?;
+            receipts.push(self.execute_transaction(txn).await?);
+        }
 
-            for change in
-                self.engine
-                    .finalize(self.header, &self.block.ommers, self.block_spec.revision)
-            {
-                match change {
-                    FinalizationChange::Reward { address, amount } => {
-                        gen_await!(self.state.add_to_balance(address, amount));
-                    }
+        for change in self
+            .engine
+            .finalize(self.header, &self.block.ommers, self.block_spec.revision)
+            .await?
+        {
+            match change {
+                FinalizationChange::Reward { address, amount } => {
+                    self.state.add_to_balance(address, amount).await?;
                 }
             }
-
-            Ok(receipts)
         }
+
+        Ok(receipts)
     }
 
-    pub fn execute_and_write_block<'a>(
-        mut self,
-    ) -> impl Generator<
-        ResumeData,
-        Yield = InterruptData,
-        Return = Result<Vec<Receipt>, ValidationError>,
-    > + 'a
-    where
-        'tracer: 'a,
-        'analysis: 'a,
-        'e: 'a,
-        'h: 'a,
-        'b: 'a,
-        'c: 'a,
-    {
-        static move |_| {
-            let receipts = gen_await!(self.execute_block_no_post_validation())?;
+    pub async fn execute_and_write_block(mut self) -> anyhow::Result<Vec<Receipt>> {
+        let receipts = self.execute_block_no_post_validation().await?;
 
-            let gas_used = receipts.last().map(|r| r.cumulative_gas_used).unwrap_or(0);
+        let gas_used = receipts.last().map(|r| r.cumulative_gas_used).unwrap_or(0);
 
-            if gas_used != self.header.gas_used {
-                let transactions = receipts
-                    .into_iter()
-                    .enumerate()
-                    .fold(
-                        (Vec::new(), 0),
-                        |(mut receipts, last_gas_used), (i, receipt)| {
-                            let gas_used = receipt.cumulative_gas_used - last_gas_used;
-                            receipts.push((i, gas_used));
-                            (receipts, receipt.cumulative_gas_used)
-                        },
-                    )
-                    .0;
-                return Err(ValidationError::WrongBlockGas {
-                    expected: self.header.gas_used,
-                    got: gas_used,
-                    transactions,
-                });
+        if gas_used != self.header.gas_used {
+            let transactions = receipts
+                .into_iter()
+                .enumerate()
+                .fold(
+                    (Vec::new(), 0),
+                    |(mut receipts, last_gas_used), (i, receipt)| {
+                        let gas_used = receipt.cumulative_gas_used - last_gas_used;
+                        receipts.push((i, gas_used));
+                        (receipts, receipt.cumulative_gas_used)
+                    },
+                )
+                .0;
+            return Err(ValidationError::WrongBlockGas {
+                expected: self.header.gas_used,
+                got: gas_used,
+                transactions,
             }
+            .into());
+        }
 
-            let block_num = self.header.number;
-            let rev = self.block_spec.revision;
+        let block_num = self.header.number;
+        let rev = self.block_spec.revision;
 
-            if rev >= Revision::Byzantium {
-                let expected = root_hash(&receipts);
-                if expected != self.header.receipts_root {
-                    return Err(ValidationError::WrongReceiptsRoot {
-                        expected,
-                        got: self.header.receipts_root,
-                    }
-                    .into());
-                }
-            }
-
-            let expected_logs_bloom = receipts
-                .iter()
-                .fold(Bloom::zero(), |bloom, r| bloom | r.bloom);
-            if expected_logs_bloom != self.header.logs_bloom {
-                return Err(ValidationError::WrongLogsBloom {
-                    expected: expected_logs_bloom,
-                    got: self.header.logs_bloom,
+        if rev >= Revision::Byzantium {
+            let expected = root_hash(&receipts);
+            if expected != self.header.receipts_root {
+                return Err(ValidationError::WrongReceiptsRoot {
+                    expected,
+                    got: self.header.receipts_root,
                 }
                 .into());
             }
-
-            for command in self.state.write_to_db(block_num) {
-                match command {
-                    UpdateCommand::BeginBlock { block_number } => {
-                        yield InterruptData::BeginBlock { block_number };
-                    }
-                    UpdateCommand::EraseStorage { address } => {
-                        yield InterruptData::EraseStorage { address };
-                    }
-                    UpdateCommand::UpdateStorage {
-                        address,
-                        location,
-                        initial,
-                        current,
-                    } => {
-                        yield InterruptData::UpdateStorage {
-                            address,
-                            location,
-                            initial,
-                            current,
-                        };
-                    }
-                    UpdateCommand::UpdateAccount {
-                        address,
-                        initial,
-                        current,
-                    } => {
-                        yield InterruptData::UpdateAccount {
-                            address,
-                            initial,
-                            current,
-                        };
-                    }
-                    UpdateCommand::UpdateCode { code_hash, code } => {
-                        yield InterruptData::UpdateCode { code_hash, code };
-                    }
-                }
-            }
-
-            Ok(receipts)
         }
+
+        let expected_logs_bloom = receipts
+            .iter()
+            .fold(Bloom::zero(), |bloom, r| bloom | r.bloom);
+        if expected_logs_bloom != self.header.logs_bloom {
+            return Err(ValidationError::WrongLogsBloom {
+                expected: expected_logs_bloom,
+                got: self.header.logs_bloom,
+            }
+            .into());
+        }
+
+        self.state.write_to_db(block_num).await?;
+
+        Ok(receipts)
     }
 
-    fn refund_gas<'a>(
-        &'a mut self,
-        txn: MessageWithSender,
+    async fn refund_gas(
+        &mut self,
+        txn: &MessageWithSender,
         mut gas_left: u64,
-    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = u64> + 'analysis
-    where
-        'tracer: 'a,
-        'analysis: 'a,
-        'e: 'a,
-        'h: 'a,
-        'b: 'a,
-        'c: 'a,
-    {
-        static move |_| {
-            let mut refund = self.state.get_refund();
-            if self.block_spec.revision < Revision::London {
-                refund += fee::R_SELF_DESTRUCT * self.state.number_of_self_destructs() as u64;
-            }
-            let max_refund_quotient = if self.block_spec.revision >= Revision::London {
-                param::MAX_REFUND_QUOTIENT_LONDON
-            } else {
-                param::MAX_REFUND_QUOTIENT_FRONTIER
-            };
-            let max_refund = (txn.gas_limit() - gas_left) / max_refund_quotient;
-            refund = min(refund, max_refund);
-            gas_left += refund;
-
-            let base_fee_per_gas = self.header.base_fee_per_gas.unwrap_or(U256::ZERO);
-            let effective_gas_price = txn.effective_gas_price(base_fee_per_gas);
-            gen_await!(self
-                .state
-                .add_to_balance(txn.sender, U256::from(gas_left) * effective_gas_price));
-
-            gas_left
+    ) -> anyhow::Result<u64> {
+        let mut refund = self.state.get_refund();
+        if self.block_spec.revision < Revision::London {
+            refund += fee::R_SELF_DESTRUCT * self.state.number_of_self_destructs() as u64;
         }
+        let max_refund_quotient = if self.block_spec.revision >= Revision::London {
+            param::MAX_REFUND_QUOTIENT_LONDON
+        } else {
+            param::MAX_REFUND_QUOTIENT_FRONTIER
+        };
+        let max_refund = (txn.gas_limit() - gas_left) / max_refund_quotient;
+        refund = min(refund, max_refund);
+        gas_left += refund;
+
+        let base_fee_per_gas = self.header.base_fee_per_gas.unwrap_or(U256::ZERO);
+        let effective_gas_price = txn.effective_gas_price(base_fee_per_gas);
+        self.state
+            .add_to_balance(txn.sender, U256::from(gas_left) * effective_gas_price)
+            .await?;
+
+        Ok(gas_left)
     }
 }
 
@@ -398,9 +318,7 @@ impl<'tracer, 'analysis, 'e, 'h, 'b, 'c> ExecutionProcessor<'tracer, 'analysis, 
 mod tests {
     use super::*;
     use crate::{
-        execution::{address::create_address, continuation::interrupt::StartedInterrupt},
-        res::chainspec::MAINNET,
-        util::test_util::run_test,
+        execution::address::create_address, res::chainspec::MAINNET, util::test_util::run_test,
         InMemoryState,
     };
     use bytes::Bytes;
@@ -409,50 +327,48 @@ mod tests {
 
     #[test]
     fn zero_gas_price() {
-        InMemoryState::new()
-            .execute(StartedInterrupt::from(Box::pin(static move |_| {
-                let header = PartialHeader {
-                    number: 2_687_232.into(),
-                    gas_limit: 3_303_221,
-                    beneficiary: hex!("4bb96091ee9d802ed039c4d1a5f6216f90f81b01").into(),
-                    ..PartialHeader::empty()
-                };
-                let block = Default::default();
+        run_test(async {
+            let header = PartialHeader {
+                number: 2_687_232.into(),
+                gas_limit: 3_303_221,
+                beneficiary: hex!("4bb96091ee9d802ed039c4d1a5f6216f90f81b01").into(),
+                ..PartialHeader::empty()
+            };
+            let block = Default::default();
 
-                // The sender does not exist
-                let sender = hex!("004512399a230565b99be5c3b0030a56f3ace68c").into();
+            // The sender does not exist
+            let sender = hex!("004512399a230565b99be5c3b0030a56f3ace68c").into();
 
-                let txn = MessageWithSender {
-                    message: Message::Legacy {
-                        chain_id: None,
-                        nonce: 0,
-                        gas_price: U256::ZERO,
-                        gas_limit: 764_017,
-                        action: TransactionAction::Create,
-                        value: U256::ZERO,
-                        input: hex!("606060").to_vec().into(),
-                    },
-                    sender,
-                };
+            let txn = MessageWithSender {
+                message: Message::Legacy {
+                    chain_id: None,
+                    nonce: 0,
+                    gas_price: U256::ZERO,
+                    gas_limit: 764_017,
+                    action: TransactionAction::Create,
+                    value: U256::ZERO,
+                    input: hex!("606060").to_vec().into(),
+                },
+                sender,
+            };
 
-                let mut analysis_cache = AnalysisCache::default();
-                let mut engine = engine_factory(MAINNET.clone()).unwrap();
-                let block_spec = MAINNET.collect_block_spec(header.number);
-                let mut processor = ExecutionProcessor::new(
-                    None,
-                    &mut analysis_cache,
-                    &mut *engine,
-                    &header,
-                    &block,
-                    &block_spec,
-                );
+            let mut state = InMemoryState::default();
+            let mut analysis_cache = AnalysisCache::default();
+            let mut engine = engine_factory(MAINNET.clone()).unwrap();
+            let block_spec = MAINNET.collect_block_spec(header.number);
+            let mut processor = ExecutionProcessor::new(
+                &mut state,
+                None,
+                &mut analysis_cache,
+                &mut *engine,
+                &header,
+                &block,
+                &block_spec,
+            );
 
-                let receipt = gen_await!(processor.execute_transaction(&txn))?;
-                assert!(receipt.success);
-
-                Ok(())
-            })))
-            .unwrap()
+            let receipt = processor.execute_transaction(&txn).await.unwrap();
+            assert!(receipt.success);
+        })
     }
 
     #[test]

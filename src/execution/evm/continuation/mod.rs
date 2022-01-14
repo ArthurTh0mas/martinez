@@ -23,18 +23,19 @@ pub mod interrupt_data;
 /// Data required for resume.
 pub mod resume_data;
 
-pub(crate) type InnerCoroutine = Box<
-    dyn Generator<
-            ResumeDataVariant,
-            Yield = InterruptData,
-            Return = Result<SuccessfulOutput, StatusCode>,
-        > + Send
-        + Sync
-        + Unpin,
+pub(crate) type InnerCoroutine = Pin<
+    Box<
+        dyn Generator<
+                ResumeData,
+                Yield = InterruptData,
+                Return = Result<SuccessfulOutput, StatusCode>,
+            > + Send
+            + Sync,
+    >,
 >;
 
-fn resume_interrupt(mut inner: InnerCoroutine, resume_data: ResumeDataVariant) -> Interrupt {
-    match Pin::new(&mut *inner).resume(resume_data) {
+fn resume_interrupt(mut inner: InnerCoroutine, resume_data: ResumeData) -> Interrupt {
+    match inner.as_mut().resume(resume_data) {
         GeneratorState::Yielded(interrupt) => match interrupt {
             InterruptData::InstructionStart { pc, opcode, state } => Interrupt::InstructionStart {
                 interrupt: InstructionStartInterrupt { inner },

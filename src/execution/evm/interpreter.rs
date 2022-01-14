@@ -1,14 +1,15 @@
 use self::instruction_table::*;
 use super::{
-    common::*,
-    continuation::{interrupt::*, interrupt_data::*, resume_data::*},
+    common::{InterpreterMessage, *},
+    continuation::{interrupt::*, interrupt_data::*, resume_data::*, InnerCoroutine},
     instructions::{control::*, stack_manip::*, *},
     state::*,
     tracing::Tracer,
     *,
 };
+use crate::models::*;
 use ethnum::U256;
-use std::{ops::Generator, sync::Arc};
+use std::sync::Arc;
 
 fn check_requirements(
     instruction_table: &InstructionTable,
@@ -55,8 +56,7 @@ pub struct AnalyzedCode {
 
 impl AnalyzedCode {
     /// Analyze code and prepare it for execution.
-    pub fn analyze(code: impl Into<Vec<u8>>) -> Self {
-        let code = code.into();
+    pub fn analyze(code: &[u8]) -> Self {
         let mut jumpdest_map = vec![false; code.len()];
 
         let mut i = 0;
@@ -105,7 +105,7 @@ impl AnalyzedCode {
 
         let code_len = code.len();
 
-        let mut padded_code = code;
+        let mut padded_code = code.to_vec();
         padded_code.resize(i + 1, OpCode::STOP.to_u8());
 
         let jumpdest_map = JumpdestMap(jumpdest_map.into());
@@ -126,7 +126,7 @@ impl AnalyzedCode {
         host: &mut H,
         tracer: &mut T,
         state_modifier: StateModifier,
-        message: Message,
+        message: InterpreterMessage,
         revision: Revision,
     ) -> Output {
         if !T::DUMMY {
@@ -148,55 +148,52 @@ impl AnalyzedCode {
     pub fn execute_resumable(
         &self,
         trace: bool,
-        message: Message,
+        message: InterpreterMessage,
         revision: Revision,
-    ) -> ExecutionStartInterrupt {
+    ) -> StartedInterrupt {
         let code = self.clone();
         let state = ExecutionState::new(message);
         let f = match (trace, revision) {
-            (true, Revision::Frontier) => interpreter_producer::<true, { Revision::Frontier }>,
-            (true, Revision::Homestead) => interpreter_producer::<true, { Revision::Homestead }>,
-            (true, Revision::Tangerine) => interpreter_producer::<true, { Revision::Tangerine }>,
-            (true, Revision::Spurious) => interpreter_producer::<true, { Revision::Spurious }>,
-            (true, Revision::Byzantium) => interpreter_producer::<true, { Revision::Byzantium }>,
+            (true, Revision::Frontier) => gen_interpreter::<true, { Revision::Frontier }>,
+            (true, Revision::Homestead) => gen_interpreter::<true, { Revision::Homestead }>,
+            (true, Revision::Tangerine) => gen_interpreter::<true, { Revision::Tangerine }>,
+            (true, Revision::Spurious) => gen_interpreter::<true, { Revision::Spurious }>,
+            (true, Revision::Byzantium) => gen_interpreter::<true, { Revision::Byzantium }>,
             (true, Revision::Constantinople) => {
-                interpreter_producer::<true, { Revision::Constantinople }>
+                gen_interpreter::<true, { Revision::Constantinople }>
             }
-            (true, Revision::Petersburg) => interpreter_producer::<true, { Revision::Petersburg }>,
-            (true, Revision::Istanbul) => interpreter_producer::<true, { Revision::Istanbul }>,
-            (true, Revision::Berlin) => interpreter_producer::<true, { Revision::Berlin }>,
-            (true, Revision::London) => interpreter_producer::<true, { Revision::London }>,
-            (true, Revision::Shanghai) => interpreter_producer::<true, { Revision::Shanghai }>,
-            (false, Revision::Frontier) => interpreter_producer::<false, { Revision::Frontier }>,
-            (false, Revision::Homestead) => interpreter_producer::<false, { Revision::Homestead }>,
-            (false, Revision::Tangerine) => interpreter_producer::<false, { Revision::Tangerine }>,
-            (false, Revision::Spurious) => interpreter_producer::<false, { Revision::Spurious }>,
-            (false, Revision::Byzantium) => interpreter_producer::<false, { Revision::Byzantium }>,
+            (true, Revision::Petersburg) => gen_interpreter::<true, { Revision::Petersburg }>,
+            (true, Revision::Istanbul) => gen_interpreter::<true, { Revision::Istanbul }>,
+            (true, Revision::Berlin) => gen_interpreter::<true, { Revision::Berlin }>,
+            (true, Revision::London) => gen_interpreter::<true, { Revision::London }>,
+            (true, Revision::Shanghai) => gen_interpreter::<true, { Revision::Shanghai }>,
+            (false, Revision::Frontier) => gen_interpreter::<false, { Revision::Frontier }>,
+            (false, Revision::Homestead) => gen_interpreter::<false, { Revision::Homestead }>,
+            (false, Revision::Tangerine) => gen_interpreter::<false, { Revision::Tangerine }>,
+            (false, Revision::Spurious) => gen_interpreter::<false, { Revision::Spurious }>,
+            (false, Revision::Byzantium) => gen_interpreter::<false, { Revision::Byzantium }>,
             (false, Revision::Constantinople) => {
-                interpreter_producer::<false, { Revision::Constantinople }>
+                gen_interpreter::<false, { Revision::Constantinople }>
             }
-            (false, Revision::Petersburg) => {
-                interpreter_producer::<false, { Revision::Petersburg }>
-            }
-            (false, Revision::Istanbul) => interpreter_producer::<false, { Revision::Istanbul }>,
-            (false, Revision::Berlin) => interpreter_producer::<false, { Revision::Berlin }>,
-            (false, Revision::London) => interpreter_producer::<false, { Revision::London }>,
-            (false, Revision::Shanghai) => interpreter_producer::<false, { Revision::Shanghai }>,
+            (false, Revision::Petersburg) => gen_interpreter::<false, { Revision::Petersburg }>,
+            (false, Revision::Istanbul) => gen_interpreter::<false, { Revision::Istanbul }>,
+            (false, Revision::Berlin) => gen_interpreter::<false, { Revision::Berlin }>,
+            (false, Revision::London) => gen_interpreter::<false, { Revision::London }>,
+            (false, Revision::Shanghai) => gen_interpreter::<false, { Revision::Shanghai }>,
         };
         let inner = (f)(code, state);
 
-        ExecutionStartInterrupt { inner }
+        StartedInterrupt { inner }
     }
 }
 
-impl ExecutionStartInterrupt {
-    #[doc(hidden)]
-    pub fn run_to_completion_with_host2<H: Host, T: Tracer>(
+impl StartedInterrupt {
+    pub fn run_to_completion_with_host<H: Host, T: Tracer>(
         self,
         host: &mut H,
         tracer: &mut T,
         state_modifier: StateModifier,
-    ) -> (Output, ExecutionComplete) {
+    ) -> Output {
         let mut interrupt = self.resume(());
 
         loop {
@@ -307,7 +304,7 @@ impl ExecutionStartInterrupt {
                     let status = host.access_storage(address, location);
                     interrupt.resume(AccessStorageStatus { status })
                 }
-                Interrupt::Complete { interrupt, result } => {
+                Interrupt::Complete { result, .. } => {
                     let output = match result {
                         Ok(output) => output.into(),
                         Err(status_code) => Output {
@@ -318,37 +315,19 @@ impl ExecutionStartInterrupt {
                         },
                     };
 
-                    return (output, interrupt);
+                    return output;
                 }
             };
         }
     }
-
-    pub fn run_to_completion_with_host<H: Host, T: Tracer>(
-        self,
-        host: &mut H,
-        tracer: &mut T,
-        state_modifier: StateModifier,
-    ) -> Output {
-        self.run_to_completion_with_host2(host, tracer, state_modifier)
-            .0
-    }
 }
 
-fn interpreter_producer<const TRACE: bool, const REVISION: Revision>(
+fn gen_interpreter<const TRACE: bool, const REVISION: Revision>(
     s: AnalyzedCode,
     mut state: ExecutionState,
-) -> Box<
-    dyn Generator<
-            ResumeDataVariant,
-            Yield = InterruptData,
-            Return = Result<SuccessfulOutput, StatusCode>,
-        > + Send
-        + Sync
-        + Unpin,
-> {
-    Box::new(move |_: ResumeDataVariant| {
-        let instruction_table = get_baseline_instruction_table(REVISION);
+) -> InnerCoroutine {
+    Box::pin(move |_: ResumeData| {
+        let instruction_table = get_instruction_table(REVISION);
 
         let mut reverted = false;
 

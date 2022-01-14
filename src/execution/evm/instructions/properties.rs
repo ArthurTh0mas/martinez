@@ -1,4 +1,4 @@
-use crate::execution::evm::{common::Revision, opcode::*};
+use crate::{execution::evm::opcode::*, models::*};
 use once_cell::sync::Lazy;
 
 pub(crate) const COLD_SLOAD_COST: u16 = 2100;

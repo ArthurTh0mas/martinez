@@ -1,6 +1,4 @@
-use crate::{
-    chain::protocol_param::param, crypto::*, execution::evm::Revision, models::*, util::*,
-};
+use crate::{chain::protocol_param::param, crypto::*, models::*, util::*};
 use arrayref::array_ref;
 use bytes::{Buf, Bytes};
 use num_bigint::BigUint;

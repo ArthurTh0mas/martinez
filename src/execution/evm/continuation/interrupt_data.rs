@@ -2,7 +2,7 @@ use super::*;
 
 #[derive(Debug)]
 pub enum Call {
-    Call(Message),
+    Call(InterpreterMessage),
     Create(CreateMessage),
 }
 

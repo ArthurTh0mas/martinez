@@ -1,7 +1,10 @@
-use crate::execution::evm::{
-    opcode::*,
-    util::{mocked_host::*, *},
-    *,
+use crate::{
+    execution::evm::{
+        opcode::*,
+        util::{mocked_host::*, *},
+        *,
+    },
+    models::*,
 };
 use ethereum_types::*;
 use ethnum::{AsU256, U256};

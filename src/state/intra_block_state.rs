@@ -1,16 +1,8 @@
 use super::{delta::*, object::*, *};
-use crate::{
-    crypto::*,
-    execution::{
-        continuation::{interrupt_data::InterruptData, resume_data::ResumeData},
-        evm::host::AccessStatus,
-    },
-    gen_await,
-    models::*,
-};
+use crate::{crypto::*, execution::evm::host::AccessStatus, models::*};
 use bytes::Bytes;
 use hex_literal::hex;
-use std::{collections::*, fmt::Debug, ops::Generator, sync::Arc};
+use std::{collections::*, fmt::Debug};
 
 #[derive(Debug)]
 pub struct Snapshot {
@@ -20,7 +12,12 @@ pub struct Snapshot {
 }
 
 #[derive(Debug)]
-pub struct IntraBlockState {
+pub struct IntraBlockState<'db, S>
+where
+    S: State,
+{
+    db: &'db mut S,
+
     pub(crate) objects: HashMap<Address, Object>,
     pub(crate) storage: HashMap<Address, Storage>,
     pub(crate) incarnations: HashMap<Address, u64>,
@@ -41,16 +38,15 @@ pub struct IntraBlockState {
     pub(crate) accessed_storage_keys: HashMap<Address, HashSet<U256>>,
 }
 
-fn get_object<'m>(
+async fn get_object<'m, 'db, S: State>(
+    db: &S,
     objects: &'m mut HashMap<Address, Object>,
     address: Address,
-) -> impl Generator<ResumeData, Yield = InterruptData, Return = Option<&'m mut Object>> + Unpin + 'm
-{
-    move |_| match objects.entry(address) {
+) -> anyhow::Result<Option<&'m mut Object>> {
+    Ok(match objects.entry(address) {
         hash_map::Entry::Occupied(entry) => Some(entry.into_mut()),
         hash_map::Entry::Vacant(entry) => {
-            let accdata =
-                ResumeData::into_account(yield InterruptData::ReadAccount { address }).unwrap();
+            let accdata = db.read_account(address).await?;
 
             if let Some(account) = accdata {
                 Some(entry.insert(Object {
@@ -61,72 +57,48 @@ fn get_object<'m>(
                 None
             }
         }
-    }
+    })
 }
 
-fn ensure_object<'m: 'j, 'j>(
+async fn ensure_object<'m: 'j, 'j, S: State>(
+    db: &S,
     objects: &'m mut HashMap<Address, Object>,
     journal: &'j mut Vec<Delta>,
     address: Address,
-) -> impl Generator<ResumeData, Yield = InterruptData, Return = ()> + Unpin + 'j {
-    move |_| {
-        if let Some(obj) = gen_await!(get_object(objects, address)) {
-            if obj.current.is_none() {
-                journal.push(Delta::Update {
-                    address,
-                    previous: obj.clone(),
-                });
-                obj.current = Some(Account::default());
-            }
-        } else {
-            journal.push(Delta::Create { address });
-            objects.entry(address).insert(Object {
-                current: Some(Account::default()),
-                ..Default::default()
+) -> anyhow::Result<()> {
+    if let Some(obj) = get_object(db, objects, address).await? {
+        if obj.current.is_none() {
+            journal.push(Delta::Update {
+                address,
+                previous: obj.clone(),
             });
+            obj.current = Some(Account::default());
         }
+    } else {
+        journal.push(Delta::Create { address });
+        objects.entry(address).insert(Object {
+            current: Some(Account::default()),
+            ..Default::default()
+        });
     }
+
+    Ok(())
 }
 
-fn get_or_create_object<'m: 'j, 'j>(
+async fn get_or_create_object<'m: 'j, 'j, S: State>(
+    db: &S,
     objects: &'m mut HashMap<Address, Object>,
     journal: &'j mut Vec<Delta>,
     address: Address,
-) -> impl Generator<ResumeData, Yield = InterruptData, Return = &'m mut Object> + Unpin + 'j {
-    move |_| {
-        gen_await!(ensure_object(objects, journal, address));
-        objects.get_mut(&address).unwrap()
-    }
+) -> anyhow::Result<&'m mut Object> {
+    ensure_object(db, objects, journal, address).await?;
+    Ok(objects.get_mut(&address).unwrap())
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum UpdateCommand {
-    BeginBlock {
-        block_number: BlockNumber,
-    },
-    EraseStorage {
-        address: Address,
-    },
-    UpdateStorage {
-        address: Address,
-        location: U256,
-        initial: U256,
-        current: U256,
-    },
-    UpdateAccount {
-        address: Address,
-        initial: Option<Account>,
-        current: Option<Account>,
-    },
-    UpdateCode {
-        code_hash: H256,
-        code: Bytes,
-    },
-}
-
-impl IntraBlockState {
-    pub fn new() -> Self {
+impl<'storage, 'r, S: State> IntraBlockState<'r, S> {
+    pub fn new(db: &'r mut S) -> Self {
         Self {
+            db,
             objects: Default::default(),
             storage: Default::default(),
             incarnations: Default::default(),
@@ -142,85 +114,77 @@ impl IntraBlockState {
         }
     }
 
-    pub fn exists(
-        &mut self,
-        address: Address,
-    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = bool> + '_ {
-        move |_| {
-            let obj = gen_await!(get_object(&mut self.objects, address));
-
-            if let Some(obj) = obj {
-                if obj.current.is_some() {
-                    return true;
-                }
-            }
-
-            false
-        }
+    pub fn db(&mut self) -> &mut S {
+        self.db
     }
 
-    pub fn is_dead(
-        &mut self,
-        address: Address,
-    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = bool> + '_ {
-        move |_| {
-            let obj = gen_await!(get_object(&mut self.objects, address));
+    pub async fn exists(&mut self, address: Address) -> anyhow::Result<bool> {
+        let obj = get_object(self.db, &mut self.objects, address).await?;
 
-            if let Some(obj) = obj {
-                if let Some(current) = &obj.current {
-                    return current.code_hash == EMPTY_HASH
-                        && current.nonce == 0
-                        && current.balance == 0;
-                }
+        if let Some(obj) = obj {
+            if obj.current.is_some() {
+                return Ok(true);
             }
-
-            true
         }
+
+        Ok(false)
     }
 
-    pub fn create_contract(
-        &mut self,
-        address: Address,
-    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = ()> + '_ {
-        move |_| {
-            let mut current = Account::default();
-            let mut initial = None;
+    // https://eips.ethereum.org/EIPS/eip-161
+    pub async fn is_dead(&mut self, address: Address) -> anyhow::Result<bool> {
+        let obj = get_object(self.db, &mut self.objects, address).await?;
 
-            self.journal.push({
-                if let Some(prev) = gen_await!(get_object(&mut self.objects, address)) {
-                    initial = prev.initial;
-                    if let Some(prev_current) = &prev.current {
-                        current.balance = prev_current.balance;
-                    }
-                    Delta::Update {
-                        address,
-                        previous: prev.clone(),
-                    }
-                } else {
-                    Delta::Create { address }
+        if let Some(obj) = obj {
+            if let Some(current) = &obj.current {
+                return Ok(current.code_hash == EMPTY_HASH
+                    && current.nonce == 0
+                    && current.balance == 0);
+            }
+        }
+
+        Ok(true)
+    }
+
+    pub async fn create_contract(&mut self, address: Address) -> anyhow::Result<()> {
+        let mut current = Account::default();
+        let mut initial = None;
+
+        self.journal.push({
+            if let Some(prev) = get_object(self.db, &mut self.objects, address).await? {
+                initial = prev.initial;
+                if let Some(prev_current) = &prev.current {
+                    current.balance = prev_current.balance;
                 }
-            });
-
-            *self.incarnations.entry(address).or_default() += 1;
-            self.journal.push(Delta::Incarnation { address });
-
-            self.objects.insert(
-                address,
-                Object {
-                    current: Some(current),
-                    initial,
-                },
-            );
-
-            if let Some(removed) = self.storage.remove(&address) {
-                self.journal.push(Delta::StorageWipe {
+                Delta::Update {
                     address,
-                    storage: removed,
-                });
+                    previous: prev.clone(),
+                }
             } else {
-                self.journal.push(Delta::StorageCreate { address });
+                Delta::Create { address }
             }
+        });
+
+        *self.incarnations.entry(address).or_default() += 1;
+        self.journal.push(Delta::Incarnation { address });
+
+        self.objects.insert(
+            address,
+            Object {
+                current: Some(current),
+                initial,
+            },
+        );
+
+        if let Some(removed) = self.storage.remove(&address) {
+            self.journal.push(Delta::StorageWipe {
+                address,
+                storage: removed,
+            });
+        } else {
+            self.journal.push(Delta::StorageCreate { address });
         }
+
+        Ok(())
     }
 
     pub async fn destruct(&mut self, address: Address) -> anyhow::Result<()> {
@@ -241,104 +205,87 @@ impl IntraBlockState {
             self.journal.push(Delta::Selfdestruct { address });
         }
     }
-    pub fn destruct_selfdestructs(
-        &mut self,
-    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = ()> + '_ {
-        move |_| {
-            for address in self.self_destructs.iter().copied().collect::<Vec<_>>() {
-                gen_await!(self.destruct(address));
-            }
+    pub async fn destruct_selfdestructs(&mut self) -> anyhow::Result<()> {
+        for address in self.self_destructs.iter().copied().collect::<Vec<_>>() {
+            self.destruct(address).await?;
         }
+
+        Ok(())
     }
-    pub fn destruct_touched_dead(
-        &mut self,
-    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = ()> + '_ {
-        move |_| {
-            for address in self.touched.iter().copied().collect::<Vec<_>>() {
-                if gen_await!(self.is_dead(address)) {
-                    gen_await!(self.destruct(address));
-                }
+    pub async fn destruct_touched_dead(&mut self) -> anyhow::Result<()> {
+        for address in self.touched.iter().copied().collect::<Vec<_>>() {
+            if self.is_dead(address).await? {
+                self.destruct(address).await?;
             }
         }
+
+        Ok(())
     }
 
     pub fn number_of_self_destructs(&self) -> usize {
         self.self_destructs.len()
     }
 
-    pub fn get_balance(
-        &mut self,
-        address: Address,
-    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = U256> + '_ {
-        move |_| {
-            gen_await!(get_object(&mut self.objects, address))
-                .map(|object| object.current.as_ref().map(|current| current.balance))
-                .flatten()
-                .unwrap_or(U256::ZERO)
-        }
+    pub async fn get_balance(&mut self, address: Address) -> anyhow::Result<U256> {
+        Ok(get_object(self.db, &mut self.objects, address)
+            .await?
+            .map(|object| object.current.as_ref().map(|current| current.balance))
+            .flatten()
+            .unwrap_or(U256::ZERO))
     }
-    pub fn set_balance(
+    pub async fn set_balance(
         &mut self,
         address: Address,
-        value: U256,
-    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = ()> + '_ {
-        move |_| {
-            let obj = gen_await!(get_or_create_object(
-                &mut self.objects,
-                &mut self.journal,
-                address
-            ));
+        value: impl AsU256,
+    ) -> anyhow::Result<()> {
+        let obj =
+            get_or_create_object(self.db, &mut self.objects, &mut self.journal, address).await?;
 
-            let current = obj.current.as_mut().unwrap();
-            self.journal.push(Delta::UpdateBalance {
-                address,
-                previous: current.balance,
-            });
-            current.balance = value.as_u256();
-            self.touch(address);
-        }
+        let current = obj.current.as_mut().unwrap();
+        self.journal.push(Delta::UpdateBalance {
+            address,
+            previous: current.balance,
+        });
+        current.balance = value.as_u256();
+        self.touch(address);
+
+        Ok(())
     }
-    pub fn add_to_balance(
+    pub async fn add_to_balance(
         &mut self,
         address: Address,
-        addend: U256,
-    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = ()> + '_ {
-        move |_| {
-            let obj = gen_await!(get_or_create_object(
-                &mut self.objects,
-                &mut self.journal,
-                address
-            ));
+        addend: impl AsU256,
+    ) -> anyhow::Result<()> {
+        let obj =
+            get_or_create_object(self.db, &mut self.objects, &mut self.journal, address).await?;
 
-            let current = obj.current.as_mut().unwrap();
-            self.journal.push(Delta::UpdateBalance {
-                address,
-                previous: current.balance,
-            });
-            current.balance += addend.as_u256();
-            self.touch(address);
-        }
+        let current = obj.current.as_mut().unwrap();
+        self.journal.push(Delta::UpdateBalance {
+            address,
+            previous: current.balance,
+        });
+        current.balance += addend.as_u256();
+        self.touch(address);
+
+        Ok(())
     }
-    pub fn subtract_from_balance(
+    pub async fn subtract_from_balance(
         &mut self,
         address: Address,
         subtrahend: U256,
-    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = ()> + '_ {
-        move |_| {
-            let obj = gen_await!(get_or_create_object(
-                &mut self.objects,
-                &mut self.journal,
-                address
-            ));
+    ) -> anyhow::Result<()> {
+        let obj =
+            get_or_create_object(self.db, &mut self.objects, &mut self.journal, address).await?;
 
-            let current = obj.current.as_mut().unwrap();
-            self.journal.push(Delta::UpdateBalance {
-                address,
-                previous: current.balance,
-            });
-            current.balance -= subtrahend;
-            self.touch(address);
-        }
+        let current = obj.current.as_mut().unwrap();
+        self.journal.push(Delta::UpdateBalance {
+            address,
+            previous: current.balance,
+        });
+        current.balance -= subtrahend;
+        self.touch(address);
+
+        Ok(())
     }
 
     pub fn touch(&mut self, address: Address) {
@@ -351,110 +298,79 @@ impl IntraBlockState {
         }
     }
 
-    pub fn get_nonce(
-        &mut self,
-        address: Address,
-    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = u64> + '_ {
-        move |_| {
-            if let Some(object) = gen_await!(get_object(&mut self.objects, address)) {
-                if let Some(current) = &object.current {
-                    return current.nonce;
-                }
+    pub async fn get_nonce(&mut self, address: Address) -> anyhow::Result<u64> {
+        if let Some(object) = get_object(self.db, &mut self.objects, address).await? {
+            if let Some(current) = &object.current {
+                return Ok(current.nonce);
             }
-
-            0
         }
+
+        Ok(0)
     }
-    pub fn set_nonce(
-        &mut self,
-        address: Address,
-        nonce: u64,
-    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = ()> + '_ {
-        move |_| {
-            let object = gen_await!(get_or_create_object(
-                &mut self.objects,
-                &mut self.journal,
-                address
-            ));
-            self.journal.push(Delta::Update {
-                address,
-                previous: object.clone(),
-            });
+    pub async fn set_nonce(&mut self, address: Address, nonce: u64) -> anyhow::Result<()> {
+        let object =
+            get_or_create_object(self.db, &mut self.objects, &mut self.journal, address).await?;
+        self.journal.push(Delta::Update {
+            address,
+            previous: object.clone(),
+        });
 
-            object.current.as_mut().unwrap().nonce = nonce;
-        }
+        object.current.as_mut().unwrap().nonce = nonce;
+
+        Ok(())
     }
 
-    pub fn get_code(
-        &mut self,
-        address: Address,
-    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = Option<Bytes>> + '_ {
-        move |_| {
-            let obj = gen_await!(get_object(&mut self.objects, address));
+    pub async fn get_code(&mut self, address: Address) -> anyhow::Result<Option<Bytes>> {
+        let obj = get_object(self.db, &mut self.objects, address).await?;
 
-            if let Some(obj) = obj {
-                if let Some(current) = &obj.current {
-                    let code_hash = current.code_hash;
-                    if code_hash != EMPTY_HASH {
-                        if let Some(code) = self.new_code.get(&code_hash) {
-                            return Some(code.clone());
-                        }
-
-                        if let Some(code) = self.existing_code.get(&code_hash) {
-                            return Some(code.clone());
-                        }
-
-                        let code =
-                            ResumeData::into_code(yield InterruptData::ReadCode { code_hash })
-                                .unwrap();
-                        self.existing_code.insert(code_hash, code.clone());
-                        return Some(code);
+        if let Some(obj) = obj {
+            if let Some(current) = &obj.current {
+                let code_hash = current.code_hash;
+                if code_hash != EMPTY_HASH {
+                    if let Some(code) = self.new_code.get(&code_hash) {
+                        return Ok(Some(code.clone()));
                     }
+
+                    if let Some(code) = self.existing_code.get(&code_hash) {
+                        return Ok(Some(code.clone()));
+                    }
+
+                    let code = self.db.read_code(code_hash).await?;
+                    self.existing_code.insert(code_hash, code.clone());
+                    return Ok(Some(code));
                 }
             }
-
-            None
         }
+
+        Ok(None)
     }
 
-    pub fn get_code_hash(
-        &mut self,
-        address: Address,
-    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = H256> + '_ {
-        move |_| {
-            if let Some(object) = gen_await!(get_object(&mut self.objects, address)) {
-                if let Some(current) = &object.current {
-                    return current.code_hash;
-                }
+    pub async fn get_code_hash(&mut self, address: Address) -> anyhow::Result<H256> {
+        if let Some(object) = get_object(self.db, &mut self.objects, address).await? {
+            if let Some(current) = &object.current {
+                return Ok(current.code_hash);
             }
-
-            EMPTY_HASH
         }
+
+        Ok(EMPTY_HASH)
     }
 
-    pub fn set_code(
-        &mut self,
-        address: Address,
-        code: Bytes,
-    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = ()> + '_ {
-        move |_| {
-            let obj = gen_await!(get_or_create_object(
-                &mut self.objects,
-                &mut self.journal,
-                address
-            ));
-            self.journal.push(Delta::Update {
-                address,
-                previous: obj.clone(),
-            });
-            obj.current.as_mut().unwrap().code_hash = keccak256(&code);
+    pub async fn set_code(&mut self, address: Address, code: Bytes) -> anyhow::Result<()> {
+        let obj =
+            get_or_create_object(self.db, &mut self.objects, &mut self.journal, address).await?;
+        self.journal.push(Delta::Update {
+            address,
+            previous: obj.clone(),
+        });
+        obj.current.as_mut().unwrap().code_hash = keccak256(&code);
 
-            // Don't overwrite already existing code so that views of it
-            // that were previously returned by get_code() are still valid.
-            self.new_code
-                .entry(obj.current.as_mut().unwrap().code_hash)
-                .or_insert(code);
-        }
+        // Don't overwrite already existing code so that views of it
+        // that were previously returned by get_code() are still valid.
+        self.new_code
+            .entry(obj.current.as_mut().unwrap().code_hash)
+            .or_insert(code);
+
+        Ok(())
     }
 
     pub fn access_account(&mut self, address: Address) -> AccessStatus {
@@ -482,139 +398,119 @@ impl IntraBlockState {
         }
     }
 
-    fn get_storage<const ORIGINAL: bool>(
-        &mut self,
-        address: Address,
-        location: U256,
-    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = U256> + '_ {
-        move |_| {
-            if let Some(obj) = gen_await!(get_object(&mut self.objects, address)) {
-                if obj.current.is_some() {
-                    let storage = self.storage.entry(address).or_default();
-
-                    if !ORIGINAL {
-                        if let Some(v) = storage.current.get(&location) {
-                            return Ok(*v);
-                        }
-                    }
-
-                    if let Some(v) = storage.committed.get(&location) {
-                        return Ok(v.original);
-                    }
-
-                    if obj.initial.is_none() || self.incarnations.contains_key(&address) {
-                        return Ok(U256::ZERO);
-                    }
-
-                    let val = ResumeData::into_storage(
-                        yield InterruptData::ReadStorage { address, location },
-                    )
-                    .unwrap();
-
-                    self.storage.entry(address).or_default().committed.insert(
-                        location,
-                        CommittedValue {
-                            initial: val,
-                            original: val,
-                        },
-                    );
-
-                    return val;
-                }
-            }
-
-            U256::ZERO
-        }
-    }
-
-    pub fn get_current_storage(
+    async fn get_storage(
         &mut self,
         address: Address,
         key: U256,
-    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = U256> + '_ {
-        self.get_storage::<false>(address, key)
+        original: bool,
+    ) -> anyhow::Result<U256> {
+        if let Some(obj) = get_object(self.db, &mut self.objects, address).await? {
+            if obj.current.is_some() {
+                let storage = self.storage.entry(address).or_default();
+
+                if !original {
+                    if let Some(v) = storage.current.get(&key) {
+                        return Ok(*v);
+                    }
+                }
+
+                if let Some(v) = storage.committed.get(&key) {
+                    return Ok(v.original);
+                }
+
+                if obj.initial.is_none() || self.incarnations.contains_key(&address) {
+                    return Ok(U256::ZERO);
+                }
+
+                let val = self.db.read_storage(address, key).await?;
+
+                self.storage.entry(address).or_default().committed.insert(
+                    key,
+                    CommittedValue {
+                        initial: val,
+                        original: val,
+                    },
+                );
+
+                return Ok(val);
+            }
+        }
+
+        Ok(U256::ZERO)
+    }
+
+    pub async fn get_current_storage(
+        &mut self,
+        address: Address,
+        key: U256,
+    ) -> anyhow::Result<U256> {
+        self.get_storage(address, key, false).await
     }
 
     // https://eips.ethereum.org/EIPS/eip-2200
-    pub fn get_original_storage(
+    pub async fn get_original_storage(
         &mut self,
         address: Address,
         key: U256,
-    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = U256> + '_ {
-        self.get_storage::<true>(address, key)
+    ) -> anyhow::Result<U256> {
+        self.get_storage(address, key, true).await
     }
 
-    pub fn set_storage(
+    pub async fn set_storage(
         &mut self,
         address: Address,
         key: U256,
         value: U256,
-    ) -> impl Generator<ResumeData, Yield = InterruptData, Return = ()> + '_ {
-        move |_| {
-            let previous = gen_await!(self.get_current_storage(address, key));
-            if previous == value {
-                return;
-            }
-            self.storage
-                .entry(address)
-                .or_default()
-                .current
-                .insert(key, value);
-
-            self.journal.push(Delta::StorageChange {
-                address,
-                key,
-                previous,
-            });
+    ) -> anyhow::Result<()> {
+        let previous = self.get_current_storage(address, key).await?;
+        if previous == value {
+            return Ok(());
         }
+        self.storage
+            .entry(address)
+            .or_default()
+            .current
+            .insert(key, value);
+
+        self.journal.push(Delta::StorageChange {
+            address,
+            key,
+            previous,
+        });
+
+        Ok(())
     }
 
-    pub fn write_to_db(self, block_number: BlockNumber) -> impl Iterator<Item = UpdateCommand> {
-        let objects = Arc::new(self.objects);
-        std::iter::once(UpdateCommand::BeginBlock { block_number })
-            .chain(
-                self.incarnations
-                    .into_iter()
-                    .filter_map(|(address, incarnation)| {
-                        if incarnation > 0 {
-                            Some(UpdateCommand::EraseStorage { address })
-                        } else {
-                            None
-                        }
-                    }),
-            )
-            .chain(self.storage.into_iter().flat_map({
-                let objects = objects.clone();
-                move |(address, storage)| {
-                    if let Some(obj) = objects.get(&address) {
-                        if obj.current.is_some() {
-                            for (&location, val) in &storage.committed {
-                                return Some(UpdateCommand::UpdateStorage {
-                                    address,
-                                    location,
-                                    initial: val.initial,
-                                    current: val.original,
-                                });
-                            }
-                        }
+    pub async fn write_to_db(self, block_number: BlockNumber) -> anyhow::Result<()> {
+        self.db.begin_block(block_number);
+
+        for (address, incarnation) in self.incarnations {
+            if incarnation > 0 {
+                self.db.erase_storage(address).await?
+            }
+        }
+
+        for (address, storage) in self.storage {
+            if let Some(obj) = self.objects.get(&address) {
+                if obj.current.is_some() {
+                    for (key, val) in &storage.committed {
+                        self.db
+                            .update_storage(address, *key, val.initial, val.original)
+                            .await?;
                     }
-                    None
                 }
-            }))
-            .chain(
-                objects
-                    .iter()
-                    .map(|(&address, object)| UpdateCommand::UpdateAccount {
-                        address,
-                        initial: object.initial,
-                        current: object.current,
-                    }),
-            )
-            .chain(
-                self.new_code
-                    .into_iter()
-                    .map(|(code_hash, code)| UpdateCommand::UpdateCode { code_hash, code }),
-            )
+            }
+        }
+
+        for (address, obj) in self.objects {
+            self.db.update_account(address, obj.initial, obj.current);
+        }
+
+        for (code_hash, code) in self.new_code {
+            self.db.update_code(code_hash, code).await?
+        }
+
+        Ok(())
     }
 
     pub fn take_snapshot(&self) -> Snapshot {

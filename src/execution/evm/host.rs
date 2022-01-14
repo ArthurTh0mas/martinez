@@ -1,4 +1,4 @@
-use super::common::{Message, Output};
+use super::common::{InterpreterMessage, Output};
 use ethereum_types::Address;
 use ethnum::U256;
 
@@ -81,7 +81,7 @@ pub trait Host {
     /// Self-destruct account.
     fn selfdestruct(&mut self, address: Address, beneficiary: Address);
     /// Call to another account.
-    fn call(&mut self, msg: &Message) -> Output;
+    fn call(&mut self, msg: &InterpreterMessage) -> Output;
     /// Retrieve transaction context.
     fn get_tx_context(&self) -> TxContext;
     /// Get block hash.
@@ -136,7 +136,7 @@ impl Host for DummyHost {
         todo!()
     }
 
-    fn call(&mut self, _: &Message) -> Output {
+    fn call(&mut self, _: &InterpreterMessage) -> Output {
         todo!()
     }
 

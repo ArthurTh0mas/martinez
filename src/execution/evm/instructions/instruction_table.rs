@@ -1,4 +1,4 @@
-use crate::execution::evm::{instructions::properties, Revision};
+use crate::{execution::evm::instructions::properties, models::*};
 use once_cell::sync::Lazy;
 
 #[derive(Clone, Copy, Debug)]
@@ -37,6 +37,6 @@ pub static INSTRUCTION_TABLES: Lazy<InstructionTables> = Lazy::new(|| {
     table
 });
 
-pub fn get_baseline_instruction_table(revision: Revision) -> &'static InstructionTable {
+pub fn get_instruction_table(revision: Revision) -> &'static InstructionTable {
     &INSTRUCTION_TABLES[revision as usize]
 }

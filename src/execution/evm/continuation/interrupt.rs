@@ -17,7 +17,7 @@ macro_rules! interrupt {
 
 interrupt! {
     /// EVM has just been created. Resume this interrupt to start execution.
-    ExecutionStartInterrupt => ()
+    StartedInterrupt => ()
 }
 interrupt! {
     /// New instruction has been encountered.
