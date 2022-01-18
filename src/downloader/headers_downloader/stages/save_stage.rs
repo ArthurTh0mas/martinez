@@ -4,11 +4,14 @@ use super::headers::{
     header_slices::{HeaderSlice, HeaderSliceStatus, HeaderSlices},
 };
 use crate::{
-    kv,
-    kv::{tables::HeaderKey, traits::MutableTransaction},
+    kv::{
+        mdbx::MdbxTransaction,
+        tables::{self, HeaderKey},
+    },
     models::*,
 };
 use anyhow::format_err;
+use mdbx::{EnvironmentKind, RW};
 use parking_lot::RwLock;
 use std::{
     ops::{ControlFlow, DerefMut},
@@ -25,19 +28,25 @@ pub enum SaveOrder {
 }
 
 /// Saves slices into the database, and sets Saved status.
-pub struct SaveStage<'tx, RwTx> {
+pub struct SaveStage<'tx, 'db: 'tx, E>
+where
+    E: EnvironmentKind,
+{
     header_slices: Arc<HeaderSlices>,
-    db_transaction: &'tx RwTx,
+    db_transaction: &'tx MdbxTransaction<'db, RW, E>,
     order: SaveOrder,
     is_canonical_chain: bool,
     pending_watch: HeaderSliceStatusWatch,
     remaining_count: Arc<AtomicUsize>,
 }
 
-impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>> SaveStage<'tx, RwTx> {
+impl<'tx, 'db: 'tx, E> SaveStage<'tx, 'db, E>
+where
+    E: EnvironmentKind,
+{
     pub fn new(
         header_slices: Arc<HeaderSlices>,
-        db_transaction: &'tx RwTx,
+        db_transaction: &'tx MdbxTransaction<'db, RW, E>,
         order: SaveOrder,
         is_canonical_chain: bool,
     ) -> Self {
@@ -68,8 +77,8 @@ impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>> SaveStage<'tx, RwTx> {
 
         debug!("SaveStage: saving {} slices", pending_count);
         let saved_count = match self.order {
-            SaveOrder::Monotonic => self.save_pending_monotonic(pending_count).await?,
-            SaveOrder::Random => self.save_pending_all(pending_count).await?,
+            SaveOrder::Monotonic => self.save_pending_monotonic(pending_count)?,
+            SaveOrder::Random => self.save_pending_all(pending_count)?,
         };
         debug!("SaveStage: saved {} slices", saved_count);
 
@@ -96,13 +105,13 @@ impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>> SaveStage<'tx, RwTx> {
         Box::new(check)
     }
 
-    async fn save_pending_monotonic(&mut self, pending_count: usize) -> anyhow::Result<usize> {
+    fn save_pending_monotonic(&mut self, pending_count: usize) -> anyhow::Result<usize> {
         let mut saved_count: usize = 0;
         for _ in 0..pending_count {
             let next_slice_lock = self.find_next_pending_monotonic();
 
             if let Some(slice_lock) = next_slice_lock {
-                self.save_slice(slice_lock).await?;
+                self.save_slice(slice_lock)?;
                 saved_count += 1;
             } else {
                 break;
@@ -129,7 +138,7 @@ impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>> SaveStage<'tx, RwTx> {
         }
     }
 
-    async fn save_pending_all(&self, pending_count: usize) -> anyhow::Result<usize> {
+    fn save_pending_all(&self, pending_count: usize) -> anyhow::Result<usize> {
         let mut saved_count: usize = 0;
         while let Some(slice_lock) = self
             .header_slices
@@ -140,13 +149,13 @@ impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>> SaveStage<'tx, RwTx> {
                 break;
             }
 
-            self.save_slice(slice_lock).await?;
+            self.save_slice(slice_lock)?;
             saved_count += 1;
         }
         Ok(saved_count)
     }
 
-    async fn save_slice(&self, slice_lock: Arc<RwLock<HeaderSlice>>) -> anyhow::Result<()> {
+    fn save_slice(&self, slice_lock: Arc<RwLock<HeaderSlice>>) -> anyhow::Result<()> {
         // take out the headers, and unlock the slice while save_slice is in progress
         let headers = {
             let mut slice = slice_lock.write();
@@ -155,7 +164,7 @@ impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>> SaveStage<'tx, RwTx> {
             })?
         };
 
-        self.save_headers(&headers).await?;
+        self.save_headers(&headers)?;
 
         let mut slice = slice_lock.write();
 
@@ -167,118 +176,107 @@ impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>> SaveStage<'tx, RwTx> {
         Ok(())
     }
 
-    async fn save_headers(&self, headers: &[BlockHeader]) -> anyhow::Result<()> {
+    fn save_headers(&self, headers: &[BlockHeader]) -> anyhow::Result<()> {
         let tx = &self.db_transaction;
         for header_ref in headers {
             // this clone happens mostly on the stack (except extra_data)
             let header = header_ref.clone();
-            Self::save_header(header, self.is_canonical_chain, tx).await?;
+            Self::save_header(header, self.is_canonical_chain, tx)?;
         }
         Ok(())
     }
 
-    async fn read_parent_header_total_difficulty(
+    fn read_parent_header_total_difficulty(
         child: &BlockHeader,
-        tx: &'tx RwTx,
+        tx: &'tx MdbxTransaction<'db, RW, E>,
     ) -> anyhow::Result<Option<U256>> {
         if child.number() == BlockNumber(0) {
             return Ok(Some(U256::ZERO));
         }
         let parent_block_num = BlockNumber(child.number().0 - 1);
         let parent_header_key: HeaderKey = (parent_block_num, child.parent_hash());
-        let parent_total_difficulty = tx
-            .get(kv::tables::HeadersTotalDifficulty, parent_header_key)
-            .await?;
+        let parent_total_difficulty = tx.get(tables::HeadersTotalDifficulty, parent_header_key)?;
         Ok(parent_total_difficulty)
     }
 
-    async fn header_total_difficulty(
+    fn header_total_difficulty(
         header: &BlockHeader,
-        tx: &'tx RwTx,
+        tx: &'tx MdbxTransaction<'db, RW, E>,
     ) -> anyhow::Result<Option<U256>> {
-        let Some(parent_total_difficulty) = Self::read_parent_header_total_difficulty(header, tx).await? else {
+        let Some(parent_total_difficulty) = Self::read_parent_header_total_difficulty(header, tx)? else {
             return Ok(None)
         };
         let total_difficulty = parent_total_difficulty + header.difficulty();
         Ok(Some(total_difficulty))
     }
 
-    pub async fn load_canonical_header_by_num(
+    pub fn load_canonical_header_by_num(
         block_num: BlockNumber,
-        tx: &'tx RwTx,
+        tx: &'tx MdbxTransaction<'db, RW, E>,
     ) -> anyhow::Result<Option<BlockHeader>> {
-        let Some(header_hash) = tx.get(kv::tables::CanonicalHeader, block_num).await? else {
+        let Some(header_hash) = tx.get(tables::CanonicalHeader, block_num)? else {
             return Ok(None);
         };
         let header_key: HeaderKey = (block_num, header_hash);
-        let header_opt = tx.get(kv::tables::Header, header_key).await?;
+        let header_opt = tx.get(tables::Header, header_key)?;
         Ok(header_opt.map(|header| BlockHeader::new(header, header_hash)))
     }
 
-    pub async fn save_header(
+    pub fn save_header(
         header: BlockHeader,
         is_canonical_chain: bool,
-        tx: &'tx RwTx,
+        tx: &'tx MdbxTransaction<'db, RW, E>,
     ) -> anyhow::Result<()> {
         let block_num = header.number();
         let header_hash = header.hash();
         let header_key: HeaderKey = (block_num, header_hash);
 
         if is_canonical_chain {
-            Self::update_canonical_chain_header(&header, tx).await?;
+            Self::update_canonical_chain_header(&header, tx)?;
         }
 
-        tx.set(kv::tables::Header, header_key, header.header)
-            .await?;
-        tx.set(kv::tables::HeaderNumber, header_hash, block_num)
-            .await?;
+        tx.set(tables::Header, header_key, header.header)?;
+        tx.set(tables::HeaderNumber, header_hash, block_num)?;
 
         Ok(())
     }
 
-    pub async fn update_canonical_chain_header(
+    pub fn update_canonical_chain_header(
         header: &BlockHeader,
-        tx: &'tx RwTx,
+        tx: &'tx MdbxTransaction<'db, RW, E>,
     ) -> anyhow::Result<()> {
         let block_num = header.number();
         let header_hash = header.hash();
         let header_key: HeaderKey = (block_num, header_hash);
 
-        tx.set(kv::tables::CanonicalHeader, block_num, header_hash)
-            .await?;
-        tx.set(kv::tables::LastHeader, Default::default(), header_hash)
-            .await?;
+        tx.set(tables::CanonicalHeader, block_num, header_hash)?;
+        tx.set(tables::LastHeader, Default::default(), header_hash)?;
 
-        let total_difficulty_opt = Self::header_total_difficulty(header, tx).await?;
+        let total_difficulty_opt = Self::header_total_difficulty(header, tx)?;
         if let Some(total_difficulty) = total_difficulty_opt {
-            tx.set(
-                kv::tables::HeadersTotalDifficulty,
-                header_key,
-                total_difficulty,
-            )
-            .await?;
+            tx.set(tables::HeadersTotalDifficulty, header_key, total_difficulty)?;
         }
 
         Ok(())
     }
 
-    pub async fn unwind(unwind_to_block_num: BlockNumber, tx: &'tx RwTx) -> anyhow::Result<()> {
+    pub fn unwind(
+        unwind_to_block_num: BlockNumber,
+        tx: &'tx MdbxTransaction<'db, RW, E>,
+    ) -> anyhow::Result<()> {
         // headers after unwind_to_block_num are not canonical anymore
         for i in unwind_to_block_num.0 + 1.. {
             let num = BlockNumber(i);
-            let was_found = tx.del(kv::tables::CanonicalHeader, num, None).await?;
+            let was_found = tx.del(tables::CanonicalHeader, num, None)?;
             if !was_found {
                 break;
             }
         }
 
         // update LastHeader to point to unwind_to_block_num
-        let last_header_hash_opt = tx
-            .get(kv::tables::CanonicalHeader, unwind_to_block_num)
-            .await?;
+        let last_header_hash_opt = tx.get(tables::CanonicalHeader, unwind_to_block_num)?;
         if let Some(hash) = last_header_hash_opt {
-            tx.set(kv::tables::LastHeader, Default::default(), hash)
-                .await?;
+            tx.set(tables::LastHeader, Default::default(), hash)?;
         } else {
             anyhow::bail!(
                 "unwind: not found header hash of the top block after unwind {}",
@@ -291,7 +289,10 @@ impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>> SaveStage<'tx, RwTx> {
 }
 
 #[async_trait::async_trait]
-impl<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>> super::stage::Stage for SaveStage<'tx, RwTx> {
+impl<'tx, 'db: 'tx, E> super::stage::Stage for SaveStage<'tx, 'db, E>
+where
+    E: EnvironmentKind,
+{
     async fn execute(&mut self) -> anyhow::Result<()> {
         Self::execute(self).await
     }
