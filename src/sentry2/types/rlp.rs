@@ -10,7 +10,7 @@ pub fn decode_rlp_message(id: MessageId, data: &[u8]) -> anyhow::Result<Message>
             Message::GetBlockHeaders(rlp::decode::<GetBlockHeaders>(data)?)
         }
         MessageId::BlockHeaders => Message::BlockHeaders(rlp::decode::<BlockHeaders>(data)?),
-        MessageId::NewBlock => Message::NewBlock(rlp::decode::<NewBlock>(data)?),
+        MessageId::NewBlock => Message::NewBlock(Box::new(rlp::decode::<NewBlock>(data)?)),
         MessageId::NewPooledTransactionHashes => {
             Message::NewPooledTransactionHashes(rlp::decode::<NewPooledTransactionHashes>(data)?)
         }

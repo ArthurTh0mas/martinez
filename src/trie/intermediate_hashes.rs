@@ -2,7 +2,10 @@
 use crate::{
     crypto::keccak256,
     etl::collector::{TableCollector, OPTIMAL_BUFFER_CAPACITY},
-    kv::{mdbx::*, tables, traits::*},
+    kv::{
+        tables,
+        traits::{Cursor as _Cursor, *},
+    },
     models::*,
     trie::{
         hash_builder::{pack_nibbles, unpack_nibbles, HashBuilder},
@@ -12,9 +15,10 @@ use crate::{
     },
 };
 use anyhow::{bail, Result};
-use parking_lot::Mutex;
-use std::marker::PhantomData;
+use async_recursion::async_recursion;
+use std::{marker::PhantomData, sync::Mutex};
 use tempfile::TempDir;
+use tokio::sync::Mutex as AsyncMutex;
 
 struct CursorSubNode {
     key: Vec<u8>,
@@ -86,12 +90,13 @@ fn increment_key(unpacked: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-struct Cursor<'cu, 'tx, 'ps, T>
+struct Cursor<'cu, 'tx, 'ps, C, T>
 where
     T: Table<Key = Vec<u8>, SeekKey = Vec<u8>, Value = Vec<u8>>,
     'tx: 'cu,
+    C: MutableCursor<'tx, T>,
 {
-    cursor: Mutex<&'cu mut MdbxCursor<'tx, RW, T>>,
+    cursor: AsyncMutex<&'cu mut C>,
     changed: &'ps mut PrefixSet,
     prefix: Vec<u8>,
     stack: Vec<CursorSubNode>,
@@ -99,41 +104,42 @@ where
     _marker: PhantomData<&'tx T>,
 }
 
-impl<'cu, 'tx, 'ps, T> Cursor<'cu, 'tx, 'ps, T>
+impl<'cu, 'tx, 'ps, C, T> Cursor<'cu, 'tx, 'ps, C, T>
 where
     T: Table<Key = Vec<u8>, SeekKey = Vec<u8>, Value = Vec<u8>>,
     'tx: 'cu,
+    C: MutableCursor<'tx, T>,
 {
-    fn new(
-        cursor: &'cu mut MdbxCursor<'tx, RW, T>,
+    async fn new(
+        cursor: &'cu mut C,
         changed: &'ps mut PrefixSet,
         prefix: &[u8],
-    ) -> Result<Cursor<'cu, 'tx, 'ps, T>> {
+    ) -> Result<Cursor<'cu, 'tx, 'ps, C, T>> {
         let mut new_cursor = Self {
-            cursor: Mutex::new(cursor),
+            cursor: AsyncMutex::new(cursor),
             changed,
             prefix: prefix.to_vec(),
             stack: vec![],
             can_skip_state: false,
             _marker: PhantomData,
         };
-        new_cursor.consume_node(&[], true)?;
+        new_cursor.consume_node(&[], true).await?;
         Ok(new_cursor)
     }
 
-    fn next(&mut self) -> Result<()> {
+    async fn next(&mut self) -> Result<()> {
         if self.stack.is_empty() {
             return Ok(()); // end-of-tree
         }
 
         if !self.can_skip_state && self.children_are_in_trie() {
             if self.stack.last().unwrap().nibble < 0 {
-                self.move_to_next_sibling(true)?;
+                self.move_to_next_sibling(true).await?;
             } else {
-                self.consume_node(&self.key().unwrap(), false)?;
+                self.consume_node(&self.key().unwrap(), false).await?;
             }
         } else {
-            self.move_to_next_sibling(false)?;
+            self.move_to_next_sibling(false).await?;
         }
 
         self.update_skip_state();
@@ -179,12 +185,12 @@ where
         Some(pack_nibbles(k.as_ref().unwrap()))
     }
 
-    fn consume_node(&mut self, to: &[u8], exact: bool) -> Result<()> {
+    async fn consume_node(&mut self, to: &[u8], exact: bool) -> Result<()> {
         let db_key = [self.prefix.as_slice(), to].concat().to_vec();
         let entry = if exact {
-            self.cursor.lock().seek_exact(db_key)?
+            self.cursor.lock().await.seek_exact(db_key).await?
         } else {
-            self.cursor.lock().seek(db_key)?
+            self.cursor.lock().await.seek(db_key).await?
         };
 
         if entry.is_none() && !exact {
@@ -225,13 +231,14 @@ where
         self.update_skip_state();
 
         if entry.is_some() && (!self.can_skip_state || nibble != -1) {
-            self.cursor.lock().delete_current()?;
+            self.cursor.lock().await.delete_current().await?;
         }
 
         Ok(())
     }
 
-    fn move_to_next_sibling(
+    #[async_recursion]
+    async fn move_to_next_sibling(
         &mut self,
         allow_root_to_child_nibble_within_subnode: bool,
     ) -> Result<()> {
@@ -243,7 +250,7 @@ where
 
         if sn.nibble >= 15 || (sn.nibble < 0 && !allow_root_to_child_nibble_within_subnode) {
             self.stack.pop();
-            self.move_to_next_sibling(false)?;
+            self.move_to_next_sibling(false).await?;
             return Ok(());
         }
 
@@ -252,8 +259,8 @@ where
         sn.nibble += 1;
 
         if sn.node.is_none() {
-            let key = self.key();
-            self.consume_node(key.as_ref().unwrap(), false)?;
+            let key = self.key().clone();
+            self.consume_node(key.as_ref().unwrap(), false).await?;
             return Ok(());
         }
 
@@ -265,7 +272,7 @@ where
         }
 
         self.stack.pop();
-        self.move_to_next_sibling(false)?;
+        self.move_to_next_sibling(false).await?;
         Ok(())
     }
 
@@ -288,29 +295,29 @@ where
     }
 }
 
-struct DbTrieLoader<'db, 'tx, 'tmp, 'co, 'nc, E>
+struct DbTrieLoader<'db, 'tx, 'tmp, 'co, 'nc, Tx>
 where
-    E: EnvironmentKind,
+    Tx: MutableTransaction<'db>,
     'db: 'tx,
     'tmp: 'co,
     'co: 'nc,
 {
-    txn: &'tx MdbxTransaction<'db, RW, E>,
+    txn: &'tx Tx,
     hb: HashBuilder<'nc>,
     storage_collector: Mutex<&'co mut TableCollector<'tmp, tables::TrieStorage>>,
     rlp: Vec<u8>,
     _marker: PhantomData<&'db ()>,
 }
 
-impl<'db, 'tx, 'tmp, 'co, 'nc, E> DbTrieLoader<'db, 'tx, 'tmp, 'co, 'nc, E>
+impl<'db, 'tx, 'tmp, 'co, 'nc, Tx> DbTrieLoader<'db, 'tx, 'tmp, 'co, 'nc, Tx>
 where
-    E: EnvironmentKind,
+    Tx: MutableTransaction<'db>,
     'db: 'tx,
     'tmp: 'co,
     'co: 'nc,
 {
     fn new(
-        txn: &'tx MdbxTransaction<'db, RW, E>,
+        txn: &'tx Tx,
         account_collector: &'co mut TableCollector<'tmp, tables::TrieAccount>,
         storage_collector: &'co mut TableCollector<'tmp, tables::TrieStorage>,
     ) -> Self {
@@ -335,11 +342,11 @@ where
         instance
     }
 
-    fn calculate_root(&mut self, changed: &mut PrefixSet) -> Result<H256> {
-        let mut state = self.txn.cursor(tables::HashedAccount)?;
-        let mut trie_db_cursor = self.txn.cursor(tables::TrieAccount)?;
+    async fn calculate_root(&mut self, changed: &mut PrefixSet) -> Result<H256> {
+        let mut state = self.txn.cursor(tables::HashedAccount).await?;
+        let mut trie_db_cursor = self.txn.mutable_cursor(tables::TrieAccount).await?;
 
-        let mut trie = Cursor::new(&mut trie_db_cursor, changed, &[])?;
+        let mut trie = Cursor::new(&mut trie_db_cursor, changed, &[]).await?;
         while trie.key().is_some() {
             if trie.can_skip_state() {
                 assert!(trie.hash().is_some());
@@ -355,12 +362,12 @@ where
                 break;
             }
 
-            trie.next()?;
+            trie.next().await?;
 
             let mut seek_key = uncovered.unwrap().to_vec();
             seek_key.resize(32, 0);
 
-            let mut acc = state.seek(H256::from_slice(seek_key.as_slice()))?;
+            let mut acc = state.seek(H256::from_slice(seek_key.as_slice())).await?;
             while acc.is_some() {
                 let unpacked_key = unpack_nibbles(acc.unwrap().0.as_bytes());
                 if trie.key().is_some() && trie.key().unwrap() < unpacked_key {
@@ -369,32 +376,40 @@ where
 
                 let account = acc.unwrap().1;
 
-                let storage_root =
-                    self.calculate_storage_root(acc.unwrap().0.as_bytes(), trie.changed_mut())?;
+                let storage_root = self
+                    .calculate_storage_root(acc.unwrap().0.as_bytes(), trie.changed_mut())
+                    .await?;
 
                 self.hb.add_leaf(
                     unpacked_key,
                     rlp::encode(&account.to_rlp(storage_root)).as_ref(),
                 );
 
-                acc = state.next()?
+                acc = state.next().await?
             }
         }
 
         Ok(self.hb.root_hash())
     }
 
-    fn calculate_storage_root(&self, key_with_inc: &[u8], changed: &mut PrefixSet) -> Result<H256> {
-        let mut state = self.txn.cursor(tables::HashedStorage)?;
-        let mut trie_db_cursor = self.txn.cursor(tables::TrieStorage)?;
+    async fn calculate_storage_root(
+        &self,
+        key_with_inc: &[u8],
+        changed: &mut PrefixSet,
+    ) -> Result<H256> {
+        let mut state = self.txn.cursor_dup_sort(tables::HashedStorage).await?;
+        let mut trie_db_cursor = self.txn.mutable_cursor(tables::TrieStorage).await?;
 
         let mut hb = HashBuilder::new();
         hb.node_collector = Some(Box::new(|unpacked_storage_key: &[u8], node: &Node| {
             let key = [key_with_inc, unpacked_storage_key].concat();
-            self.storage_collector.lock().push(key, marshal_node(node));
+            self.storage_collector
+                .lock()
+                .unwrap()
+                .push(key, marshal_node(node));
         }));
 
-        let mut trie = Cursor::new(&mut trie_db_cursor, changed, key_with_inc)?;
+        let mut trie = Cursor::new(&mut trie_db_cursor, changed, key_with_inc).await?;
         while trie.key().is_some() {
             if trie.can_skip_state() {
                 assert!(trie.hash().is_some());
@@ -410,15 +425,17 @@ where
                 break;
             }
 
-            trie.next()?;
+            trie.next().await?;
 
             let mut seek_key = uncovered.unwrap().to_vec();
             seek_key.resize(32, 0);
 
-            let mut storage = state.seek_both_range(
-                H256::from_slice(key_with_inc),
-                H256::from_slice(seek_key.as_slice()),
-            )?;
+            let mut storage = state
+                .seek_both_range(
+                    H256::from_slice(key_with_inc),
+                    H256::from_slice(seek_key.as_slice()),
+                )
+                .await?;
             while storage.is_some() {
                 let (storage_location, value) = storage.unwrap();
                 let unpacked_loc = unpack_nibbles(storage_location.as_bytes());
@@ -427,7 +444,7 @@ where
                 }
                 let rlp = rlp::encode(&value);
                 hb.add_leaf(unpacked_loc, rlp.as_ref());
-                storage = state.next_dup()?.map(|(_, v)| v);
+                storage = state.next_dup().await?.map(|(_, v)| v);
             }
         }
 
@@ -435,15 +452,15 @@ where
     }
 }
 
-fn do_increment_intermediate_hashes<'db, 'tx, E>(
-    txn: &'tx MdbxTransaction<'db, RW, E>,
+async fn do_increment_intermediate_hashes<'db, 'tx, Tx>(
+    txn: &'tx Tx,
     etl_dir: &TempDir,
     expected_root: Option<H256>,
     changed: &mut PrefixSet,
 ) -> Result<H256>
 where
     'db: 'tx,
-    E: EnvironmentKind,
+    Tx: MutableTransaction<'db>,
 {
     let mut account_collector = TableCollector::new(etl_dir, OPTIMAL_BUFFER_CAPACITY);
     let mut storage_collector = TableCollector::new(etl_dir, OPTIMAL_BUFFER_CAPACITY);
@@ -451,7 +468,7 @@ where
     let root = {
         let mut loader = DbTrieLoader::new(txn, &mut account_collector, &mut storage_collector);
 
-        loader.calculate_root(changed)?
+        loader.calculate_root(changed).await?
     };
 
     if expected_root.is_some() && expected_root.unwrap() != root {
@@ -462,39 +479,35 @@ where
         );
     }
 
-    let mut target = txn.cursor(tables::TrieAccount.erased())?;
-    account_collector.load(&mut target)?;
+    let mut target = txn.mutable_cursor(tables::TrieAccount.erased()).await?;
+    account_collector.load(&mut target).await?;
 
-    let mut target = txn.cursor(tables::TrieStorage.erased())?;
-    storage_collector.load(&mut target)?;
+    let mut target = txn.mutable_cursor(tables::TrieStorage.erased()).await?;
+    storage_collector.load(&mut target).await?;
 
     Ok(root)
 }
 
-fn gather_changes<'db, 'tx, K, E>(
-    txn: &'tx MdbxTransaction<'db, K, E>,
-    from: BlockNumber,
-) -> Result<PrefixSet>
+async fn gather_changes<'db, 'tx, Tx>(txn: &'tx Tx, from: BlockNumber) -> Result<PrefixSet>
 where
     'db: 'tx,
-    K: TransactionKind,
-    E: EnvironmentKind,
+    Tx: MutableTransaction<'db>,
 {
     let starting_key = from + 1;
 
     let mut out = PrefixSet::new();
 
-    let mut account_changes = txn.cursor(tables::AccountChangeSet)?;
-    let mut data = account_changes.seek(starting_key)?;
+    let mut account_changes = txn.cursor_dup_sort(tables::AccountChangeSet).await?;
+    let mut data = account_changes.seek(starting_key).await?;
     while data.is_some() {
         let address = data.unwrap().1.address;
         let hashed_address = keccak256(address);
         out.insert(unpack_nibbles(hashed_address.as_bytes()).as_slice());
-        data = account_changes.next()?;
+        data = account_changes.next().await?;
     }
 
-    let mut storage_changes = txn.cursor(tables::StorageChangeSet)?;
-    let mut data = storage_changes.seek(starting_key)?;
+    let mut storage_changes = txn.cursor_dup_sort(tables::StorageChangeSet).await?;
+    let mut data = storage_changes.seek(starting_key).await?;
     while data.is_some() {
         let address = data.as_ref().unwrap().0.address;
         let location = data.as_ref().unwrap().1.location;
@@ -507,39 +520,39 @@ where
         ]
         .concat();
         out.insert(hashed_key.as_slice());
-        data = storage_changes.next()?;
+        data = storage_changes.next().await?;
     }
 
     Ok(out)
 }
 
-pub fn increment_intermediate_hashes<'db, 'tx, E>(
-    txn: &'tx MdbxTransaction<'db, RW, E>,
+pub async fn increment_intermediate_hashes<'db, 'tx, Tx>(
+    txn: &'tx Tx,
     etl_dir: &TempDir,
     from: BlockNumber,
     expected_root: Option<H256>,
 ) -> Result<H256>
 where
     'db: 'tx,
-    E: EnvironmentKind,
+    Tx: MutableTransaction<'db>,
 {
-    let mut changes = gather_changes(txn, from)?;
-    do_increment_intermediate_hashes(txn, etl_dir, expected_root, &mut changes)
+    let mut changes = gather_changes(txn, from).await?;
+    do_increment_intermediate_hashes(txn, etl_dir, expected_root, &mut changes).await
 }
 
-pub fn regenerate_intermediate_hashes<'db, 'tx, E>(
-    txn: &'tx MdbxTransaction<'db, RW, E>,
+pub async fn regenerate_intermediate_hashes<'db, 'tx, Tx>(
+    txn: &'tx Tx,
     etl_dir: &TempDir,
     expected_root: Option<H256>,
 ) -> Result<H256>
 where
     'db: 'tx,
-    E: EnvironmentKind,
+    Tx: MutableTransaction<'db>,
 {
-    txn.clear_table(tables::TrieAccount)?;
-    txn.clear_table(tables::TrieStorage)?;
+    txn.clear_table(tables::TrieAccount).await?;
+    txn.clear_table(tables::TrieStorage).await?;
     let mut empty = PrefixSet::new();
-    do_increment_intermediate_hashes(txn, etl_dir, expected_root, &mut empty)
+    do_increment_intermediate_hashes(txn, etl_dir, expected_root, &mut empty).await
 }
 
 #[cfg(test)]
@@ -554,63 +567,64 @@ mod tests {
     };
     use hex_literal::hex;
     use maplit::hashmap;
+    use tokio_stream::StreamExt;
 
-    #[test]
-    fn test_intermediate_hashes_cursor_traversal_1() {
+    #[tokio::test]
+    async fn test_intermediate_hashes_cursor_traversal_1() {
         let db = new_mem_database().unwrap();
-        let txn = db.begin_mutable().unwrap();
-        let mut trie = txn.cursor(tables::TrieAccount).unwrap();
+        let txn = db.begin_mutable().await.unwrap();
+        let mut trie = txn.mutable_cursor(tables::TrieAccount).await.unwrap();
 
         let key1 = vec![0x1u8];
         let node1 = Node::new(0b1011, 0b1001, 0, vec![], None);
-        trie.upsert(key1, marshal_node(&node1)).unwrap();
+        trie.upsert(key1, marshal_node(&node1)).await.unwrap();
 
         let key2 = vec![0x1u8, 0x0, 0xB];
         let node2 = Node::new(0b1010, 0, 0, vec![], None);
-        trie.upsert(key2, marshal_node(&node2)).unwrap();
+        trie.upsert(key2, marshal_node(&node2)).await.unwrap();
 
         let key3 = vec![0x1u8, 0x3];
         let node3 = Node::new(0b1110, 0, 0, vec![], None);
-        trie.upsert(key3, marshal_node(&node3)).unwrap();
+        trie.upsert(key3, marshal_node(&node3)).await.unwrap();
 
         let mut changed = PrefixSet::new();
-        let mut cursor = Cursor::new(&mut trie, &mut changed, &[]).unwrap();
+        let mut cursor = Cursor::new(&mut trie, &mut changed, &[]).await.unwrap();
 
         assert!(cursor.key().unwrap().is_empty());
 
-        cursor.next().unwrap();
+        cursor.next().await.unwrap();
         assert_eq!(cursor.key().unwrap(), vec![0x1, 0x0]);
 
-        cursor.next().unwrap();
+        cursor.next().await.unwrap();
         assert_eq!(cursor.key().unwrap(), vec![0x1, 0x0, 0xB, 0x1]);
 
-        cursor.next().unwrap();
+        cursor.next().await.unwrap();
         assert_eq!(cursor.key().unwrap(), vec![0x1, 0x0, 0xB, 0x3]);
 
-        cursor.next().unwrap();
+        cursor.next().await.unwrap();
         assert_eq!(cursor.key().unwrap(), vec![0x1, 0x1]);
 
-        cursor.next().unwrap();
+        cursor.next().await.unwrap();
         assert_eq!(cursor.key().unwrap(), vec![0x1, 0x3]);
 
-        cursor.next().unwrap();
+        cursor.next().await.unwrap();
         assert_eq!(cursor.key().unwrap(), vec![0x1, 0x3, 0x1]);
 
-        cursor.next().unwrap();
+        cursor.next().await.unwrap();
         assert_eq!(cursor.key().unwrap(), vec![0x1, 0x3, 0x2]);
 
-        cursor.next().unwrap();
+        cursor.next().await.unwrap();
         assert_eq!(cursor.key().unwrap(), vec![0x1, 0x3, 0x3]);
 
-        cursor.next().unwrap();
+        cursor.next().await.unwrap();
         assert!(cursor.key().is_none());
     }
 
-    #[test]
-    fn test_intermediate_hashes_cursor_traversal_2() {
+    #[tokio::test]
+    async fn test_intermediate_hashes_cursor_traversal_2() {
         let db = new_mem_database().unwrap();
-        let txn = db.begin_mutable().unwrap();
-        let mut trie = txn.cursor(tables::TrieAccount).unwrap();
+        let txn = db.begin_mutable().await.unwrap();
+        let mut trie = txn.mutable_cursor(tables::TrieAccount).await.unwrap();
 
         let key1 = vec![0x4u8];
         let node1 = Node::new(
@@ -622,7 +636,7 @@ mod tests {
             ))],
             None,
         );
-        trie.upsert(key1, marshal_node(&node1)).unwrap();
+        trie.upsert(key1, marshal_node(&node1)).await.unwrap();
 
         let key2 = vec![0x6u8];
         let node2 = Node::new(
@@ -634,34 +648,34 @@ mod tests {
             ))],
             None,
         );
-        trie.upsert(key2, marshal_node(&node2)).unwrap();
+        trie.upsert(key2, marshal_node(&node2)).await.unwrap();
 
         let mut changed = PrefixSet::new();
-        let mut cursor = Cursor::new(&mut trie, &mut changed, &[]).unwrap();
+        let mut cursor = Cursor::new(&mut trie, &mut changed, &[]).await.unwrap();
 
         assert!(cursor.key().unwrap().is_empty());
 
-        cursor.next().unwrap();
+        cursor.next().await.unwrap();
         assert_eq!(cursor.key().unwrap(), vec![0x4, 0x2]);
 
-        cursor.next().unwrap();
+        cursor.next().await.unwrap();
         assert_eq!(cursor.key().unwrap(), vec![0x4, 0x4]);
 
-        cursor.next().unwrap();
+        cursor.next().await.unwrap();
         assert_eq!(cursor.key().unwrap(), vec![0x6, 0x1]);
 
-        cursor.next().unwrap();
+        cursor.next().await.unwrap();
         assert_eq!(cursor.key().unwrap(), vec![0x6, 0x4]);
 
-        cursor.next().unwrap();
+        cursor.next().await.unwrap();
         assert!(cursor.key().is_none());
     }
 
-    #[test]
-    fn test_intermediate_hashes_cursor_traversal_within_prefix() {
+    #[tokio::test]
+    async fn test_intermediate_hashes_cursor_traversal_within_prefix() {
         let db = new_mem_database().unwrap();
-        let txn = db.begin_mutable().unwrap();
-        let mut trie = txn.cursor(tables::TrieAccount).unwrap();
+        let txn = db.begin_mutable().await.unwrap();
+        let mut trie = txn.mutable_cursor(tables::TrieAccount).await.unwrap();
 
         let prefix_a = vec![0xau8, 0xa, 0x0, 0x2];
         let prefix_b = vec![0xbu8, 0xb, 0x0, 0x5];
@@ -676,7 +690,9 @@ mod tests {
                 "2e1b81393448317fc1834241119c23f9e1763f7a662f8078949accc35b0d3b13"
             ))),
         );
-        trie.upsert(prefix_a, marshal_node(&node_a)).unwrap();
+        trie.upsert(prefix_a.clone(), marshal_node(&node_a))
+            .await
+            .unwrap();
 
         let node_b1 = Node::new(
             0b10100,
@@ -688,6 +704,7 @@ mod tests {
             ))),
         );
         trie.upsert(prefix_b.clone(), marshal_node(&node_b1))
+            .await
             .unwrap();
 
         let node_b2 = Node::new(
@@ -701,7 +718,7 @@ mod tests {
         );
         let mut key_b2 = prefix_b.clone();
         key_b2.push(0x2);
-        trie.upsert(key_b2, marshal_node(&node_b2)).unwrap();
+        trie.upsert(key_b2, marshal_node(&node_b2)).await.unwrap();
 
         let node_c = Node::new(
             0b11110,
@@ -713,42 +730,47 @@ mod tests {
             ))),
         );
         trie.upsert(prefix_c.clone(), marshal_node(&node_c))
+            .await
             .unwrap();
 
         let mut changed = PrefixSet::new();
-        let mut cursor = Cursor::new(&mut trie, &mut changed, prefix_b.as_slice()).unwrap();
+        let mut cursor = Cursor::new(&mut trie, &mut changed, prefix_b.as_slice())
+            .await
+            .unwrap();
 
         assert!(cursor.key().unwrap().is_empty());
         assert!(cursor.can_skip_state());
 
-        cursor.next().unwrap();
+        cursor.next().await.unwrap();
         assert!(cursor.key().is_none());
 
         let mut changed = PrefixSet::new();
         changed.insert([prefix_b.as_slice(), &[0xdu8, 0x5]].concat().as_slice());
         changed.insert([prefix_c.as_slice(), &[0xbu8, 0x8]].concat().as_slice());
-        let mut cursor = Cursor::new(&mut trie, &mut changed, prefix_b.as_slice()).unwrap();
+        let mut cursor = Cursor::new(&mut trie, &mut changed, prefix_b.as_slice())
+            .await
+            .unwrap();
 
         assert!(cursor.key().unwrap().is_empty());
         assert!(!cursor.can_skip_state());
 
-        cursor.next().unwrap();
+        cursor.next().await.unwrap();
         assert_eq!(cursor.key().unwrap(), [0x2]);
-        cursor.next().unwrap();
+        cursor.next().await.unwrap();
         assert_eq!(cursor.key().unwrap(), [0x2, 0x1]);
-        cursor.next().unwrap();
+        cursor.next().await.unwrap();
         assert_eq!(cursor.key().unwrap(), [0x4]);
 
-        cursor.next().unwrap();
+        cursor.next().await.unwrap();
         assert!(cursor.key().is_none());
     }
 
-    #[test]
-    fn cursor_traversal_within_prefix() {
+    #[tokio::test]
+    async fn cursor_traversal_within_prefix() {
         let db = new_mem_database().unwrap();
-        let txn = db.begin_mutable().unwrap();
+        let txn = db.begin_mutable().await.unwrap();
 
-        let mut trie = txn.cursor(tables::TrieStorage).unwrap();
+        let mut trie = txn.mutable_cursor(tables::TrieStorage).await.unwrap();
 
         let prefix_a: [u8; 4] = [0xa, 0xa, 0x0, 0x2];
         let prefix_b: [u8; 4] = [0xb, 0xb, 0x0, 0x5];
@@ -762,6 +784,7 @@ mod tests {
             Some(hex!("2e1b81393448317fc1834241119c23f9e1763f7a662f8078949accc35b0d3b13").into()),
         );
         trie.upsert(prefix_a.to_vec(), marshal_node(&node_a))
+            .await
             .unwrap();
 
         let node_b1 = Node::new(
@@ -779,11 +802,13 @@ mod tests {
             None,
         );
         trie.upsert(prefix_b.to_vec(), marshal_node(&node_b1))
+            .await
             .unwrap();
         trie.upsert(
             [&prefix_b as &[u8], &([0x2] as [u8; 1]) as &[u8]].concat(),
             marshal_node(&node_b2),
         )
+        .await
         .unwrap();
 
         let node_c = Node::new(
@@ -794,41 +819,46 @@ mod tests {
             Some(hex!("0f12bed8e3cc4cce692d234e69a4d79c0e74ab05ecb808dad588212eab788c31").into()),
         );
         trie.upsert(prefix_c.to_vec(), marshal_node(&node_c))
+            .await
             .unwrap();
 
         // No changes
         let mut changed = PrefixSet::new();
-        let mut cursor = Cursor::new(&mut trie, &mut changed, &prefix_b).unwrap();
+        let mut cursor = Cursor::new(&mut trie, &mut changed, &prefix_b)
+            .await
+            .unwrap();
 
         assert_eq!(cursor.key(), Some(vec![])); // root
         assert!(cursor.can_skip_state()); // due to root_hash
-        cursor.next().unwrap(); // skips to end of trie
+        cursor.next().await.unwrap(); // skips to end of trie
         assert_eq!(cursor.key(), None);
 
         // Some changes
         let mut changed = PrefixSet::new();
         changed.insert(&[&prefix_b as &[u8], &([0xD, 0x5] as [u8; 2]) as &[u8]].concat());
         changed.insert(&[&prefix_c as &[u8], &([0xB, 0x8] as [u8; 2]) as &[u8]].concat());
-        let mut cursor = Cursor::new(&mut trie, &mut changed, &prefix_b).unwrap();
+        let mut cursor = Cursor::new(&mut trie, &mut changed, &prefix_b)
+            .await
+            .unwrap();
 
         assert_eq!(cursor.key(), Some(vec![])); // root
         assert!(!cursor.can_skip_state());
-        cursor.next().unwrap();
+        cursor.next().await.unwrap();
         assert_eq!(cursor.key(), Some(vec![0x2]));
-        cursor.next().unwrap();
+        cursor.next().await.unwrap();
         assert_eq!(cursor.key(), Some(vec![0x2, 0x1]));
-        cursor.next().unwrap();
+        cursor.next().await.unwrap();
         assert_eq!(cursor.key(), Some(vec![0x4]));
 
-        cursor.next().unwrap();
+        cursor.next().await.unwrap();
         assert_eq!(cursor.key(), None); // end of trie
     }
 
-    fn setup_storage<E>(tx: &MdbxTransaction<'_, RW, E>, storage_key: H256) -> H256
-    where
-        E: EnvironmentKind,
-    {
-        let mut hashed_storage = tx.cursor(tables::HashedStorage).unwrap();
+    async fn setup_storage<'db, Tx: MutableTransaction<'db>>(tx: &Tx, storage_key: H256) -> H256 {
+        let mut hashed_storage = tx
+            .mutable_cursor_dupsort(tables::HashedStorage)
+            .await
+            .unwrap();
 
         let mut hb = HashBuilder::new();
 
@@ -853,7 +883,9 @@ mod tests {
             let loc = H256(loc);
             let val = val.as_u256();
 
-            upsert_hashed_storage_value(&mut hashed_storage, storage_key, loc, val).unwrap();
+            upsert_hashed_storage_value(&mut hashed_storage, storage_key, loc, val)
+                .await
+                .unwrap();
 
             hb.add_leaf(unpack_nibbles(loc.as_bytes()), &rlp::encode(&val));
         }
@@ -861,29 +893,31 @@ mod tests {
         hb.root_hash()
     }
 
-    fn read_all_nodes<K, T>(cursor: MdbxCursor<'_, K, T>) -> HashMap<Vec<u8>, Node>
-    where
-        K: TransactionKind,
+    async fn read_all_nodes<
+        'tx,
+        C: crate::kv::traits::Cursor<'tx, T>,
         T: Table<Key = Vec<u8>, Value = Vec<u8>>,
-    {
-        cursor
-            .walk(None)
+    >(
+        cursor: &mut C,
+    ) -> HashMap<Vec<u8>, Node> {
+        walk(cursor, None)
             .map(|res| {
                 let (k, v) = res.unwrap();
                 (k, unmarshal_node(&v).unwrap())
             })
             .collect::<Vec<_>>()
+            .await
             .into_iter()
             .collect()
     }
 
-    #[test]
-    fn account_and_storage_trie() {
+    #[tokio::test]
+    async fn account_and_storage_trie() {
         let temp_dir = TempDir::new().unwrap();
         let db = new_mem_database().unwrap();
-        let txn = db.begin_mutable().unwrap();
+        let txn = db.begin_mutable().await.unwrap();
 
-        let mut hashed_accounts = txn.cursor(tables::HashedAccount).unwrap();
+        let mut hashed_accounts = txn.mutable_cursor(tables::HashedAccount).await.unwrap();
         let mut hb = HashBuilder::new();
 
         let key1 = hex!("B000000000000000000000000000000000000000000000000000000000000000").into();
@@ -892,7 +926,7 @@ mod tests {
             balance: 3.as_u256() * ETHER,
             ..Default::default()
         };
-        hashed_accounts.upsert(key1, a1).unwrap();
+        hashed_accounts.upsert(key1, a1).await.unwrap();
         hb.add_leaf(
             unpack_nibbles(&key1[..]),
             &rlp::encode(&a1.to_rlp(EMPTY_ROOT)),
@@ -908,7 +942,7 @@ mod tests {
             balance: 1.as_u256() * ETHER,
             ..Default::default()
         };
-        hashed_accounts.upsert(key2, a2).unwrap();
+        hashed_accounts.upsert(key2, a2).await.unwrap();
         hb.add_leaf(
             unpack_nibbles(&key2[..]),
             &rlp::encode(&a2.to_rlp(EMPTY_ROOT)),
@@ -925,9 +959,9 @@ mod tests {
             balance: 2.as_u256() * ETHER,
             code_hash,
         };
-        hashed_accounts.upsert(key3, a3).unwrap();
+        hashed_accounts.upsert(key3, a3).await.unwrap();
 
-        let storage_root = setup_storage(&txn, key3);
+        let storage_root = setup_storage(&txn, key3).await;
 
         hb.add_leaf(
             unpack_nibbles(&key3[..]),
@@ -940,7 +974,7 @@ mod tests {
             balance: 4.as_u256() * ETHER,
             ..Default::default()
         };
-        hashed_accounts.upsert(key4a, a4a).unwrap();
+        hashed_accounts.upsert(key4a, a4a).await.unwrap();
         hb.add_leaf(
             unpack_nibbles(&key4a[..]),
             &rlp::encode(&a4a.to_rlp(EMPTY_ROOT)),
@@ -952,7 +986,7 @@ mod tests {
             balance: 8.as_u256() * ETHER,
             ..Default::default()
         };
-        hashed_accounts.upsert(key5, a5).unwrap();
+        hashed_accounts.upsert(key5, a5).await.unwrap();
         hb.add_leaf(
             unpack_nibbles(&key5[..]),
             &rlp::encode(&a5.to_rlp(EMPTY_ROOT)),
@@ -964,7 +998,7 @@ mod tests {
             balance: 1.as_u256() * ETHER,
             ..Default::default()
         };
-        hashed_accounts.upsert(key6, a6).unwrap();
+        hashed_accounts.upsert(key6, a6).await.unwrap();
         hb.add_leaf(
             unpack_nibbles(&key6[..]),
             &rlp::encode(&a6.to_rlp(EMPTY_ROOT)),
@@ -974,13 +1008,17 @@ mod tests {
         // Populate account & storage trie DB tables
         // ----------------------------------------------------------------
 
-        regenerate_intermediate_hashes(&txn, &temp_dir, Some(hb.root_hash())).unwrap();
+        regenerate_intermediate_hashes(&txn, &temp_dir, Some(hb.root_hash()))
+            .await
+            .unwrap();
 
         // ----------------------------------------------------------------
         // Check account trie
         // ----------------------------------------------------------------
 
-        let node_map = read_all_nodes(txn.cursor(tables::TrieAccount).unwrap());
+        let mut account_trie = txn.cursor(tables::TrieAccount).await.unwrap();
+
+        let node_map = read_all_nodes(&mut account_trie).await;
         assert_eq!(node_map.len(), 2);
 
         let node1a = &node_map[&vec![0xB]];
@@ -1005,7 +1043,9 @@ mod tests {
         // Check storage trie
         // ----------------------------------------------------------------
 
-        let node_map = read_all_nodes(txn.cursor(tables::TrieStorage).unwrap());
+        let mut storage_trie = txn.cursor(tables::TrieStorage).await.unwrap();
+
+        let node_map = read_all_nodes(&mut storage_trie).await;
         assert_eq!(node_map.len(), 1);
 
         let node3 = &node_map[&key3.0.to_vec()];
@@ -1035,9 +1075,10 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
 
-        let mut account_change_table = txn.cursor(tables::AccountChangeSet).unwrap();
+        let mut account_change_table = txn.mutable_cursor(tables::AccountChangeSet).await.unwrap();
         account_change_table
             .upsert(
                 BlockNumber(1),
@@ -1046,11 +1087,14 @@ mod tests {
                     account: None,
                 },
             )
+            .await
             .unwrap();
 
-        increment_intermediate_hashes(&txn, &temp_dir, BlockNumber(0), None).unwrap();
+        increment_intermediate_hashes(&txn, &temp_dir, BlockNumber(0), None)
+            .await
+            .unwrap();
 
-        let node_map = read_all_nodes(txn.cursor(tables::TrieAccount).unwrap());
+        let node_map = read_all_nodes(&mut account_trie).await;
         assert_eq!(node_map.len(), 2);
 
         let node1b = &node_map[&vec![0xB]];
@@ -1069,17 +1113,20 @@ mod tests {
 
         drop(hashed_accounts);
         drop(account_change_table);
-        txn.commit().unwrap();
+        drop(account_trie);
+        drop(storage_trie);
+        txn.commit().await.unwrap();
 
         // Delete an account
         {
-            let txn = db.begin_mutable().unwrap();
-            let mut hashed_accounts = txn.cursor(tables::HashedAccount).unwrap();
-            let account_trie = txn.cursor(tables::TrieAccount).unwrap();
-            let mut account_change_table = txn.cursor(tables::AccountChangeSet).unwrap();
+            let txn = db.begin_mutable().await.unwrap();
+            let mut hashed_accounts = txn.mutable_cursor(tables::HashedAccount).await.unwrap();
+            let mut account_trie = txn.cursor(tables::TrieAccount).await.unwrap();
+            let mut account_change_table =
+                txn.mutable_cursor(tables::AccountChangeSet).await.unwrap();
             {
-                let account = hashed_accounts.seek_exact(key2).unwrap().unwrap().1;
-                hashed_accounts.delete_current().unwrap();
+                let account = hashed_accounts.seek_exact(key2).await.unwrap().unwrap().1;
+                hashed_accounts.delete_current().await.unwrap();
                 account_change_table
                     .upsert(
                         BlockNumber(2),
@@ -1088,12 +1135,15 @@ mod tests {
                             account: Some(account),
                         },
                     )
+                    .await
                     .unwrap();
             }
 
-            increment_intermediate_hashes(&txn, &temp_dir, BlockNumber(1), None).unwrap();
+            increment_intermediate_hashes(&txn, &temp_dir, BlockNumber(1), None)
+                .await
+                .unwrap();
 
-            let node_map = read_all_nodes(account_trie);
+            let node_map = read_all_nodes(&mut account_trie).await;
             assert_eq!(node_map.len(), 1);
 
             let node1c = &node_map[&vec![0xB]];
@@ -1111,13 +1161,14 @@ mod tests {
 
         // Delete several accounts
         {
-            let txn = db.begin_mutable().unwrap();
-            let mut hashed_accounts = txn.cursor(tables::HashedAccount).unwrap();
-            let account_trie = txn.cursor(tables::TrieAccount).unwrap();
-            let mut account_change_table = txn.cursor(tables::AccountChangeSet).unwrap();
+            let txn = db.begin_mutable().await.unwrap();
+            let mut hashed_accounts = txn.mutable_cursor(tables::HashedAccount).await.unwrap();
+            let mut account_trie = txn.cursor(tables::TrieAccount).await.unwrap();
+            let mut account_change_table =
+                txn.mutable_cursor(tables::AccountChangeSet).await.unwrap();
             for (key, address) in [(key2, address2), (key3, address3)] {
-                let account = hashed_accounts.seek_exact(key).unwrap().unwrap().1;
-                hashed_accounts.delete_current().unwrap();
+                let account = hashed_accounts.seek_exact(key).await.unwrap().unwrap().1;
+                hashed_accounts.delete_current().await.unwrap();
                 account_change_table
                     .upsert(
                         BlockNumber(2),
@@ -1126,13 +1177,16 @@ mod tests {
                             account: Some(account),
                         },
                     )
+                    .await
                     .unwrap();
             }
 
-            increment_intermediate_hashes(&txn, &temp_dir, BlockNumber(1), None).unwrap();
+            increment_intermediate_hashes(&txn, &temp_dir, BlockNumber(1), None)
+                .await
+                .unwrap();
 
             assert_eq!(
-                read_all_nodes(account_trie),
+                read_all_nodes(&mut account_trie).await,
                 hashmap! {
                     vec![0xB] => Node::new(0b1011, 0b0000, 0b1010, vec![node1b.hashes()[1], node1b.hashes()[2]], None)
                 }
@@ -1140,11 +1194,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn account_trie_around_extension_node() {
+    #[tokio::test]
+    async fn account_trie_around_extension_node() {
         let temp_dir = TempDir::new().unwrap();
         let db = new_mem_database().unwrap();
-        let txn = db.begin_mutable().unwrap();
+        let txn = db.begin_mutable().await.unwrap();
 
         let a = Account {
             nonce: 0,
@@ -1152,7 +1206,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut hashed_accounts = txn.cursor(tables::HashedAccount).unwrap();
+        let mut hashed_accounts = txn.mutable_cursor(tables::HashedAccount).await.unwrap();
         let mut hb = HashBuilder::new();
 
         for key in [
@@ -1163,7 +1217,7 @@ mod tests {
             hex!("30af8f0000000000000000000000000000000000000000000000000000000000"),
             hex!("3100000000000000000000000000000000000000000000000000000000000000"),
         ] {
-            hashed_accounts.upsert(H256(key), a).unwrap();
+            hashed_accounts.upsert(H256(key), a).await.unwrap();
             hb.add_leaf(
                 unpack_nibbles(&key[..]),
                 &rlp::encode(&a.to_rlp(EMPTY_ROOT)),
@@ -1172,11 +1226,15 @@ mod tests {
 
         let expected_root = hb.root_hash();
         assert_eq!(
-            regenerate_intermediate_hashes(&txn, &temp_dir, Some(expected_root)).unwrap(),
+            regenerate_intermediate_hashes(&txn, &temp_dir, Some(expected_root))
+                .await
+                .unwrap(),
             expected_root
         );
 
-        let node_map = read_all_nodes(txn.cursor(tables::TrieAccount).unwrap());
+        let mut account_trie = txn.mutable_cursor(tables::TrieAccount).await.unwrap();
+
+        let node_map = read_all_nodes(&mut account_trie).await;
         assert_eq!(node_map.len(), 2);
 
         assert_eq!(
@@ -1200,8 +1258,8 @@ mod tests {
         address
     }
 
-    #[test]
-    fn incremental_vs_regeneration() {
+    #[tokio::test]
+    async fn incremental_vs_regeneration() {
         let temp_dir = TempDir::new().unwrap();
         let db = new_mem_database().unwrap();
 
@@ -1222,18 +1280,22 @@ mod tests {
             // Take A: create some accounts at genesis and then apply some changes at Block 1
             // ------------------------------------------------------------------------------
 
-            let txn = db.begin_mutable().unwrap();
-            let mut hashed_accounts = txn.cursor(tables::HashedAccount).unwrap();
-            let mut account_change_table = txn.cursor(tables::AccountChangeSet).unwrap();
+            let txn = db.begin_mutable().await.unwrap();
+            let mut hashed_accounts = txn.mutable_cursor(tables::HashedAccount).await.unwrap();
+            let mut account_change_table =
+                txn.mutable_cursor(tables::AccountChangeSet).await.unwrap();
+            let mut account_trie = txn.mutable_cursor(tables::TrieAccount).await.unwrap();
 
             // Start with 3n accounts at genesis, each holding 1 ETH
             for i in 0..3 * N {
                 let address = int_to_address(i);
                 let hash = keccak256(address);
-                hashed_accounts.upsert(hash, one_eth).unwrap();
+                hashed_accounts.upsert(hash, one_eth).await.unwrap();
             }
 
-            regenerate_intermediate_hashes(&txn, &temp_dir, None).unwrap();
+            regenerate_intermediate_hashes(&txn, &temp_dir, None)
+                .await
+                .unwrap();
 
             let block_key = BlockNumber(1);
 
@@ -1241,7 +1303,7 @@ mod tests {
             for i in 0..N {
                 let address = int_to_address(i);
                 let hash = keccak256(address);
-                hashed_accounts.upsert(hash, two_eth).unwrap();
+                hashed_accounts.upsert(hash, two_eth).await.unwrap();
                 account_change_table
                     .upsert(
                         block_key,
@@ -1250,6 +1312,7 @@ mod tests {
                             account: Some(one_eth),
                         },
                     )
+                    .await
                     .unwrap();
             }
 
@@ -1257,8 +1320,8 @@ mod tests {
             for i in N..2 * N {
                 let address = int_to_address(i);
                 let hash = keccak256(address);
-                let account = hashed_accounts.seek_exact(hash).unwrap().unwrap().1;
-                hashed_accounts.delete_current().unwrap();
+                let account = hashed_accounts.seek_exact(hash).await.unwrap().unwrap().1;
+                hashed_accounts.delete_current().await.unwrap();
                 account_change_table
                     .upsert(
                         block_key,
@@ -1267,6 +1330,7 @@ mod tests {
                             account: Some(account),
                         },
                     )
+                    .await
                     .unwrap();
             }
 
@@ -1276,7 +1340,7 @@ mod tests {
             for i in 3 * N..4 * N {
                 let address = int_to_address(i);
                 let hash = keccak256(address);
-                hashed_accounts.upsert(hash, one_eth).unwrap();
+                hashed_accounts.upsert(hash, one_eth).await.unwrap();
                 account_change_table
                     .upsert(
                         block_key,
@@ -1285,13 +1349,16 @@ mod tests {
                             account: None,
                         },
                     )
+                    .await
                     .unwrap();
             }
 
             let incremental_root =
-                increment_intermediate_hashes(&txn, &temp_dir, BlockNumber(0), None).unwrap();
+                increment_intermediate_hashes(&txn, &temp_dir, BlockNumber(0), None)
+                    .await
+                    .unwrap();
 
-            let incremental_nodes = read_all_nodes(txn.cursor(tables::TrieAccount).unwrap());
+            let incremental_nodes = read_all_nodes(&mut account_trie).await;
 
             (incremental_root, incremental_nodes)
         };
@@ -1302,14 +1369,15 @@ mod tests {
             // without increment_intermediate_hashes
             // ------------------------------------------------------------------------------
 
-            let txn = db.begin_mutable().unwrap();
-            let mut hashed_accounts = txn.cursor(tables::HashedAccount).unwrap();
+            let txn = db.begin_mutable().await.unwrap();
+            let mut hashed_accounts = txn.mutable_cursor(tables::HashedAccount).await.unwrap();
+            let mut account_trie = txn.mutable_cursor(tables::TrieAccount).await.unwrap();
 
             // Accounts [0,N) now hold 2 ETH
             for i in 0..N {
                 let address = int_to_address(i);
                 let hash = keccak256(address);
-                hashed_accounts.upsert(hash, two_eth).unwrap();
+                hashed_accounts.upsert(hash, two_eth).await.unwrap();
             }
 
             // Accounts [N,2N) are deleted
@@ -1318,12 +1386,14 @@ mod tests {
             for i in 2 * N..4 * N {
                 let address = int_to_address(i);
                 let hash = keccak256(address);
-                hashed_accounts.upsert(hash, one_eth).unwrap();
+                hashed_accounts.upsert(hash, one_eth).await.unwrap();
             }
 
-            let fused_root = regenerate_intermediate_hashes(&txn, &temp_dir, None).unwrap();
+            let fused_root = regenerate_intermediate_hashes(&txn, &temp_dir, None)
+                .await
+                .unwrap();
 
-            let fused_nodes = read_all_nodes(txn.cursor(tables::TrieAccount).unwrap());
+            let fused_nodes = read_all_nodes(&mut account_trie).await;
 
             (fused_root, fused_nodes)
         };
@@ -1335,8 +1405,8 @@ mod tests {
         assert_eq!(fused_nodes, incremental_nodes);
     }
 
-    #[test]
-    fn incremental_vs_regeneration_for_storage() {
+    #[tokio::test]
+    async fn incremental_vs_regeneration_for_storage() {
         let temp_dir = TempDir::new().unwrap();
         let db = new_mem_database().unwrap();
 
@@ -1359,9 +1429,13 @@ mod tests {
         let address1 = H160(hex!("1000000000000000000000000000000000000000"));
         let address2 = H160(hex!("2000000000000000000000000000000000000000"));
 
-        fn upsert_storage_for_two_test_accounts<'tx>(
-            hashed_storage: &mut MdbxCursor<'tx, RW, tables::HashedStorage>,
-            storage_change_table: &mut MdbxCursor<'tx, RW, tables::StorageChangeSet>,
+        async fn upsert_storage_for_two_test_accounts<
+            'tx,
+            HS: MutableCursorDupSort<'tx, tables::HashedStorage>,
+            SCT: MutableCursorDupSort<'tx, tables::StorageChangeSet>,
+        >(
+            hashed_storage: &mut HS,
+            storage_change_table: &mut SCT,
             address1: Address,
             address2: Address,
             i: u128,
@@ -1377,6 +1451,7 @@ mod tests {
                 keccak256(plain_loc1),
                 value,
             )
+            .await
             .unwrap();
             upsert_hashed_storage_value(
                 hashed_storage,
@@ -1384,6 +1459,7 @@ mod tests {
                 keccak256(plain_loc2),
                 value,
             )
+            .await
             .unwrap();
             if register_change {
                 storage_change_table
@@ -1397,6 +1473,7 @@ mod tests {
                             value: U256::ZERO,
                         },
                     )
+                    .await
                     .unwrap();
                 storage_change_table
                     .upsert(
@@ -1409,6 +1486,7 @@ mod tests {
                             value: U256::ZERO,
                         },
                     )
+                    .await
                     .unwrap();
             }
         }
@@ -1417,18 +1495,20 @@ mod tests {
             "71f602b294119bf452f1923814f5c6de768221254d3056b1bd63e72dc3142a29"
         ));
         {
-            let txn = db.begin_mutable().unwrap();
-            let mut hashed_accounts = txn.cursor(tables::HashedAccount).unwrap();
+            let txn = db.begin_mutable().await.unwrap();
+            let mut hashed_accounts = txn.mutable_cursor(tables::HashedAccount).await.unwrap();
 
             hashed_accounts
                 .upsert(keccak256(address1), account1)
+                .await
                 .unwrap();
             hashed_accounts
                 .upsert(keccak256(address2), account2)
+                .await
                 .unwrap();
 
             drop(hashed_accounts);
-            txn.commit().unwrap();
+            txn.commit().await.unwrap();
         }
 
         let (incremental_root, incremental_nodes) = {
@@ -1436,10 +1516,17 @@ mod tests {
             // Take A: create some storage at genesis and then apply some changes at Block 1
             // ------------------------------------------------------------------------------
 
-            let txn = db.begin_mutable().unwrap();
+            let txn = db.begin_mutable().await.unwrap();
 
-            let mut hashed_storage = txn.cursor(tables::HashedStorage).unwrap();
-            let mut storage_change_table = txn.cursor(tables::StorageChangeSet).unwrap();
+            let mut hashed_storage = txn
+                .mutable_cursor_dupsort(tables::HashedStorage)
+                .await
+                .unwrap();
+            let mut storage_change_table = txn
+                .mutable_cursor_dupsort(tables::StorageChangeSet)
+                .await
+                .unwrap();
+            let mut storage_trie = txn.mutable_cursor(tables::TrieStorage).await.unwrap();
 
             // Start with 3n storage slots per account at genesis, each with the same value
             for i in 0..3 * N {
@@ -1451,10 +1538,13 @@ mod tests {
                     i,
                     value_x,
                     false,
-                );
+                )
+                .await;
             }
 
-            regenerate_intermediate_hashes(&txn, &temp_dir, None).unwrap();
+            regenerate_intermediate_hashes(&txn, &temp_dir, None)
+                .await
+                .unwrap();
 
             // Change the value of the first third of the storage
             for i in 0..N {
@@ -1466,7 +1556,8 @@ mod tests {
                     i,
                     value_y,
                     true,
-                );
+                )
+                .await;
             }
 
             // Delete the second third of the storage
@@ -1479,7 +1570,8 @@ mod tests {
                     i,
                     U256::ZERO,
                     true,
-                );
+                )
+                .await;
             }
 
             // Don't touch the last third of genesis storage
@@ -1494,13 +1586,16 @@ mod tests {
                     i,
                     value_x,
                     true,
-                );
+                )
+                .await;
             }
 
             let incremental_root =
-                increment_intermediate_hashes(&txn, &temp_dir, BlockNumber(0), None).unwrap();
+                increment_intermediate_hashes(&txn, &temp_dir, BlockNumber(0), None)
+                    .await
+                    .unwrap();
 
-            let incremental_nodes = read_all_nodes(txn.cursor(tables::TrieStorage).unwrap());
+            let incremental_nodes = read_all_nodes(&mut storage_trie).await;
 
             (incremental_root, incremental_nodes)
         };
@@ -1511,9 +1606,16 @@ mod tests {
             // without increment_intermediate_hashes
             // ------------------------------------------------------------------------------
 
-            let txn = db.begin_mutable().unwrap();
-            let mut hashed_storage = txn.cursor(tables::HashedStorage).unwrap();
-            let mut storage_change_table = txn.cursor(tables::StorageChangeSet).unwrap();
+            let txn = db.begin_mutable().await.unwrap();
+            let mut hashed_storage = txn
+                .mutable_cursor_dupsort(tables::HashedStorage)
+                .await
+                .unwrap();
+            let mut storage_change_table = txn
+                .mutable_cursor_dupsort(tables::StorageChangeSet)
+                .await
+                .unwrap();
+            let mut storage_trie = txn.mutable_cursor(tables::TrieStorage).await.unwrap();
 
             // The first third of the storage now has value_y
             for i in 0..N {
@@ -1525,7 +1627,8 @@ mod tests {
                     i,
                     value_y,
                     false,
-                );
+                )
+                .await;
             }
 
             // The second third of the storage is deleted
@@ -1540,12 +1643,15 @@ mod tests {
                     i,
                     value_x,
                     false,
-                );
+                )
+                .await;
             }
 
-            let fused_root = regenerate_intermediate_hashes(&txn, &temp_dir, None).unwrap();
+            let fused_root = regenerate_intermediate_hashes(&txn, &temp_dir, None)
+                .await
+                .unwrap();
 
-            let fused_nodes = read_all_nodes(txn.cursor(tables::TrieStorage).unwrap());
+            let fused_nodes = read_all_nodes(&mut storage_trie).await;
 
             (fused_root, fused_nodes)
         };
@@ -1557,11 +1663,11 @@ mod tests {
         assert_eq!(fused_nodes, incremental_nodes);
     }
 
-    #[test]
-    fn storage_deletion() {
+    #[tokio::test]
+    async fn storage_deletion() {
         let temp_dir = TempDir::new().unwrap();
         let db = new_mem_database().unwrap();
-        let txn = db.begin_mutable().unwrap();
+        let txn = db.begin_mutable().await.unwrap();
 
         let address = hex!("1000000000000000000000000000000000000000").into();
         let hashed_address = keccak256(address);
@@ -1573,10 +1679,17 @@ mod tests {
                 .into(),
         };
 
-        let mut hashed_accounts = txn.cursor(tables::HashedAccount).unwrap();
-        let mut hashed_storage = txn.cursor(tables::HashedStorage).unwrap();
+        let mut hashed_accounts = txn.mutable_cursor(tables::HashedAccount).await.unwrap();
+        let mut hashed_storage = txn
+            .mutable_cursor_dupsort(tables::HashedStorage)
+            .await
+            .unwrap();
+        let mut storage_trie = txn.mutable_cursor(tables::TrieStorage).await.unwrap();
 
-        hashed_accounts.upsert(hashed_address, account).unwrap();
+        hashed_accounts
+            .upsert(hashed_address, account)
+            .await
+            .unwrap();
 
         let plain_location1 =
             hex!("1000000000000000000000000000000000000000000000000000000000000000").into();
@@ -1599,6 +1712,7 @@ mod tests {
             hashed_location1,
             value1,
         )
+        .await
         .unwrap();
         upsert_hashed_storage_value(
             &mut hashed_storage,
@@ -1606,6 +1720,7 @@ mod tests {
             hashed_location2,
             value2,
         )
+        .await
         .unwrap();
         upsert_hashed_storage_value(
             &mut hashed_storage,
@@ -1613,31 +1728,45 @@ mod tests {
             hashed_location3,
             value3,
         )
+        .await
         .unwrap();
 
-        regenerate_intermediate_hashes(&txn, &temp_dir, None).unwrap();
+        regenerate_intermediate_hashes(&txn, &temp_dir, None)
+            .await
+            .unwrap();
 
         // There should be one root node in storage trie
-        let nodes_a = read_all_nodes(txn.cursor(tables::TrieStorage).unwrap());
+        let nodes_a = read_all_nodes(&mut storage_trie).await;
         assert_eq!(nodes_a.len(), 1);
 
         drop(hashed_accounts);
         drop(hashed_storage);
-        txn.commit().unwrap();
+        drop(storage_trie);
+        txn.commit().await.unwrap();
 
         {
             // Increment the trie without any changes
-            let txn = db.begin_mutable().unwrap();
-            increment_intermediate_hashes(&txn, &temp_dir, BlockNumber(0), None).unwrap();
-            let nodes_b = read_all_nodes(txn.cursor(tables::TrieStorage).unwrap());
+            let txn = db.begin_mutable().await.unwrap();
+            let mut storage_trie = txn.mutable_cursor(tables::TrieStorage).await.unwrap();
+            increment_intermediate_hashes(&txn, &temp_dir, BlockNumber(0), None)
+                .await
+                .unwrap();
+            let nodes_b = read_all_nodes(&mut storage_trie).await;
             assert_eq!(nodes_b, nodes_a);
         }
 
         {
             // Delete storage and increment the trie
-            let txn = db.begin_mutable().unwrap();
-            let mut hashed_storage = txn.cursor(tables::HashedStorage).unwrap();
-            let mut storage_change_table = txn.cursor(tables::StorageChangeSet).unwrap();
+            let txn = db.begin_mutable().await.unwrap();
+            let mut hashed_storage = txn
+                .mutable_cursor_dupsort(tables::HashedStorage)
+                .await
+                .unwrap();
+            let mut storage_change_table = txn
+                .mutable_cursor_dupsort(tables::StorageChangeSet)
+                .await
+                .unwrap();
+            let mut storage_trie = txn.mutable_cursor(tables::TrieStorage).await.unwrap();
 
             upsert_hashed_storage_value(
                 &mut hashed_storage,
@@ -1645,6 +1774,7 @@ mod tests {
                 hashed_location1,
                 U256::ZERO,
             )
+            .await
             .unwrap();
             upsert_hashed_storage_value(
                 &mut hashed_storage,
@@ -1652,6 +1782,7 @@ mod tests {
                 hashed_location2,
                 U256::ZERO,
             )
+            .await
             .unwrap();
             upsert_hashed_storage_value(
                 &mut hashed_storage,
@@ -1659,6 +1790,7 @@ mod tests {
                 hashed_location3,
                 U256::ZERO,
             )
+            .await
             .unwrap();
 
             let storage_change_key = tables::StorageChangeKey {
@@ -1674,6 +1806,7 @@ mod tests {
                         value: U256::ZERO,
                     },
                 )
+                .await
                 .unwrap();
             storage_change_table
                 .upsert(
@@ -1683,6 +1816,7 @@ mod tests {
                         value: U256::ZERO,
                     },
                 )
+                .await
                 .unwrap();
             storage_change_table
                 .upsert(
@@ -1692,10 +1826,13 @@ mod tests {
                         value: U256::ZERO,
                     },
                 )
+                .await
                 .unwrap();
 
-            increment_intermediate_hashes(&txn, &temp_dir, BlockNumber(0), None).unwrap();
-            let nodes_b = read_all_nodes(txn.cursor(tables::TrieStorage).unwrap());
+            increment_intermediate_hashes(&txn, &temp_dir, BlockNumber(0), None)
+                .await
+                .unwrap();
+            let nodes_b = read_all_nodes(&mut storage_trie).await;
             assert!(nodes_b.is_empty());
         }
     }
@@ -1721,16 +1858,15 @@ mod property_test {
         crypto::{keccak256, trie_root},
         h256_to_u256,
         kv::{
-            mdbx::{MdbxCursor, MdbxTransaction},
             new_mem_database, tables,
             tables::{AccountChange, StorageChange, StorageChangeKey},
+            traits::{MutableCursor, MutableKV, MutableTransaction},
         },
         models::{Account, BlockNumber, EMPTY_ROOT},
         trie::regenerate_intermediate_hashes,
         u256_to_h256, zeroless_view,
     };
     use anyhow::Result;
-    use mdbx::{EnvironmentKind, RW};
     use proptest::prelude::*;
     use std::collections::BTreeMap;
     use tempfile::TempDir;
@@ -1860,38 +1996,42 @@ mod property_test {
         result
     }
 
-    fn add_account_to_hashed_state<'tx, 'cu>(
-        account_cursor: &'cu mut MdbxCursor<'tx, RW, tables::HashedAccount>,
-        storage_cursor: &'cu mut MdbxCursor<'tx, RW, tables::HashedStorage>,
+    async fn add_account_to_hashed_state<'tx, 'cu, AC, SC>(
+        account_cursor: &'cu mut AC,
+        storage_cursor: &'cu mut SC,
         address: &Address,
         account: &Account,
         storage: &Storage,
     ) -> Result<()>
     where
         'tx: 'cu,
+        AC: MutableCursor<'tx, tables::HashedAccount>,
+        SC: MutableCursor<'tx, tables::HashedStorage>,
     {
         let address_hash = keccak256(address);
-        account_cursor.upsert(address_hash, *account)?;
+        account_cursor.upsert(address_hash, *account).await?;
         for (location, value) in storage {
             let location_hash = keccak256(location);
-            storage_cursor.upsert(address_hash, (location_hash, *value))?
+            storage_cursor
+                .upsert(address_hash, (location_hash, *value))
+                .await?
         }
         Ok(())
     }
 
-    fn populate_hashed_state<'db, 'tx, E>(
-        tx: &'tx MdbxTransaction<'db, RW, E>,
+    async fn populate_hashed_state<'db, 'tx, Tx>(
+        tx: &'tx Tx,
         accounts_with_storage: BTreeMap<Address, (Account, Storage)>,
     ) -> Result<()>
     where
-        E: EnvironmentKind,
         'db: 'tx,
+        Tx: MutableTransaction<'db>,
     {
-        tx.clear_table(tables::HashedAccount)?;
-        tx.clear_table(tables::HashedStorage)?;
+        tx.clear_table(tables::HashedAccount).await?;
+        tx.clear_table(tables::HashedStorage).await?;
 
-        let mut account_cursor = tx.cursor(tables::HashedAccount)?;
-        let mut storage_cursor = tx.cursor(tables::HashedStorage)?;
+        let mut account_cursor = tx.mutable_cursor(tables::HashedAccount).await?;
+        let mut storage_cursor = tx.mutable_cursor_dupsort(tables::HashedStorage).await?;
 
         for (address, (account, storage)) in accounts_with_storage {
             add_account_to_hashed_state(
@@ -1900,25 +2040,26 @@ mod property_test {
                 &address,
                 &account,
                 &storage,
-            )?;
+            )
+            .await?;
         }
 
         Ok(())
     }
 
-    fn populate_change_sets<'db, 'tx, E>(
-        tx: &'tx MdbxTransaction<'db, RW, E>,
+    async fn populate_change_sets<'db, 'tx, Tx>(
+        tx: &'tx Tx,
         changing_accounts: &BTreeMap<Address, ChangingAccount>,
     ) -> Result<()>
     where
-        E: EnvironmentKind,
         'db: 'tx,
+        Tx: MutableTransaction<'db>,
     {
-        tx.clear_table(tables::AccountChangeSet)?;
-        tx.clear_table(tables::StorageChangeSet)?;
+        tx.clear_table(tables::AccountChangeSet).await?;
+        tx.clear_table(tables::StorageChangeSet).await?;
 
-        let mut account_cursor = tx.cursor(tables::AccountChangeSet)?;
-        let mut storage_cursor = tx.cursor(tables::StorageChangeSet)?;
+        let mut account_cursor = tx.mutable_cursor_dupsort(tables::AccountChangeSet).await?;
+        let mut storage_cursor = tx.mutable_cursor_dupsort(tables::StorageChangeSet).await?;
 
         for (address, states) in changing_accounts {
             let mut previous: Option<&(Account, Storage)> = None;
@@ -1928,13 +2069,15 @@ mod property_test {
                     let previous_account = previous.as_ref().map(|(a, _)| *a);
                     let current_account = current.as_ref().map(|(a, _)| *a);
                     if current_account != previous_account {
-                        account_cursor.upsert(
-                            block_number,
-                            AccountChange {
-                                address: *address,
-                                account: previous_account,
-                            },
-                        )?;
+                        account_cursor
+                            .upsert(
+                                block_number,
+                                AccountChange {
+                                    address: *address,
+                                    account: previous_account,
+                                },
+                            )
+                            .await?;
                     }
                     let empty_storage = Storage::new();
                     let previous_storage =
@@ -1943,30 +2086,34 @@ mod property_test {
                         current.as_ref().map(|(_, s)| s).unwrap_or(&empty_storage);
                     for (location, value) in previous_storage {
                         if current_storage.get(location).unwrap_or(&U256::ZERO) != value {
-                            storage_cursor.upsert(
-                                StorageChangeKey {
-                                    block_number,
-                                    address: *address,
-                                },
-                                StorageChange {
-                                    location: *location,
-                                    value: *value,
-                                },
-                            )?;
+                            storage_cursor
+                                .upsert(
+                                    StorageChangeKey {
+                                        block_number,
+                                        address: *address,
+                                    },
+                                    StorageChange {
+                                        location: *location,
+                                        value: *value,
+                                    },
+                                )
+                                .await?;
                         }
                     }
                     for location in current_storage.keys() {
                         if !previous_storage.contains_key(location) {
-                            storage_cursor.upsert(
-                                StorageChangeKey {
-                                    block_number,
-                                    address: *address,
-                                },
-                                StorageChange {
-                                    location: *location,
-                                    value: U256::ZERO,
-                                },
-                            )?;
+                            storage_cursor
+                                .upsert(
+                                    StorageChangeKey {
+                                        block_number,
+                                        address: *address,
+                                    },
+                                    StorageChange {
+                                        location: *location,
+                                        value: U256::ZERO,
+                                    },
+                                )
+                                .await?;
                         }
                     }
                 }
@@ -1990,36 +2137,45 @@ mod property_test {
     }
 
     // test
-    fn do_trie_root_matches(test_data: ChangingAccountsFixture) {
+    async fn do_trie_root_matches(test_data: ChangingAccountsFixture) {
         let db = new_mem_database().unwrap();
         let temp_dir = TempDir::new().unwrap();
 
-        let tx = db.begin_mutable().unwrap();
+        let tx = db.begin_mutable().await.unwrap();
         let state_before_increment = accounts_at_height(&test_data, test_data.before_increment);
         let expected = expected_state_root(&state_before_increment);
-        populate_hashed_state(&tx, state_before_increment).unwrap();
-        tx.commit().unwrap();
+        populate_hashed_state(&tx, state_before_increment)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
 
-        let tx = db.begin_mutable().unwrap();
-        let root = regenerate_intermediate_hashes(&tx, &temp_dir, None).unwrap();
-        tx.commit().unwrap();
+        let tx = db.begin_mutable().await.unwrap();
+        let root = regenerate_intermediate_hashes(&tx, &temp_dir, None)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
 
         assert_eq!(root, expected);
 
-        let tx = db.begin_mutable().unwrap();
+        let tx = db.begin_mutable().await.unwrap();
         let state_after_increment = accounts_at_height(&test_data, test_data.after_increment);
         let expected = expected_state_root(&state_after_increment);
-        populate_hashed_state(&tx, state_after_increment).unwrap();
-        populate_change_sets(&tx, &test_data.accounts).unwrap();
-        tx.commit().unwrap();
+        populate_hashed_state(&tx, state_after_increment)
+            .await
+            .unwrap();
+        populate_change_sets(&tx, &test_data.accounts)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
 
-        let tx = db.begin_mutable().unwrap();
+        let tx = db.begin_mutable().await.unwrap();
         let root = increment_intermediate_hashes(
             &tx,
             &temp_dir,
             BlockNumber(test_data.before_increment as u64),
             None,
         )
+        .await
         .unwrap();
 
         assert_eq!(root, expected);
@@ -2028,7 +2184,7 @@ mod property_test {
     proptest! {
         #[test]
         fn trie_root_matches(test_data in test_datas()) {
-            do_trie_root_matches(test_data);
+            tokio_test::block_on(do_trie_root_matches(test_data));
         }
     }
 }

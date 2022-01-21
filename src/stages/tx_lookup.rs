@@ -1,15 +1,15 @@
 use crate::{
     etl::collector::*,
-    kv::{mdbx::*, tables},
+    kv::{tables, traits::*},
     models::BodyForStorage,
     stagedsync::{stage::*, stages::*},
     StageId,
 };
 use async_trait::async_trait;
-use mdbx::EnvironmentKind;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::pin;
+use tokio_stream::StreamExt;
 use tracing::*;
 
 /// Generation of TransactionHash => BlockNumber mapping
@@ -19,9 +19,9 @@ pub struct TxLookup {
 }
 
 #[async_trait]
-impl<'db, E> Stage<'db, E> for TxLookup
+impl<'db, RwTx> Stage<'db, RwTx> for TxLookup
 where
-    E: EnvironmentKind,
+    RwTx: MutableTransaction<'db>,
 {
     fn id(&self) -> StageId {
         TX_LOOKUP
@@ -29,42 +29,47 @@ where
 
     async fn execute<'tx>(
         &mut self,
-        tx: &'tx mut MdbxTransaction<'db, RW, E>,
+        tx: &'tx mut RwTx,
         input: StageInput,
     ) -> anyhow::Result<ExecOutput>
     where
         'db: 'tx,
     {
-        let mut tx_hash_cursor = tx.cursor(tables::BlockTransactionLookup.erased())?;
+        let mut bodies_cursor = tx.mutable_cursor(tables::BlockBody).await?;
+        let mut tx_hash_cursor = tx
+            .mutable_cursor(tables::BlockTransactionLookup.erased())
+            .await?;
+
+        let mut block_txs_cursor = tx.cursor(tables::BlockTransaction).await?;
 
         let mut collector = TableCollector::new(&*self.temp_dir, OPTIMAL_BUFFER_CAPACITY);
 
         let last_processed_block_number = tx
-            .cursor(tables::BlockTransactionLookup)?
-            .last()?
+            .mutable_cursor(tables::BlockTransactionLookup)
+            .await?
+            .last()
+            .await?
             .map(|(_, v)| v.0)
             .unwrap_or_else(|| 0.into());
 
         let start_block_number = last_processed_block_number + 1;
 
-        let walker_block_body = tx.cursor(tables::BlockBody)?.walk(Some(start_block_number));
+        let walker_block_body = walk(&mut bodies_cursor, Some(start_block_number));
         pin!(walker_block_body);
 
-        while let Some(((block_number, _), ref body_rpl)) = walker_block_body.next().transpose()? {
+        while let Some(((block_number, _), ref body_rpl)) = walker_block_body.try_next().await? {
             let (tx_count, tx_base_id) = (body_rpl.tx_amount, body_rpl.base_tx_id);
 
-            let walker_block_txs = tx
-                .cursor(tables::BlockTransaction)?
-                .walk(Some(tx_base_id))
-                .take(tx_count.try_into()?);
+            let walker_block_txs =
+                walk(&mut block_txs_cursor, Some(tx_base_id)).take(tx_count.try_into()?);
             pin!(walker_block_txs);
 
-            while let Some((_, tx)) = walker_block_txs.next().transpose()? {
+            while let Some((_, tx)) = walker_block_txs.try_next().await? {
                 collector.push(tx.hash(), tables::TruncateStart(block_number));
             }
         }
 
-        collector.load(&mut tx_hash_cursor)?;
+        collector.load(&mut tx_hash_cursor).await?;
         info!("Processed");
         Ok(ExecOutput::Progress {
             stage_progress: input
@@ -77,14 +82,15 @@ where
 
     async fn unwind<'tx>(
         &mut self,
-        tx: &'tx mut MdbxTransaction<'db, RW, E>,
+        tx: &'tx mut RwTx,
         input: UnwindInput,
     ) -> anyhow::Result<UnwindOutput>
     where
         'db: 'tx,
     {
-        let bodies_cursor = tx.cursor(tables::BlockBody)?;
-        let mut tx_hash_cursor = tx.cursor(tables::BlockTransactionLookup)?;
+        let mut bodies_cursor = tx.mutable_cursor(tables::BlockBody).await?;
+        let mut tx_hash_cursor = tx.mutable_cursor(tables::BlockTransactionLookup).await?;
+        let mut block_txs_cursor = tx.cursor(tables::BlockTransaction).await?;
 
         let start_block_number = input.unwind_to + 1;
 
@@ -93,7 +99,7 @@ where
             input.stage_progress, input.unwind_to
         );
 
-        let walker_block_body = bodies_cursor.walk(Some(start_block_number));
+        let walker_block_body = walk(&mut bodies_cursor, Some(start_block_number));
         pin!(walker_block_body);
 
         while let Some((
@@ -103,20 +109,20 @@ where
                 tx_amount,
                 ..
             },
-        )) = walker_block_body.next().transpose()?
+        )) = walker_block_body.try_next().await?
         {
-            let walker_block_txs = tx.cursor(tables::BlockTransaction)?.walk(Some(base_tx_id));
+            let walker_block_txs = walk(&mut block_txs_cursor, Some(base_tx_id));
             pin!(walker_block_txs);
 
             let mut num_txs = 1;
 
-            while let Some((_, tx_value)) = walker_block_txs.next().transpose()? {
+            while let Some((_, tx_value)) = walker_block_txs.try_next().await? {
                 if num_txs > tx_amount {
                     break;
                 }
 
-                if tx_hash_cursor.seek(tx_value.hash())?.is_some() {
-                    tx_hash_cursor.delete_current()?;
+                if tx_hash_cursor.seek(tx_value.hash()).await?.is_some() {
+                    tx_hash_cursor.delete_current().await?;
                 }
                 num_txs += 1;
             }
@@ -144,7 +150,7 @@ mod tests {
     #[tokio::test]
     async fn tx_lookup_stage_with_data() {
         let db = new_mem_database().unwrap();
-        let mut tx = db.begin_mutable().unwrap();
+        let mut tx = db.begin_mutable().await.unwrap();
 
         let recipient1 = Address::from(hex!("f4148309cc30f2dd4ba117122cad6be1e3ba0e2b"));
         let recipient2 = Address::from(hex!("d7fa8303df7073290f66ced1add5fe89dac0c462"));
@@ -289,12 +295,22 @@ mod tests {
         let hash2 = H256::random();
         let hash3 = H256::random();
 
-        chain::storage_body::write(&tx, hash1, 1, &block1).unwrap();
-        chain::storage_body::write(&tx, hash2, 2, &block2).unwrap();
-        chain::storage_body::write(&tx, hash3, 3, &block3).unwrap();
+        chain::storage_body::write(&tx, hash1, 1, &block1)
+            .await
+            .unwrap();
+        chain::storage_body::write(&tx, hash2, 2, &block2)
+            .await
+            .unwrap();
+        chain::storage_body::write(&tx, hash3, 3, &block3)
+            .await
+            .unwrap();
 
-        chain::tx::write(&tx, block1.base_tx_id, &[tx1_1, tx1_2]).unwrap();
-        chain::tx::write(&tx, block2.base_tx_id, &[tx2_1, tx2_2, tx2_3]).unwrap();
+        chain::tx::write(&tx, block1.base_tx_id, &[tx1_1, tx1_2])
+            .await
+            .unwrap();
+        chain::tx::write(&tx, block2.base_tx_id, &[tx2_1, tx2_2, tx2_3])
+            .await
+            .unwrap();
 
         let mut stage = TxLookup {
             temp_dir: Arc::new(TempDir::new().unwrap()),
@@ -325,7 +341,7 @@ mod tests {
             (hash2_3, 2),
         ] {
             assert_eq!(
-                dbg!(chain::tl::read(&tx, hashed_tx).unwrap().unwrap()),
+                dbg!(chain::tl::read(&tx, hashed_tx).await.unwrap().unwrap()),
                 block_number.into()
             );
         }
@@ -334,7 +350,7 @@ mod tests {
     #[tokio::test]
     async fn tx_lookup_stage_without_data() {
         let db = new_mem_database().unwrap();
-        let mut tx = db.begin_mutable().unwrap();
+        let mut tx = db.begin_mutable().await.unwrap();
         let mut stage = TxLookup {
             temp_dir: Arc::new(TempDir::new().unwrap()),
         };
@@ -360,7 +376,7 @@ mod tests {
     #[tokio::test]
     async fn tx_lookup_unwind() {
         let db = new_mem_database().unwrap();
-        let mut tx = db.begin_mutable().unwrap();
+        let mut tx = db.begin_mutable().await.unwrap();
 
         let recipient1 = Address::from(hex!("f4148309cc30f2dd4ba117122cad6be1e3ba0e2b"));
         let recipient2 = Address::from(hex!("d7fa8303df7073290f66ced1add5fe89dac0c462"));
@@ -505,18 +521,28 @@ mod tests {
         let hash2 = H256::random();
         let hash3 = H256::random();
 
-        chain::storage_body::write(&tx, hash1, 1, &block1).unwrap();
-        chain::storage_body::write(&tx, hash2, 2, &block2).unwrap();
-        chain::storage_body::write(&tx, hash3, 3, &block3).unwrap();
+        chain::storage_body::write(&tx, hash1, 1, &block1)
+            .await
+            .unwrap();
+        chain::storage_body::write(&tx, hash2, 2, &block2)
+            .await
+            .unwrap();
+        chain::storage_body::write(&tx, hash3, 3, &block3)
+            .await
+            .unwrap();
 
-        chain::tx::write(&tx, block1.base_tx_id, &[tx1_1, tx1_2]).unwrap();
-        chain::tx::write(&tx, block2.base_tx_id, &[tx2_1, tx2_2, tx2_3]).unwrap();
+        chain::tx::write(&tx, block1.base_tx_id, &[tx1_1, tx1_2])
+            .await
+            .unwrap();
+        chain::tx::write(&tx, block2.base_tx_id, &[tx2_1, tx2_2, tx2_3])
+            .await
+            .unwrap();
 
-        chain::tl::write(&tx, hash1_1, 1.into()).unwrap();
-        chain::tl::write(&tx, hash1_2, 1.into()).unwrap();
-        chain::tl::write(&tx, hash2_1, 2.into()).unwrap();
-        chain::tl::write(&tx, hash2_2, 2.into()).unwrap();
-        chain::tl::write(&tx, hash2_3, 2.into()).unwrap();
+        chain::tl::write(&tx, hash1_1, 1.into()).await.unwrap();
+        chain::tl::write(&tx, hash1_2, 1.into()).await.unwrap();
+        chain::tl::write(&tx, hash2_1, 2.into()).await.unwrap();
+        chain::tl::write(&tx, hash2_2, 2.into()).await.unwrap();
+        chain::tl::write(&tx, hash2_3, 2.into()).await.unwrap();
         let mut stage = TxLookup {
             temp_dir: Arc::new(TempDir::new().unwrap()),
         };
@@ -531,8 +557,8 @@ mod tests {
             .await
             .unwrap();
 
-        tx.commit().unwrap();
-        let tx = db.begin_mutable().unwrap();
+        tx.commit().await.unwrap();
+        let tx = db.begin_mutable().await.unwrap();
 
         for (hashed_tx, block_number) in [
             (hash1_1, Some(1.into())),
@@ -541,7 +567,10 @@ mod tests {
             (hash2_2, None),
             (hash2_3, None),
         ] {
-            assert_eq!(dbg!(chain::tl::read(&tx, hashed_tx).unwrap()), block_number);
+            assert_eq!(
+                dbg!(chain::tl::read(&tx, hashed_tx).await.unwrap()),
+                block_number
+            );
         }
     }
 }

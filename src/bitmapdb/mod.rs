@@ -1,24 +1,23 @@
 use crate::{
-    kv::{mdbx::MdbxTransaction, tables::BitmapKey, traits::*},
+    kv::{tables::BitmapKey, traits::*},
     models::*,
 };
 use croaring::{treemap::NativeSerializer, Treemap as RoaringTreemap};
-use mdbx::{EnvironmentKind, TransactionKind};
 use std::{iter::Peekable, ops::RangeInclusive};
 use tokio::pin;
+use tokio_stream::StreamExt;
 
 // Size beyond which we get MDBX overflow pages: 4096 / 2 - (key_size + 8)
 pub const CHUNK_LIMIT: usize = 1950;
 
-pub fn get<T, K, TK, E>(
-    tx: &MdbxTransaction<'_, TK, E>,
+pub async fn get<'db, Tx, T, K>(
+    tx: &Tx,
     table: T,
     key: K,
     range: RangeInclusive<BlockNumber>,
 ) -> anyhow::Result<RoaringTreemap>
 where
-    TK: TransactionKind,
-    E: EnvironmentKind,
+    Tx: Transaction<'db>,
     K: Clone + PartialEq + Send,
     BitmapKey<K>: TableDecode,
     T: Table<Key = BitmapKey<K>, Value = RoaringTreemap, SeekKey = BitmapKey<K>>,
@@ -27,17 +26,20 @@ where
     let from = *range.start();
     let to = *range.end();
 
-    let s = tx
-        .cursor(table)?
-        .walk(Some(BitmapKey {
+    let mut c = tx.cursor(table).await?;
+
+    let s = walk(
+        &mut c,
+        Some(BitmapKey {
             inner: key.clone(),
             block_number: from,
-        }))
-        .take_while(ttw(|(BitmapKey { inner, .. }, _)| *inner == key));
+        }),
+    )
+    .take_while(ttw(|(BitmapKey { inner, .. }, _)| *inner == key));
 
     pin!(s);
 
-    while let Some((BitmapKey { block_number, .. }, v)) = s.next().transpose()? {
+    while let Some((BitmapKey { block_number, .. }, v)) = s.try_next().await? {
         if out.is_some() {
             out = Some(out.unwrap() | v);
         } else {

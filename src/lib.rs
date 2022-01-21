@@ -1,13 +1,19 @@
 #![feature(
     bool_to_option,
+    destructuring_assignment,
+    entry_insert,
     generator_trait,
     generators,
+    generic_associated_types,
     let_else,
     map_first_last,
     never_type,
     step_trait,
     type_alias_impl_trait,
-    adt_const_params
+    integer_atomics,
+    async_closure,
+    const_try,
+    let_chains
 )]
 #![recursion_limit = "256"]
 #![allow(
@@ -32,6 +38,7 @@ pub mod kv;
 pub mod models;
 pub mod res;
 pub mod sentry;
+pub mod sentry2;
 pub mod stagedsync;
 pub mod stages;
 mod state;

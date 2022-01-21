@@ -1,6 +1,7 @@
 use super::*;
 use crate::{chain::protocol_param::param, models::*, state::*};
 use anyhow::Context;
+use async_recursion::*;
 use std::time::SystemTime;
 
 #[derive(Debug)]
@@ -17,7 +18,7 @@ impl ConsensusEngineBase {
         }
     }
 
-    pub fn validate_block_header(
+    pub async fn validate_block_header(
         &self,
         header: &BlockHeader,
         parent: &BlockHeader,
@@ -94,20 +95,23 @@ impl ConsensusEngineBase {
         Ok(())
     }
 
-    pub fn get_parent_header(
+    pub async fn get_parent_header(
         &self,
         state: &mut dyn State,
         header: &BlockHeader,
     ) -> anyhow::Result<Option<BlockHeader>> {
         if let Some(parent_number) = header.number.0.checked_sub(1) {
-            return state.read_header(parent_number.into(), header.parent_hash);
+            return state
+                .read_header(parent_number.into(), header.parent_hash)
+                .await;
         }
 
         Ok(None)
     }
 
     // See [YP] Section 11.1 "Ommer Validation"
-    fn is_kin(
+    #[async_recursion]
+    async fn is_kin(
         &self,
         branch_header: &BlockHeader,
         mainline_header: &BlockHeader,
@@ -117,11 +121,14 @@ impl ConsensusEngineBase {
         old_ommers: &mut Vec<BlockHeader>,
     ) -> anyhow::Result<bool> {
         if n > 0 && branch_header != mainline_header {
-            if let Some(mainline_body) = state.read_body(mainline_header.number, mainline_hash)? {
+            if let Some(mainline_body) = state
+                .read_body(mainline_header.number, mainline_hash)
+                .await?
+            {
                 old_ommers.extend_from_slice(&mainline_body.ommers);
 
-                let mainline_parent = self.get_parent_header(state, mainline_header)?;
-                let branch_parent = self.get_parent_header(state, branch_header)?;
+                let mainline_parent = self.get_parent_header(state, mainline_header).await?;
+                let branch_parent = self.get_parent_header(state, branch_header).await?;
 
                 if let Some(mainline_parent) = mainline_parent {
                     if let Some(branch_parent) = branch_parent {
@@ -130,14 +137,16 @@ impl ConsensusEngineBase {
                         }
                     }
 
-                    return self.is_kin(
-                        branch_header,
-                        &mainline_parent,
-                        mainline_header.parent_hash,
-                        n - 1,
-                        state,
-                        old_ommers,
-                    );
+                    return self
+                        .is_kin(
+                            branch_header,
+                            &mainline_parent,
+                            mainline_header.parent_hash,
+                            n - 1,
+                            state,
+                            old_ommers,
+                        )
+                        .await;
                 }
             }
         }
@@ -193,7 +202,11 @@ impl ConsensusEngineBase {
         None
     }
 
-    pub fn pre_validate_block(&self, block: &Block, state: &mut dyn State) -> anyhow::Result<()> {
+    pub async fn pre_validate_block(
+        &self,
+        block: &Block,
+        state: &mut dyn State,
+    ) -> anyhow::Result<()> {
         let expected_ommers_hash = Block::ommers_hash(&block.ommers);
         if block.header.ommers_hash != expected_ommers_hash {
             return Err(ValidationError::WrongOmmersHash {
@@ -221,25 +234,31 @@ impl ConsensusEngineBase {
         }
 
         let parent = self
-            .get_parent_header(state, &block.header)?
+            .get_parent_header(state, &block.header)
+            .await?
             .ok_or(ValidationError::UnknownParent)?;
 
         for ommer in &block.ommers {
             let ommer_parent = self
-                .get_parent_header(state, ommer)?
+                .get_parent_header(state, ommer)
+                .await?
                 .ok_or(ValidationError::UnknownParent)?;
 
             self.validate_block_header(ommer, &ommer_parent, false)
+                .await
                 .context(ValidationError::InvalidOmmerHeader)?;
             let mut old_ommers = vec![];
-            if !self.is_kin(
-                ommer,
-                &parent,
-                block.header.parent_hash,
-                6,
-                state,
-                &mut old_ommers,
-            )? {
+            if !self
+                .is_kin(
+                    ommer,
+                    &parent,
+                    block.header.parent_hash,
+                    6,
+                    state,
+                    &mut old_ommers,
+                )
+                .await?
+            {
                 return Err(ValidationError::NotAnOmmer.into());
             }
             for oo in old_ommers {

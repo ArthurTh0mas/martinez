@@ -1,10 +1,16 @@
+use super::{header::BlockHeaders, PeerId};
 use crate::{
     models::H256,
     sentry2::types::{GetBlockHeaders, NewBlock, NewBlockHashes},
 };
+use ethereum_interfaces::sentry as grpc_sentry;
 use rlp_derive::{RlpDecodableWrapper, RlpEncodableWrapper};
 
-use super::block::BlockHeaders;
+#[derive(Debug, Clone, PartialEq)]
+pub struct InboundMessage {
+    pub msg: Message,
+    pub peer_id: PeerId,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MessageId {
     Status = 0,
@@ -22,6 +28,32 @@ pub enum MessageId {
     NodeData = 12,
     Receipts = 13,
     PooledTransactions = 14,
+}
+
+impl MessageId {
+    #[inline(always)]
+    pub fn from_i32(i: i32) -> Result<Self, InvalidMessageId> {
+        match grpc_sentry::MessageId::from_i32(i).unwrap() {
+            grpc_sentry::MessageId::Status66 => Ok(MessageId::Status),
+            grpc_sentry::MessageId::NewBlockHashes66 => Ok(MessageId::NewBlockHashes),
+            grpc_sentry::MessageId::Transactions66 => Ok(MessageId::Transactions),
+            grpc_sentry::MessageId::GetBlockHeaders66 => Ok(MessageId::GetBlockHeaders),
+            grpc_sentry::MessageId::BlockHeaders66 => Ok(MessageId::BlockHeaders),
+            grpc_sentry::MessageId::GetBlockBodies66 => Ok(MessageId::GetBlockBodies),
+            grpc_sentry::MessageId::BlockBodies66 => Ok(MessageId::BlockBodies),
+            grpc_sentry::MessageId::NewBlock66 => Ok(MessageId::NewBlock),
+            grpc_sentry::MessageId::NewPooledTransactionHashes66 => {
+                Ok(MessageId::NewPooledTransactionHashes)
+            }
+            grpc_sentry::MessageId::GetPooledTransactions66 => Ok(MessageId::GetPooledTransactions),
+            grpc_sentry::MessageId::PooledTransactions66 => Ok(MessageId::PooledTransactions),
+            grpc_sentry::MessageId::GetNodeData66 => Ok(MessageId::GetNodeData),
+            grpc_sentry::MessageId::NodeData66 => Ok(MessageId::NodeData),
+            grpc_sentry::MessageId::GetReceipts66 => Ok(MessageId::GetReceipts),
+            grpc_sentry::MessageId::Receipts66 => Ok(MessageId::Receipts),
+            _ => Err(InvalidMessageId),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -71,11 +103,12 @@ pub enum Message {
     NewBlockHashes(NewBlockHashes),
     GetBlockHeaders(GetBlockHeaders),
     BlockHeaders(BlockHeaders),
-    NewBlock(NewBlock),
+    NewBlock(Box<NewBlock>),
     NewPooledTransactionHashes(NewPooledTransactionHashes),
 }
 
 impl Message {
+    #[inline(always)]
     pub const fn id(&self) -> MessageId {
         match self {
             Self::NewBlockHashes(_) => MessageId::NewBlockHashes,

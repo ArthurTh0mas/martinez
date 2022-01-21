@@ -2,7 +2,6 @@ use martinez::{
     binutil::MartinezDataDir,
     downloader::sentry_status_provider::SentryStatusProvider,
     kv::{
-        mdbx::*,
         tables::{self, ErasedTable},
         traits::*,
     },
@@ -18,7 +17,6 @@ use martinez::{
 use anyhow::{bail, format_err, Context};
 use async_trait::async_trait;
 use clap::Parser;
-use mdbx::EnvironmentKind;
 use rayon::prelude::*;
 use std::{
     panic,
@@ -27,6 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::pin;
+use tokio_stream::StreamExt;
 use tracing::*;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
@@ -99,20 +98,20 @@ pub struct Opt {
 }
 
 #[derive(Debug)]
-struct ConvertHeaders<SE>
+struct ConvertHeaders<Source>
 where
-    SE: EnvironmentKind,
+    Source: KV,
 {
-    db: Arc<MdbxEnvironment<SE>>,
+    db: Arc<Source>,
     max_block: Option<BlockNumber>,
     exit_after_progress: Option<u64>,
 }
 
 #[async_trait]
-impl<'db, E, SE> Stage<'db, E> for ConvertHeaders<SE>
+impl<'db, RwTx, Source> Stage<'db, RwTx> for ConvertHeaders<Source>
 where
-    E: EnvironmentKind,
-    SE: EnvironmentKind,
+    Source: KV,
+    RwTx: MutableTransaction<'db>,
 {
     fn id(&self) -> StageId {
         HEADERS
@@ -120,7 +119,7 @@ where
 
     async fn execute<'tx>(
         &mut self,
-        tx: &'tx mut MdbxTransaction<'db, RW, E>,
+        tx: &'tx mut RwTx,
         input: StageInput,
     ) -> anyhow::Result<ExecOutput>
     where
@@ -129,17 +128,19 @@ where
         let original_highest_block = input.stage_progress.unwrap_or(BlockNumber(0));
         let mut highest_block = original_highest_block;
 
-        let erigon_tx = self.db.begin()?;
+        let erigon_tx = self.db.begin().await?;
 
-        let erigon_canonical_cur = erigon_tx.cursor(tables::CanonicalHeader)?;
-        let mut canonical_cur = tx.cursor(tables::CanonicalHeader)?;
-        let mut erigon_header_cur = erigon_tx.cursor(tables::Header.erased())?;
-        let mut header_cur = tx.cursor(tables::Header)?;
-        let mut erigon_td_cur = erigon_tx.cursor(tables::HeadersTotalDifficulty)?;
-        let mut td_cur = tx.cursor(tables::HeadersTotalDifficulty)?;
+        let mut erigon_canonical_cur = erigon_tx.cursor(tables::CanonicalHeader).await?;
+        let mut canonical_cur = tx.mutable_cursor(tables::CanonicalHeader).await?;
+        let mut erigon_header_cur = erigon_tx.cursor(tables::Header.erased()).await?;
+        let mut header_cur = tx.mutable_cursor(tables::Header).await?;
+        let mut erigon_td_cur = erigon_tx.cursor(tables::HeadersTotalDifficulty).await?;
+        let mut td_cur = tx.mutable_cursor(tables::HeadersTotalDifficulty).await?;
 
-        if erigon_tx.get(tables::CanonicalHeader, highest_block)?
-            != tx.get(tables::CanonicalHeader, highest_block)?
+        if erigon_tx
+            .get(tables::CanonicalHeader, highest_block)
+            .await?
+            != tx.get(tables::CanonicalHeader, highest_block).await?
         {
             let unwind_to = BlockNumber(highest_block.0.checked_sub(1).ok_or_else(|| {
                 format_err!("Attempted to unwind past genesis block, are Erigon and Martinez on the same chain?")
@@ -148,9 +149,9 @@ where
             return Ok(ExecOutput::Unwind { unwind_to });
         }
 
-        let walker = erigon_canonical_cur.walk(Some(highest_block + 1));
+        let walker = walk(&mut erigon_canonical_cur, Some(highest_block + 1));
         pin!(walker);
-        while let Some((block_number, canonical_hash)) = walker.next().transpose()? {
+        while let Some((block_number, canonical_hash)) = walker.try_next().await? {
             if block_number > self.max_block.unwrap_or(BlockNumber(u64::MAX)) {
                 break;
             }
@@ -168,23 +169,31 @@ where
 
             highest_block = block_number;
 
-            canonical_cur.append(block_number, canonical_hash)?;
-            header_cur.append(
-                (block_number, canonical_hash),
-                rlp::decode(
-                    &erigon_header_cur
-                        .seek_exact(TableEncode::encode((block_number, canonical_hash)).to_vec())?
+            canonical_cur.append(block_number, canonical_hash).await?;
+            header_cur
+                .append(
+                    (block_number, canonical_hash),
+                    rlp::decode(
+                        &erigon_header_cur
+                            .seek_exact(
+                                TableEncode::encode((block_number, canonical_hash)).to_vec(),
+                            )
+                            .await?
+                            .unwrap()
+                            .1,
+                    )?,
+                )
+                .await?;
+            td_cur
+                .append(
+                    (block_number, canonical_hash),
+                    erigon_td_cur
+                        .seek_exact((block_number, canonical_hash))
+                        .await?
                         .unwrap()
                         .1,
-                )?,
-            )?;
-            td_cur.append(
-                (block_number, canonical_hash),
-                erigon_td_cur
-                    .seek_exact((block_number, canonical_hash))?
-                    .unwrap()
-                    .1,
-            )?;
+                )
+                .await?;
 
             if block_number.0 % 500_000 == 0 {
                 info!("Extracted block {}", block_number);
@@ -199,38 +208,38 @@ where
 
     async fn unwind<'tx>(
         &mut self,
-        tx: &'tx mut MdbxTransaction<'db, RW, E>,
+        tx: &'tx mut RwTx,
         input: UnwindInput,
     ) -> anyhow::Result<UnwindOutput>
     where
         'db: 'tx,
     {
-        let mut canonical_cur = tx.cursor(tables::CanonicalHeader)?;
+        let mut canonical_cur = tx.mutable_cursor(tables::CanonicalHeader).await?;
 
-        while let Some((block_num, _)) = canonical_cur.last()? {
+        while let Some((block_num, _)) = canonical_cur.last().await? {
             if block_num <= input.unwind_to {
                 break;
             }
 
-            canonical_cur.delete_current()?;
+            canonical_cur.delete_current().await?;
         }
 
-        let mut header_cur = tx.cursor(tables::Header)?;
-        while let Some(((block_num, _), _)) = header_cur.last()? {
+        let mut header_cur = tx.mutable_cursor(tables::Header).await?;
+        while let Some(((block_num, _), _)) = header_cur.last().await? {
             if block_num <= input.unwind_to {
                 break;
             }
 
-            header_cur.delete_current()?;
+            header_cur.delete_current().await?;
         }
 
-        let mut td_cur = tx.cursor(tables::HeadersTotalDifficulty)?;
-        while let Some(((block_num, _), _)) = td_cur.last()? {
+        let mut td_cur = tx.mutable_cursor(tables::HeadersTotalDifficulty).await?;
+        while let Some(((block_num, _), _)) = td_cur.last().await? {
             if block_num <= input.unwind_to {
                 break;
             }
 
-            td_cur.delete_current()?;
+            td_cur.delete_current().await?;
         }
 
         Ok(UnwindOutput {
@@ -240,27 +249,28 @@ where
 }
 
 #[derive(Debug)]
-struct ConvertBodies<SE>
+struct ConvertBodies<Source>
 where
-    SE: EnvironmentKind,
+    Source: KV,
 {
-    db: Arc<MdbxEnvironment<SE>>,
+    db: Arc<Source>,
     commit_after: Duration,
 }
 
 #[async_trait]
-impl<'db, E, SE> Stage<'db, E> for ConvertBodies<SE>
+impl<'db, RwTx, Source> Stage<'db, RwTx> for ConvertBodies<Source>
 where
-    E: EnvironmentKind,
-    SE: EnvironmentKind,
+    Source: KV,
+    RwTx: MutableTransaction<'db>,
 {
     fn id(&self) -> StageId {
         BODIES
     }
 
+    #[allow(clippy::redundant_closure_call)]
     async fn execute<'tx>(
         &mut self,
-        tx: &'tx mut MdbxTransaction<'db, RW, E>,
+        tx: &'tx mut RwTx,
         input: StageInput,
     ) -> anyhow::Result<ExecOutput>
     where
@@ -271,10 +281,12 @@ where
 
         const MAX_TXS_PER_BATCH: usize = 500_000;
         const BUFFERING_FACTOR: usize = 100_000;
-        let erigon_tx = self.db.begin()?;
+        let erigon_tx = self.db.begin().await?;
 
-        if erigon_tx.get(tables::CanonicalHeader, highest_block)?
-            != tx.get(tables::CanonicalHeader, highest_block)?
+        if erigon_tx
+            .get(tables::CanonicalHeader, highest_block)
+            .await?
+            != tx.get(tables::CanonicalHeader, highest_block).await?
         {
             let unwind_to = BlockNumber(highest_block.0.checked_sub(1).ok_or_else(|| {
                 format_err!("Attempted to unwind past genesis block, are Erigon and Martinez on the same chain?")
@@ -283,28 +295,34 @@ where
             return Ok(ExecOutput::Unwind { unwind_to });
         }
 
-        let canonical_header_cur = tx.cursor(tables::CanonicalHeader)?;
+        let mut canonical_header_cur = tx.cursor(tables::CanonicalHeader).await?;
 
-        let erigon_body_cur = erigon_tx.cursor(tables::BlockBody.erased())?;
-        let mut body_cur = tx.cursor(tables::BlockBody)?;
+        let mut erigon_body_cur = erigon_tx.cursor(tables::BlockBody.erased()).await?;
+        let mut body_cur = tx.mutable_cursor(tables::BlockBody).await?;
 
-        let mut tx_cur = tx.cursor(tables::BlockTransaction.erased())?;
+        let mut erigon_tx_cur = erigon_tx.cursor(tables::BlockTransaction.erased()).await?;
+        let mut tx_cur = tx.mutable_cursor(tables::BlockTransaction.erased()).await?;
 
         let prev_body = tx
             .get(
                 tables::BlockBody,
                 (
                     highest_block,
-                    tx.get(tables::CanonicalHeader, highest_block)?.unwrap(),
+                    tx.get(tables::CanonicalHeader, highest_block)
+                        .await?
+                        .unwrap(),
                 ),
-            )?
+            )
+            .await?
             .unwrap();
 
         let mut starting_index = prev_body.base_tx_id + prev_body.tx_amount as u64;
-        let canonical_header_walker = canonical_header_cur.walk(Some(highest_block + 1));
+        let canonical_header_walker = walk(&mut canonical_header_cur, Some(highest_block + 1));
         pin!(canonical_header_walker);
-        let erigon_body_walker =
-            erigon_body_cur.walk(Some(TableEncode::encode(highest_block + 1).to_vec()));
+        let erigon_body_walker = walk(
+            &mut erigon_body_cur,
+            Some(TableEncode::encode(highest_block + 1).to_vec()),
+        );
         pin!(erigon_body_walker);
         let mut batch = Vec::with_capacity(BUFFERING_FACTOR);
         let mut converted = Vec::new();
@@ -317,11 +335,10 @@ where
         let done = loop {
             let mut no_more_bodies = true;
             let mut accum_txs = 0;
-            'l: while let Some((block_num, block_hash)) =
-                canonical_header_walker.next().transpose()?
+            'l: while let Some((block_num, block_hash)) = canonical_header_walker.try_next().await?
             {
                 loop {
-                    if let Some((k, v)) = erigon_body_walker.next().transpose()? {
+                    if let Some((k, v)) = erigon_body_walker.try_next().await? {
                         let (body_block_num, body_block_hash) = <(BlockNumber, H256)>::decode(&k)?;
                         if body_block_num > block_num {
                             break 'l;
@@ -336,12 +353,11 @@ where
                         let base_tx_id = body.base_tx_id;
 
                         let tx_amount = usize::try_from(body.tx_amount)?;
-                        let txs = erigon_tx
-                            .cursor(tables::BlockTransaction.erased())?
-                            .walk(Some(base_tx_id.encode().to_vec()))
+                        let txs = walk(&mut erigon_tx_cur, Some(base_tx_id.encode().to_vec()))
                             .map(|res| res.map(|(_, tx)| tx))
                             .take(tx_amount)
-                            .collect::<anyhow::Result<Vec<_>>>()?;
+                            .collect::<anyhow::Result<Vec<_>>>()
+                            .await?;
 
                         if txs.len() != tx_amount {
                             bail!(
@@ -405,14 +421,16 @@ where
                     uncles,
                 };
 
-                body_cur.append((block_num, block_hash), body)?;
+                body_cur.append((block_num, block_hash), body).await?;
 
                 for tx in txs {
-                    tx_cur.append(
-                        ErasedTable::<tables::BlockTransaction>::encode_key(starting_index)
-                            .to_vec(),
-                        tx,
-                    )?;
+                    tx_cur
+                        .append(
+                            ErasedTable::<tables::BlockTransaction>::encode_key(starting_index)
+                                .to_vec(),
+                            tx,
+                        )
+                        .await?;
                     starting_index.0 += 1;
                 }
             }
@@ -450,26 +468,26 @@ where
     }
     async fn unwind<'tx>(
         &mut self,
-        tx: &'tx mut MdbxTransaction<'db, RW, E>,
+        tx: &'tx mut RwTx,
         input: UnwindInput,
     ) -> anyhow::Result<UnwindOutput>
     where
         'db: 'tx,
     {
-        let mut block_body_cur = tx.cursor(tables::BlockBody)?;
-        let mut block_tx_cur = tx.cursor(tables::BlockTransaction)?;
-        while let Some(((block_num, _), body)) = block_body_cur.last()? {
+        let mut block_body_cur = tx.mutable_cursor(tables::BlockBody).await?;
+        let mut block_tx_cur = tx.mutable_cursor(tables::BlockTransaction).await?;
+        while let Some(((block_num, _), body)) = block_body_cur.last().await? {
             if block_num <= input.unwind_to {
                 break;
             }
 
-            block_body_cur.delete_current()?;
+            block_body_cur.delete_current().await?;
 
             let mut deleted = 0;
             while deleted < body.tx_amount {
                 let to_delete = body.base_tx_id + deleted;
-                if block_tx_cur.seek(to_delete)?.is_some() {
-                    block_tx_cur.delete_current()?;
+                if block_tx_cur.seek(to_delete).await?.is_some() {
+                    block_tx_cur.delete_current().await?;
                 }
 
                 deleted += 1;
@@ -486,16 +504,16 @@ where
 struct FinishStage;
 
 #[async_trait]
-impl<'db, E> Stage<'db, E> for FinishStage
+impl<'db, RwTx> Stage<'db, RwTx> for FinishStage
 where
-    E: EnvironmentKind,
+    RwTx: MutableTransaction<'db>,
 {
     fn id(&self) -> StageId {
         FINISH
     }
     async fn execute<'tx>(
         &mut self,
-        _: &'tx mut MdbxTransaction<'db, RW, E>,
+        _: &'tx mut RwTx,
         input: StageInput,
     ) -> anyhow::Result<ExecOutput>
     where
@@ -513,7 +531,7 @@ where
     }
     async fn unwind<'tx>(
         &mut self,
-        _: &'tx mut MdbxTransaction<'db, RW, E>,
+        _: &'tx mut RwTx,
         input: UnwindInput,
     ) -> anyhow::Result<UnwindOutput>
     where
@@ -568,7 +586,7 @@ fn main() -> anyhow::Result<()> {
                 // database setup
                 let erigon_db = if let Some(erigon_data_dir) = opt.erigon_data_dir {
                     let erigon_chain_data_dir = erigon_data_dir.join("chaindata");
-                    let erigon_db = martinez::kv::mdbx::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
+                    let erigon_db = martinez::kv::mdbx::Environment::<mdbx::NoWriteMap>::open_ro(
                         mdbx::Environment::new(),
                         &erigon_chain_data_dir,
                         martinez::kv::tables::CHAINDATA_TABLES.clone(),
@@ -588,18 +606,22 @@ fn main() -> anyhow::Result<()> {
                         .context("failed to create ETL temp dir")?,
                 );
                 let db = martinez::kv::new_database(&martinez_chain_data_dir)?;
-                {
-                    let span = span!(Level::INFO, "", " Genesis initialization ");
-                    let _g = span.enter();
-                    let txn = db.begin_mutable()?;
+                async {
+                    let txn = db.begin_mutable().await?;
                     if martinez::genesis::initialize_genesis(
                         &txn,
                         &*etl_temp_dir,
                         chain_config.chain_spec().clone(),
-                    )? {
-                        txn.commit()?;
+                    )
+                    .await?
+                    {
+                        txn.commit().await?;
                     }
+
+                    Ok::<_, anyhow::Error>(())
                 }
+                .instrument(span!(Level::INFO, "", " Genesis initialization "))
+                .await?;
 
                 let sentry_status_provider = SentryStatusProvider::new(chain_config.clone());
                 // staged sync setup

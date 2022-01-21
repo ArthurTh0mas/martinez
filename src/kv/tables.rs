@@ -25,7 +25,7 @@ where
     type Value = Vec<u8>;
     type SeekKey = Vec<u8>;
 
-    fn db_name(&self) -> string::String<Bytes> {
+    fn db_name(&self) -> string::String<StaticBytes> {
         self.0.db_name()
     }
 }

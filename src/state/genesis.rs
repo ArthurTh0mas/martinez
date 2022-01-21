@@ -1,9 +1,8 @@
 use crate::{
-    kv::{mdbx::MdbxTransaction, tables},
+    kv::{tables, traits::*},
     models::*,
     state::*,
 };
-use mdbx::{EnvironmentKind, RW};
 use tempfile::TempDir;
 
 #[derive(Clone, Debug)]
@@ -60,16 +59,16 @@ impl GenesisState {
     }
 }
 
-pub fn initialize_genesis<'db, E>(
-    txn: &MdbxTransaction<'db, RW, E>,
+pub async fn initialize_genesis<'db, Tx>(
+    txn: &Tx,
     etl_temp_dir: &TempDir,
     chainspec: ChainSpec,
 ) -> anyhow::Result<bool>
 where
-    E: EnvironmentKind,
+    Tx: MutableTransaction<'db>,
 {
     let genesis = chainspec.genesis.number;
-    if txn.get(tables::CanonicalHeader, genesis)?.is_some() {
+    if txn.get(tables::CanonicalHeader, genesis).await?.is_some() {
         return Ok(false);
     }
 
@@ -89,11 +88,11 @@ where
         }
     }
 
-    state_buffer.write_to_db()?;
+    state_buffer.write_to_db().await?;
 
-    crate::stages::promote_clean_accounts(txn, etl_temp_dir)?;
-    crate::stages::promote_clean_storage(txn, etl_temp_dir)?;
-    let state_root = crate::trie::regenerate_intermediate_hashes(txn, etl_temp_dir, None)?;
+    crate::stages::promote_clean_accounts(txn, etl_temp_dir).await?;
+    crate::stages::promote_clean_storage(txn, etl_temp_dir).await?;
+    let state_root = crate::trie::regenerate_intermediate_hashes(txn, etl_temp_dir, None).await?;
 
     let header = BlockHeader {
         parent_hash: H256::zero(),
@@ -116,14 +115,17 @@ where
     };
     let block_hash = header.hash();
 
-    txn.set(tables::Header, (genesis, block_hash), header.clone())?;
-    txn.set(tables::CanonicalHeader, genesis, block_hash)?;
-    txn.set(tables::HeaderNumber, block_hash, genesis)?;
+    txn.set(tables::Header, (genesis, block_hash), header.clone())
+        .await?;
+    txn.set(tables::CanonicalHeader, genesis, block_hash)
+        .await?;
+    txn.set(tables::HeaderNumber, block_hash, genesis).await?;
     txn.set(
         tables::HeadersTotalDifficulty,
         (genesis, block_hash),
         header.difficulty,
-    )?;
+    )
+    .await?;
 
     txn.set(
         tables::BlockBody,
@@ -133,14 +135,16 @@ where
             tx_amount: 0,
             uncles: vec![],
         },
-    )?;
+    )
+    .await?;
 
-    txn.set(tables::TotalGas, genesis, 0)?;
-    txn.set(tables::TotalTx, genesis, 0)?;
+    txn.set(tables::TotalGas, genesis, 0).await?;
+    txn.set(tables::TotalTx, genesis, 0).await?;
 
-    txn.set(tables::LastHeader, Default::default(), block_hash)?;
+    txn.set(tables::LastHeader, Default::default(), block_hash)
+        .await?;
 
-    txn.set(tables::Config, block_hash, chainspec)?;
+    txn.set(tables::Config, block_hash, chainspec).await?;
 
     Ok(true)
 }
@@ -173,17 +177,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn init_mainnet_genesis() {
+    #[tokio::test]
+    async fn init_mainnet_genesis() {
         let db = new_mem_database().unwrap();
-        let tx = db.begin_mutable().unwrap();
+        let tx = db.begin_mutable().await.unwrap();
 
         let temp_dir = TempDir::new().unwrap();
         assert!(
-            initialize_genesis(&tx, &temp_dir, crate::res::chainspec::MAINNET.clone()).unwrap()
+            initialize_genesis(&tx, &temp_dir, crate::res::chainspec::MAINNET.clone())
+                .await
+                .unwrap()
         );
 
-        let genesis_hash = tx.get(tables::CanonicalHeader, 0.into()).unwrap().unwrap();
+        let genesis_hash = tx
+            .get(tables::CanonicalHeader, 0.into())
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(
             genesis_hash,

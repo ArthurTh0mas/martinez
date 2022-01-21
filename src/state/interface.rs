@@ -1,31 +1,33 @@
 use crate::models::*;
+use async_trait::async_trait;
 use auto_impl::auto_impl;
 use bytes::Bytes;
 use std::fmt::Debug;
 
+#[async_trait]
 #[auto_impl(&mut, Box)]
 pub trait State: Debug + Send + Sync {
-    fn read_account(&self, address: Address) -> anyhow::Result<Option<Account>>;
+    async fn read_account(&self, address: Address) -> anyhow::Result<Option<Account>>;
 
-    fn read_code(&self, code_hash: H256) -> anyhow::Result<Bytes>;
+    async fn read_code(&self, code_hash: H256) -> anyhow::Result<Bytes>;
 
-    fn read_storage(&self, address: Address, location: U256) -> anyhow::Result<U256>;
+    async fn read_storage(&self, address: Address, location: U256) -> anyhow::Result<U256>;
 
-    fn erase_storage(&mut self, address: Address) -> anyhow::Result<()>;
+    async fn erase_storage(&mut self, address: Address) -> anyhow::Result<()>;
 
-    fn read_header(
+    async fn read_header(
         &self,
         block_number: BlockNumber,
         block_hash: H256,
     ) -> anyhow::Result<Option<BlockHeader>>;
 
-    fn read_body(
+    async fn read_body(
         &self,
         block_number: BlockNumber,
         block_hash: H256,
     ) -> anyhow::Result<Option<BlockBody>>;
 
-    fn total_difficulty(
+    async fn total_difficulty(
         &self,
         block_number: BlockNumber,
         block_hash: H256,
@@ -45,9 +47,9 @@ pub trait State: Debug + Send + Sync {
         current: Option<Account>,
     );
 
-    fn update_code(&mut self, code_hash: H256, code: Bytes) -> anyhow::Result<()>;
+    async fn update_code(&mut self, code_hash: H256, code: Bytes) -> anyhow::Result<()>;
 
-    fn update_storage(
+    async fn update_storage(
         &mut self,
         address: Address,
         location: U256,

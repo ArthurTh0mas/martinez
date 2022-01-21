@@ -6,7 +6,7 @@ pub(crate) struct PrefixSet(BTreeSet<Vec<u8>>);
 
 impl PrefixSet {
     pub(crate) fn new() -> Self {
-        Self(BTreeSet::new())
+        Self { 0: BTreeSet::new() }
     }
 
     pub(crate) fn contains(&mut self, prefix: &[u8]) -> bool {

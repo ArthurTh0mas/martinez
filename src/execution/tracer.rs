@@ -1,8 +1,6 @@
-use crate::{
-    execution::evm::{ExecutionState, OpCode, StatusCode},
-    models::*,
-};
+use crate::models::*;
 use bytes::Bytes;
+use evmodin::{ExecutionState, OpCode, StatusCode};
 use std::collections::{BTreeMap, HashMap};
 
 #[derive(Clone, Debug, PartialEq)]

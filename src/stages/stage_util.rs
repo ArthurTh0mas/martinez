@@ -1,11 +1,11 @@
 use crate::{
-    kv::{mdbx::*, tables},
+    kv::{tables, traits::*},
     models::*,
 };
 use anyhow::format_err;
 
-pub fn should_do_clean_promotion<'db, 'tx, K, E>(
-    tx: &'tx MdbxTransaction<'db, K, E>,
+pub async fn should_do_clean_promotion<'db, 'tx, Tx>(
+    tx: &'tx Tx,
     genesis: BlockNumber,
     past_progress: BlockNumber,
     max_block: BlockNumber,
@@ -13,14 +13,15 @@ pub fn should_do_clean_promotion<'db, 'tx, K, E>(
 ) -> anyhow::Result<bool>
 where
     'db: 'tx,
-    K: TransactionKind,
-    E: EnvironmentKind,
+    Tx: Transaction<'db>,
 {
     let current_gas = tx
-        .get(tables::TotalGas, past_progress)?
+        .get(tables::TotalGas, past_progress)
+        .await?
         .ok_or_else(|| format_err!("No cumulative index for block {}", past_progress))?;
     let max_gas = tx
-        .get(tables::TotalGas, max_block)?
+        .get(tables::TotalGas, max_block)
+        .await?
         .ok_or_else(|| format_err!("No cumulative index for block {}", max_block))?;
 
     let gas_progress = max_gas.checked_sub(current_gas).ok_or_else(|| {

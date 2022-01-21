@@ -1,9 +1,8 @@
-use martinez::{binutil::MartinezDataDir, kv::mdbx::*, models::*, stagedsync::stages::*};
+use martinez::{binutil::MartinezDataDir, kv::traits::*, models::*, stagedsync::stages::*};
 use async_trait::async_trait;
 use clap::Parser;
 use ethnum::U256;
 use jsonrpsee::{core::RpcResult, http_server::HttpServerBuilder, proc_macros::rpc};
-use mdbx::EnvironmentKind;
 use std::{future::pending, net::SocketAddr, sync::Arc};
 use tracing_subscriber::{prelude::*, EnvFilter};
 
@@ -25,30 +24,34 @@ pub trait EthApi {
     async fn get_balance(&self, address: Address, block_number: BlockNumber) -> RpcResult<U256>;
 }
 
-pub struct EthApiServerImpl<E>
+pub struct EthApiServerImpl<DB>
 where
-    E: EnvironmentKind,
+    DB: KV,
 {
-    db: Arc<MdbxEnvironment<E>>,
+    db: Arc<DB>,
 }
 
 #[async_trait]
-impl<E> EthApiServer for EthApiServerImpl<E>
+impl<DB> EthApiServer for EthApiServerImpl<DB>
 where
-    E: EnvironmentKind,
+    DB: KV,
 {
     async fn block_number(&self) -> RpcResult<BlockNumber> {
         Ok(FINISH
-            .get_progress(&self.db.begin()?)?
+            .get_progress(&self.db.begin().await?)
+            .await?
             .unwrap_or(BlockNumber(0)))
     }
 
     async fn get_balance(&self, address: Address, block_number: BlockNumber) -> RpcResult<U256> {
-        Ok(
-            martinez::accessors::state::account::read(&self.db.begin()?, address, Some(block_number))?
-                .map(|acc| acc.balance)
-                .unwrap_or(U256::ZERO),
+        Ok(martinez::accessors::state::account::read(
+            &self.db.begin().await?,
+            address,
+            Some(block_number),
         )
+        .await?
+        .map(|acc| acc.balance)
+        .unwrap_or(U256::ZERO))
     }
 }
 
@@ -69,13 +72,11 @@ async fn main() -> anyhow::Result<()> {
         .with(env_filter)
         .init();
 
-    let db = Arc::new(
-        martinez::kv::mdbx::MdbxEnvironment::<mdbx::NoWriteMap>::open_ro(
-            mdbx::Environment::new(),
-            &opt.datadir,
-            martinez::kv::tables::CHAINDATA_TABLES.clone(),
-        )?,
-    );
+    let db = Arc::new(martinez::kv::mdbx::Environment::<mdbx::NoWriteMap>::open_ro(
+        mdbx::Environment::new(),
+        &opt.datadir,
+        martinez::kv::tables::CHAINDATA_TABLES.clone(),
+    )?);
 
     let server = HttpServerBuilder::default().build(opt.listen_address)?;
     let _server_handle = server.start(EthApiServerImpl { db }.into_rpc())?;

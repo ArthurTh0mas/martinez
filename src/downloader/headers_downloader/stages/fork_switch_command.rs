@@ -1,5 +1,3 @@
-use mdbx::{EnvironmentKind, RW};
-
 use super::{
     headers::{
         header_slices,
@@ -7,7 +5,7 @@ use super::{
     },
     SaveStage,
 };
-use crate::{kv::mdbx::MdbxTransaction, models::BlockNumber};
+use crate::{kv::traits::MutableTransaction, models::BlockNumber};
 use std::{
     ops::{DerefMut, Range},
     sync::Arc,
@@ -46,12 +44,12 @@ impl ForkSwitchCommand {
         (status == HeaderSliceStatus::Verified) || (status == HeaderSliceStatus::Saved)
     }
 
-    pub fn execute<'tx, 'db: 'tx, E: EnvironmentKind>(
+    pub async fn execute<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>>(
         self,
-        tx: &'tx MdbxTransaction<'db, RW, E>,
+        tx: &'tx RwTx,
     ) -> anyhow::Result<()> {
         self.switch_to_fork();
-        self.update_canonical_chain_headers(tx)
+        self.update_canonical_chain_headers(tx).await
     }
 
     fn switch_to_fork(&self) {
@@ -109,9 +107,9 @@ impl ForkSwitchCommand {
         self.fork_header_slices.clear();
     }
 
-    fn update_canonical_chain_headers<'tx, 'db: 'tx, E: EnvironmentKind>(
+    async fn update_canonical_chain_headers<'tx, 'db: 'tx, RwTx: MutableTransaction<'db>>(
         &self,
-        tx: &'tx MdbxTransaction<'db, RW, E>,
+        tx: &'tx RwTx,
     ) -> anyhow::Result<()> {
         let mut num = self.fork_range.start;
         while num < self.fork_range.end {
@@ -133,7 +131,7 @@ impl ForkSwitchCommand {
                     if header.number() <= self.connection_block_num {
                         continue;
                     }
-                    SaveStage::update_canonical_chain_header(&header, tx)?;
+                    SaveStage::update_canonical_chain_header(&header, tx).await?;
                 }
             }
 

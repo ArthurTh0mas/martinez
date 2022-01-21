@@ -3,7 +3,7 @@ use crate::{
         sentry_status_provider::SentryStatusProvider, ui::ui_system::UISystem, HeadersDownloader,
         HeadersDownloaderRunState,
     },
-    kv::mdbx::*,
+    kv::traits::*,
     models::BlockNumber,
     sentry::{chain_config::ChainConfig, sentry_client_reactor::SentryClientReactorShared},
     stagedsync::{stage::*, stages::HEADERS},
@@ -53,9 +53,9 @@ impl HeaderDownload {
 }
 
 #[async_trait]
-impl<'db, E> Stage<'db, E> for HeaderDownload
+impl<'db, RwTx> Stage<'db, RwTx> for HeaderDownload
 where
-    E: EnvironmentKind,
+    RwTx: MutableTransaction<'db>,
 {
     fn id(&self) -> StageId {
         HEADERS
@@ -63,7 +63,7 @@ where
 
     async fn execute<'tx>(
         &mut self,
-        tx: &'tx mut MdbxTransaction<'db, RW, E>,
+        tx: &'tx mut RwTx,
         input: StageInput,
     ) -> anyhow::Result<ExecOutput>
     where
@@ -74,7 +74,7 @@ where
         // finalize unwind request
         if let Some(mut state) = self.load_previous_run_state().await {
             if let Some(unwind_request) = state.unwind_request.take() {
-                self.downloader.unwind_finalize(tx, unwind_request)?;
+                self.downloader.unwind_finalize(tx, unwind_request).await?;
                 self.save_run_state(state).await;
             }
         }
@@ -126,13 +126,13 @@ where
 
     async fn unwind<'tx>(
         &mut self,
-        tx: &'tx mut MdbxTransaction<'db, RW, E>,
-        input: UnwindInput,
+        tx: &'tx mut RwTx,
+        input: crate::stagedsync::stage::UnwindInput,
     ) -> anyhow::Result<UnwindOutput>
     where
         'db: 'tx,
     {
-        self.downloader.unwind(tx, input.unwind_to)?;
+        self.downloader.unwind(tx, input.unwind_to).await?;
 
         let stage_progress = BlockNumber(std::cmp::min(input.stage_progress.0, input.unwind_to.0));
         Ok(UnwindOutput { stage_progress })

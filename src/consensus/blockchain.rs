@@ -5,6 +5,7 @@ use crate::{
     state::*,
 };
 use anyhow::Context;
+use async_recursion::async_recursion;
 use std::{collections::HashMap, convert::TryFrom};
 
 #[derive(Debug)]
@@ -17,7 +18,7 @@ pub struct Blockchain<'state> {
 }
 
 impl<'state> Blockchain<'state> {
-    pub fn new(
+    pub async fn new(
         state: &'state mut InMemoryState,
         config: ChainSpec,
         genesis_block: Block,
@@ -28,9 +29,10 @@ impl<'state> Blockchain<'state> {
             config,
             genesis_block,
         )
+        .await
     }
 
-    pub fn new_with_consensus(
+    pub async fn new_with_consensus(
         state: &'state mut InMemoryState,
         engine: Box<dyn Consensus>,
         config: ChainSpec,
@@ -50,10 +52,17 @@ impl<'state> Blockchain<'state> {
         })
     }
 
-    pub fn insert_block(&mut self, block: Block, check_state_root: bool) -> anyhow::Result<()> {
+    pub async fn insert_block(
+        &mut self,
+        block: Block,
+        check_state_root: bool,
+    ) -> anyhow::Result<()> {
         self.engine
-            .validate_block_header(&block.header, &mut self.state, true)?;
-        self.engine.pre_validate_block(&block, &mut self.state)?;
+            .validate_block_header(&block.header, &mut self.state, true)
+            .await?;
+        self.engine
+            .pre_validate_block(&block, &mut self.state)
+            .await?;
 
         let hash = block.header.hash();
         if let Some(error) = self.bad_blocks.get(&hash) {
@@ -62,31 +71,37 @@ impl<'state> Blockchain<'state> {
 
         let b = BlockWithSenders::from(block.clone());
 
-        let ancestor = self.canonical_ancestor(&b.header, hash)?;
+        let ancestor = self.canonical_ancestor(&b.header, hash).await?;
 
         let current_canonical_block = self.state.current_canonical_block();
 
-        self.unwind_last_changes(ancestor, current_canonical_block)?;
+        self.unwind_last_changes(ancestor, current_canonical_block)
+            .await?;
 
         let block_number = b.header.number;
 
-        let mut chain = self.intermediate_chain(
-            BlockNumber(block_number.0 - 1),
-            b.header.parent_hash,
-            ancestor,
-        )?;
+        let mut chain = self
+            .intermediate_chain(
+                BlockNumber(block_number.0 - 1),
+                b.header.parent_hash,
+                ancestor,
+            )
+            .await?;
         chain.push(WithHash { inner: b, hash });
 
         let mut num_of_executed_chain_blocks = 0;
         for x in &chain {
             if let Err(e) = self
                 .execute_block(&x.inner, check_state_root)
+                .await
                 .with_context(|| format!("Failed to execute block #{}", block_number))
             {
                 if let Some(e) = e.downcast_ref::<ValidationError>() {
                     self.bad_blocks.insert(hash, e.clone());
-                    self.unwind_last_changes(ancestor, ancestor.0 + num_of_executed_chain_blocks)?;
-                    self.re_execute_canonical_chain(ancestor, current_canonical_block)?;
+                    self.unwind_last_changes(ancestor, ancestor.0 + num_of_executed_chain_blocks)
+                        .await?;
+                    self.re_execute_canonical_chain(ancestor, current_canonical_block)
+                        .await?;
                 }
 
                 return Err(e);
@@ -102,10 +117,17 @@ impl<'state> Blockchain<'state> {
             .total_difficulty(
                 current_canonical_block,
                 self.state.canonical_hash(current_canonical_block).unwrap(),
-            )?
+            )
+            .await?
             .unwrap();
 
-        if self.state.total_difficulty(block_number, hash)?.unwrap() > current_total_difficulty {
+        if self
+            .state
+            .total_difficulty(block_number, hash)
+            .await?
+            .unwrap()
+            > current_total_difficulty
+        {
             // canonize the new chain
             for i in (ancestor + 1..=current_canonical_block).rev() {
                 self.state.decanonize_block(i);
@@ -115,14 +137,16 @@ impl<'state> Blockchain<'state> {
                 self.state.canonize_block(x.header.number, x.hash);
             }
         } else {
-            self.unwind_last_changes(ancestor, ancestor + num_of_executed_chain_blocks)?;
-            self.re_execute_canonical_chain(ancestor, current_canonical_block)?;
+            self.unwind_last_changes(ancestor, ancestor + num_of_executed_chain_blocks)
+                .await?;
+            self.re_execute_canonical_chain(ancestor, current_canonical_block)
+                .await?;
         }
 
         Ok(())
     }
 
-    fn execute_block(
+    async fn execute_block(
         &mut self,
         block: &BlockWithSenders,
         check_state_root: bool,
@@ -145,7 +169,7 @@ impl<'state> Blockchain<'state> {
             &block_spec,
         );
 
-        let _ = processor.execute_and_write_block()?;
+        let _ = processor.execute_and_write_block().await?;
 
         if check_state_root {
             let state_root = self.state.state_root_hash();
@@ -162,7 +186,7 @@ impl<'state> Blockchain<'state> {
         Ok(())
     }
 
-    fn re_execute_canonical_chain(
+    async fn re_execute_canonical_chain(
         &mut self,
         ancestor: impl Into<BlockNumber>,
         tip: impl Into<BlockNumber>,
@@ -176,7 +200,7 @@ impl<'state> Blockchain<'state> {
                 .state
                 .read_body_with_senders(block_number, hash)?
                 .unwrap();
-            let header = self.state.read_header(block_number, hash)?.unwrap();
+            let header = self.state.read_header(block_number, hash).await?.unwrap();
 
             let block = BlockWithSenders {
                 header: header.into(),
@@ -184,13 +208,13 @@ impl<'state> Blockchain<'state> {
                 ommers: body.ommers,
             };
 
-            let _ = self.execute_block(&block, false).unwrap();
+            let _ = self.execute_block(&block, false).await.unwrap();
         }
 
         Ok(())
     }
 
-    fn unwind_last_changes(
+    async fn unwind_last_changes(
         &mut self,
         ancestor: impl Into<BlockNumber>,
         tip: impl Into<BlockNumber>,
@@ -205,7 +229,7 @@ impl<'state> Blockchain<'state> {
         Ok(())
     }
 
-    fn intermediate_chain(
+    async fn intermediate_chain(
         &self,
         block_number: impl Into<BlockNumber>,
         mut hash: H256,
@@ -220,7 +244,12 @@ impl<'state> Blockchain<'state> {
                 .state
                 .read_body_with_senders(block_number, hash)?
                 .unwrap();
-            let header = self.state.read_header(block_number, hash)?.unwrap().into();
+            let header = self
+                .state
+                .read_header(block_number, hash)
+                .await?
+                .unwrap()
+                .into();
 
             let block = WithHash {
                 inner: BlockWithSenders {
@@ -241,7 +270,8 @@ impl<'state> Blockchain<'state> {
         Ok(chain)
     }
 
-    fn canonical_ancestor(
+    #[async_recursion]
+    async fn canonical_ancestor(
         &self,
         header: &PartialHeader,
         hash: H256,
@@ -253,8 +283,10 @@ impl<'state> Blockchain<'state> {
         }
         let parent = self
             .state
-            .read_header(BlockNumber(header.number.0 - 1), header.parent_hash)?
+            .read_header(BlockNumber(header.number.0 - 1), header.parent_hash)
+            .await?
             .ok_or(ValidationError::UnknownParent)?;
         self.canonical_ancestor(&parent.into(), header.parent_hash)
+            .await
     }
 }

@@ -1,14 +1,13 @@
 use crate::{
-    kv::{mdbx::MdbxTransaction, tables, traits::*},
+    kv::{tables, traits::*},
     models::*,
 };
-use mdbx::{EnvironmentKind, TransactionKind};
 
 pub mod account {
     use super::*;
 
-    pub fn read<K: TransactionKind, E: EnvironmentKind>(
-        tx: &MdbxTransaction<'_, K, E>,
+    pub async fn read<'db, Tx: Transaction<'db>>(
+        tx: &Tx,
         address_to_find: Address,
         block_number: Option<BlockNumber>,
     ) -> anyhow::Result<Option<Account>> {
@@ -18,10 +17,14 @@ pub mod account {
                 tables::AccountHistory,
                 address_to_find,
                 block_number,
-            )? {
+            )
+            .await?
+            {
                 if let Some(tables::AccountChange { address, account }) = tx
-                    .cursor(tables::AccountChangeSet)?
-                    .seek_both_range(block_number, address_to_find)?
+                    .cursor_dup_sort(tables::AccountChangeSet)
+                    .await?
+                    .seek_both_range(block_number, address_to_find)
+                    .await?
                 {
                     if address == address_to_find {
                         return Ok(account);
@@ -30,7 +33,7 @@ pub mod account {
             }
         }
 
-        tx.get(tables::Account, address_to_find)
+        tx.get(tables::Account, address_to_find).await
     }
 }
 
@@ -38,8 +41,8 @@ pub mod storage {
     use super::*;
     use crate::u256_to_h256;
 
-    pub fn read<K: TransactionKind, E: EnvironmentKind>(
-        tx: &MdbxTransaction<'_, K, E>,
+    pub async fn read<'db, Tx: Transaction<'db>>(
+        tx: &Tx,
         address: Address,
         location_to_find: U256,
         block_number: Option<BlockNumber>,
@@ -51,15 +54,20 @@ pub mod storage {
                 tables::StorageHistory,
                 (address, location_to_find),
                 block_number,
-            )? {
-                if let Some(tables::StorageChange { location, value }) =
-                    tx.cursor(tables::StorageChangeSet)?.seek_both_range(
+            )
+            .await?
+            {
+                if let Some(tables::StorageChange { location, value }) = tx
+                    .cursor_dup_sort(tables::StorageChangeSet)
+                    .await?
+                    .seek_both_range(
                         tables::StorageChangeKey {
                             block_number,
                             address,
                         },
                         location_to_find,
-                    )?
+                    )
+                    .await?
                 {
                     if location == location_to_find {
                         return Ok(value);
@@ -68,22 +76,19 @@ pub mod storage {
             }
         }
 
-        Ok(tx
-            .cursor(tables::Storage)?
-            .seek_both_range(address, location_to_find)?
-            .filter(|&(l, _)| l == location_to_find)
-            .map(|(_, v)| v)
-            .unwrap_or(U256::ZERO))
+        Ok(crate::read_account_storage(tx, address, location_to_find)
+            .await?
+            .unwrap_or_default())
     }
 }
 
 pub mod history_index {
     use super::*;
-    use crate::kv::{mdbx::MdbxTransaction, tables::BitmapKey};
+    use crate::kv::tables::BitmapKey;
     use croaring::Treemap as RoaringTreemap;
 
-    pub fn find_next_block<'db: 'tx, 'tx, K, TK, E, H>(
-        tx: &'tx MdbxTransaction<'db, TK, E>,
+    pub async fn find_next_block<'db: 'tx, 'tx, Tx: Transaction<'db>, K, H>(
+        tx: &'tx Tx,
         table: H,
         needle: K,
         block_number: BlockNumber,
@@ -92,14 +97,15 @@ pub mod history_index {
         H: Table<Key = BitmapKey<K>, Value = RoaringTreemap, SeekKey = BitmapKey<K>>,
         BitmapKey<K>: TableObject,
         K: Copy + PartialEq,
-        TK: TransactionKind,
-        E: EnvironmentKind,
     {
-        let mut ch = tx.cursor(table)?;
-        if let Some((index_key, change_blocks)) = ch.seek(BitmapKey {
-            inner: needle,
-            block_number,
-        })? {
+        let mut ch = tx.cursor(table).await?;
+        if let Some((index_key, change_blocks)) = ch
+            .seek(BitmapKey {
+                inner: needle,
+                block_number,
+            })
+            .await?
+        {
             if index_key.inner == needle {
                 return Ok(change_blocks
                     .iter()
@@ -121,10 +127,10 @@ pub mod tests {
     };
     use hex_literal::hex;
 
-    #[test]
-    fn read_storage() {
+    #[tokio::test]
+    async fn read_storage() {
         let db = new_mem_database().unwrap();
-        let txn = db.begin_mutable().unwrap();
+        let txn = db.begin_mutable().await.unwrap();
 
         let address = hex!("b000000000000000000000000000000000000008").into();
 
@@ -140,24 +146,38 @@ pub mod tests {
             "4400000000000000000000000000000000000000000000000000000000000000"
         )));
 
-        txn.set(tables::Storage, address, (loc1, val1)).unwrap();
-        txn.set(tables::Storage, address, (loc2, val2)).unwrap();
-        txn.set(tables::Storage, address, (loc3, val3)).unwrap();
+        txn.set(tables::Storage, address, (loc1, val1))
+            .await
+            .unwrap();
+        txn.set(tables::Storage, address, (loc2, val2))
+            .await
+            .unwrap();
+        txn.set(tables::Storage, address, (loc3, val3))
+            .await
+            .unwrap();
 
         assert_eq!(
-            super::storage::read(&txn, address, h256_to_u256(loc1), None).unwrap(),
+            super::storage::read(&txn, address, h256_to_u256(loc1), None)
+                .await
+                .unwrap(),
             val1
         );
         assert_eq!(
-            super::storage::read(&txn, address, h256_to_u256(loc2), None).unwrap(),
+            super::storage::read(&txn, address, h256_to_u256(loc2), None)
+                .await
+                .unwrap(),
             val2
         );
         assert_eq!(
-            super::storage::read(&txn, address, h256_to_u256(loc3), None).unwrap(),
+            super::storage::read(&txn, address, h256_to_u256(loc3), None)
+                .await
+                .unwrap(),
             val3
         );
         assert_eq!(
-            super::storage::read(&txn, address, h256_to_u256(loc4), None).unwrap(),
+            super::storage::read(&txn, address, h256_to_u256(loc4), None)
+                .await
+                .unwrap(),
             0.as_u256()
         );
     }
