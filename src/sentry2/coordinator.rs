@@ -6,45 +6,26 @@ use crate::{
 use async_trait::async_trait;
 use ethereum_interfaces::sentry as grpc_sentry;
 use futures_util::{FutureExt, StreamExt};
-use std::{pin::Pin, sync::Arc};
+use std::{collections::HashSet, pin::Pin, sync::Arc};
 use tokio::sync::RwLock as AsyncMutex;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, instrument, warn};
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct HeadData {
+pub struct Status {
     pub height: u64,
     pub hash: H256,
-    pub td: u128,
+    pub total_difficulty: H256,
 }
 
-impl HeadData {
-    pub fn new(height: u64, hash: H256, td: u128) -> Self {
-        Self { height, hash, td }
+impl From<Status> for grpc_sentry::StatusData {
+    fn from(_status: Status) -> Self {
+        todo!();
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Status {
-    pub network_id: u64,
-    pub total_difficulty: Option<H256>,
-    pub hash: Option<H256>,
-    pub config: ChainConfig,
-    pub block_number: BlockNumber,
+pub struct HeaderDownloader {
+    pub bad_headers: Arc<AsyncMutex<HashSet<H256>>>,
 }
-
-// impl From<Status> for grpc_sentry::StatusData {
-//     fn from(status: Status) -> Self {
-//         grpc_sentry::StatusData {
-//             network_id: status.network_id,
-//             total_difficulty: status.total_difficulty,
-//             best_hash: status.hash,
-//             fork_data: None,
-//             max_block: status.block_number,
-//         }
-//     }
-// }
-
-pub struct HeaderDownloader {}
 
 pub struct BodyDownaloder {}
 
@@ -55,7 +36,7 @@ pub struct Coordinator {
     pub sentries: Vec<SentryClient>,
     pub header_downloader: Arc<HeaderDownloader>,
     pub body_downloader: Arc<BodyDownaloder>,
-    pub head_data: Arc<AsyncMutex<HeadData>>,
+    pub status: Arc<AsyncMutex<Status>>,
     pub chain_config: Option<ChainConfig>,
     pub forks: Vec<u64>,
     pub genesis_hash: H256,
@@ -66,7 +47,7 @@ impl Coordinator {
     pub fn new(
         sentries: Vec<SentryClient>,
         header_downloader: Arc<HeaderDownloader>,
-        head_data: Arc<AsyncMutex<HeadData>>,
+        status: Arc<AsyncMutex<Status>>,
         _chain_config: Option<ChainConfig>,
         forks: Vec<u64>,
         genesis_hash: H256,
@@ -76,11 +57,11 @@ impl Coordinator {
             sentries,
             header_downloader,
             body_downloader: Arc::new(BodyDownaloder {}),
-            head_data,
             chain_config: None,
             forks,
             genesis_hash,
             network_id,
+            status,
         }
     }
 }
@@ -94,41 +75,13 @@ pub type SentryInboundStream = futures_util::stream::Map<
 #[allow(unreachable_code)]
 impl SentryCoordinator for Coordinator {
     async fn set_status(&mut self) -> anyhow::Result<()> {
-        let mainnet_config = crate::sentry::chain_config::ChainsConfig::new()
-            .unwrap()
-            .get("mainnet")
-            .unwrap();
+        let status_data: grpc_sentry::StatusData = (*self.status.read().await).into();
+        let mut futs = Vec::new();
+        for sentry in self.sentries.iter_mut() {
+            futs.push(sentry.set_status(status_data.clone()))
+        }
+        futures_util::future::join_all(futs).await;
 
-        let forks = mainnet_config
-            .fork_block_numbers()
-            .into_iter()
-            .map(|n| n.0)
-            .collect::<Vec<u64>>();
-
-        let status_data = grpc_sentry::StatusData {
-            network_id: 1,
-            total_difficulty: Some(
-                H256::from_slice(
-                    mainnet_config
-                        .chain_spec()
-                        .genesis
-                        .seal
-                        .difficulty()
-                        .to_be_bytes()
-                        .as_ref(),
-                )
-                .into(),
-            ),
-            best_hash: Some(mainnet_config.genesis_block_hash().into()),
-            fork_data: Some(grpc_sentry::Forks {
-                genesis: Some(mainnet_config.genesis_block_hash().into()),
-                forks,
-            }),
-            max_block: 0,
-        };
-
-        let mut sentry = self.sentries[0].clone();
-        sentry.set_status(status_data).await?;
         Ok(())
     }
     async fn send_body_request(&mut self, req: BodyRequest) -> anyhow::Result<()> {
@@ -206,14 +159,39 @@ impl SentryCoordinator for Coordinator {
 
     async fn update_head(
         &mut self,
-        _height: u64,
-        _hash: H256,
-        _total_difficultyy: u128,
+        height: u64,
+        hash: H256,
+        total_difficultyy: H256,
     ) -> anyhow::Result<()> {
+        let status = Status {
+            height,
+            hash,
+            total_difficulty: total_difficultyy,
+        };
+        self.status.write().await.clone_from(&status);
+        self.set_status().await?;
+
         Ok(())
     }
 
-    async fn penalize(&mut self, _penalties: Vec<Penalty>) -> anyhow::Result<()> {
+    async fn penalize(&mut self, penalties: Vec<Penalty>) -> anyhow::Result<()> {
+        let sentry_penalize = async move |mut s: SentryClient,
+                                          penalty: Penalty|
+                    -> Result<tonic::Response<()>, tonic::Status> {
+            s.penalize_peer(grpc_sentry::PenalizePeerRequest {
+                peer_id: Some(penalty.peer_id),
+                penalty: 0,
+            })
+            .await
+        };
+
+        let mut futures = Vec::new();
+        self.sentries.iter().for_each(|s| {
+            penalties.iter().for_each(|p| {
+                futures.push(sentry_penalize(s.clone(), p.clone()));
+            });
+        });
+        futures_util::future::join_all(futures).await;
         Ok(())
     }
 
@@ -228,7 +206,6 @@ impl SentryCoordinator for Coordinator {
                               req: grpc_sentry::OutboundMessageData|
                     -> anyhow::Result<()> {
             s.hand_shake(tonic::Request::new(())).await?;
-            info!("Handshake with sentry node");
             match filter {
                 PeerFilter::All => s.send_message_to_all(req).boxed(),
                 PeerFilter::PeerId(peer_id) => s
@@ -283,19 +260,16 @@ impl SentryCoordinator for Coordinator {
         Ok(peer_count)
     }
 }
-
-async fn recv_sentry(s: &SentryClient, msg_ids: Vec<i32>) -> SingleSentryStream {
+async fn recv_sentry(s: &SentryClient, ids: Vec<i32>) -> SingleSentryStream {
     let mut s = s.clone();
     s.hand_shake(tonic::Request::new(())).await.unwrap();
     debug!("Handshake with sentry {:?} done", s);
 
     poll_sentry_stream(
-        s.messages(grpc_sentry::MessagesRequest {
-            ids: msg_ids.clone(),
-        })
-        .await
-        .unwrap()
-        .into_inner(),
+        s.messages(grpc_sentry::MessagesRequest { ids })
+            .await
+            .unwrap()
+            .into_inner(),
     )
 }
 
@@ -338,76 +312,10 @@ pub trait SentryCoordinator: Send + Sync {
         &mut self,
         height: u64,
         hash: H256,
-        total_difficulty: u128,
+        total_difficulty: H256,
     ) -> anyhow::Result<()>;
     async fn penalize(&mut self, penalties: Vec<Penalty>) -> anyhow::Result<()>;
     async fn send_message(&mut self, message: Message, predicate: PeerFilter)
         -> anyhow::Result<()>;
     async fn peer_count(&mut self) -> anyhow::Result<u64>;
-}
-
-mod tests {
-    #[test]
-    fn it_works() {
-        use std::time::Duration;
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        use super::*;
-        rt.block_on(async move {
-            tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::TRACE)
-                .init();
-            let mut coordinator = Coordinator::new(
-                vec![
-                    grpc_sentry::sentry_client::SentryClient::connect("http://127.0.0.1:9999")
-                        .await
-                        .unwrap(),
-                ],
-                Arc::new(HeaderDownloader {}),
-                Arc::new(AsyncMutex::new(HeadData::new(0, H256::default(), 0))),
-                None,
-                vec![],
-                H256::default(),
-                0,
-            );
-            // let msg_ids = vec![
-            //     grpc_sentry::MessageId::from(MessageId::BlockHeaders) as i32,
-            //     grpc_sentry::MessageId::from(MessageId::BlockBodies) as i32,
-            //     grpc_sentry::MessageId::from(MessageId::NewBlockHashes) as i32,
-            //     grpc_sentry::MessageId::from(MessageId::NewBlock) as i32,
-            //     grpc_sentry::MessageId::from(MessageId::NewPooledTransactionHashes) as i32,
-            // ];
-
-            info!("Sending header request");
-            coordinator.set_status().await.unwrap();
-            let mut coordinator2 = coordinator.clone();
-            tokio::task::spawn(async move {
-                loop {
-                    coordinator2
-                        .send_message(
-                            Message::GetBlockHeaders(GetBlockHeaders {
-                                request_id: 0,
-                                params: GetBlockHeadersParams {
-                                    start: BlockId::Number(BlockNumber(0)),
-                                    limit: 100,
-                                    skip: 0,
-                                    reverse: 0,
-                                },
-                            }),
-                            PeerFilter::All,
-                        )
-                        .await
-                        .unwrap();
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            });
-
-            let mut stream = coordinator.recv_headers().await.unwrap();
-            while let Some(msg) = stream.next().await {
-                let _ = msg;
-            }
-        });
-    }
 }
