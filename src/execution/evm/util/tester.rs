@@ -27,9 +27,9 @@ fn exec(
     let code = AnalyzedCode::analyze(&code);
 
     if collect_traces {
-        code.execute(host, &mut StdoutTracer::default(), None, message, revision)
+        code.execute(host, &mut StdoutTracer::default(), message, revision)
     } else {
-        code.execute(host, &mut NoopTracer, None, message, revision)
+        code.execute(host, &mut NoopTracer, message, revision)
     }
 }
 

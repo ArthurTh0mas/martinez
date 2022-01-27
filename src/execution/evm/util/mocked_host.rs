@@ -121,12 +121,12 @@ impl Records {
 }
 
 impl Host for MockedHost {
-    fn account_exists(&self, address: ethereum_types::Address) -> bool {
+    fn account_exists(&mut self, address: ethereum_types::Address) -> bool {
         self.recorded.lock().record_account_access(address);
         self.accounts.contains_key(&address)
     }
 
-    fn get_storage(&self, address: ethereum_types::Address, key: U256) -> U256 {
+    fn get_storage(&mut self, address: ethereum_types::Address, key: U256) -> U256 {
         self.recorded.lock().record_account_access(address);
 
         self.accounts
@@ -180,7 +180,7 @@ impl Host for MockedHost {
         status
     }
 
-    fn get_balance(&self, address: ethereum_types::Address) -> ethnum::U256 {
+    fn get_balance(&mut self, address: ethereum_types::Address) -> ethnum::U256 {
         self.recorded.lock().record_account_access(address);
 
         self.accounts
@@ -189,7 +189,7 @@ impl Host for MockedHost {
             .unwrap_or(U256::ZERO)
     }
 
-    fn get_code_size(&self, address: ethereum_types::Address) -> ethnum::U256 {
+    fn get_code_size(&mut self, address: ethereum_types::Address) -> ethnum::U256 {
         self.recorded.lock().record_account_access(address);
 
         self.accounts
@@ -198,7 +198,7 @@ impl Host for MockedHost {
             .unwrap_or(U256::ZERO)
     }
 
-    fn get_code_hash(&self, address: ethereum_types::Address) -> U256 {
+    fn get_code_hash(&mut self, address: ethereum_types::Address) -> U256 {
         self.recorded.lock().record_account_access(address);
 
         self.accounts
@@ -207,7 +207,7 @@ impl Host for MockedHost {
             .unwrap_or(U256::ZERO)
     }
 
-    fn copy_code(&self, address: Address, code_offset: usize, buffer: &mut [u8]) -> usize {
+    fn copy_code(&mut self, address: Address, code_offset: usize, buffer: &mut [u8]) -> usize {
         self.recorded.lock().record_account_access(address);
 
         self.accounts
@@ -242,34 +242,35 @@ impl Host for MockedHost {
         });
     }
 
-    fn call(&mut self, msg: &InterpreterMessage) -> Output {
+    fn call(&mut self, msg: Call) -> Output {
         let mut r = self.recorded.lock();
 
+        let msg = InterpreterMessage::from(msg);
         r.record_account_access(msg.recipient);
 
         if r.calls.len() < MAX_RECORDED_CALLS {
             r.calls.push(msg.clone());
             let call_msg = msg;
             if !call_msg.input_data.is_empty() {
-                r.call_inputs.push(call_msg.input_data.clone());
+                r.call_inputs.push(call_msg.input_data);
             }
         }
         self.call_result.clone()
     }
 
-    fn get_tx_context(&self) -> TxContext {
+    fn get_tx_context(&mut self) -> TxContext {
         self.tx_context.clone()
     }
 
-    fn get_block_hash(&self, block_number: u64) -> U256 {
+    fn get_block_hash(&mut self, block_number: u64) -> U256 {
         self.recorded.lock().blockhashes.push(block_number);
         self.block_hash
     }
 
-    fn emit_log(&mut self, address: ethereum_types::Address, data: &[u8], topics: &[U256]) {
+    fn emit_log(&mut self, address: ethereum_types::Address, data: Bytes, topics: &[U256]) {
         self.recorded.lock().logs.push(LogRecord {
             creator: address,
-            data: data.to_vec().into(),
+            data,
             topics: topics.to_vec(),
         });
     }

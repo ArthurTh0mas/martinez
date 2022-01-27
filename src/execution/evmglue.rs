@@ -1,15 +1,14 @@
 use super::{
     address::*,
     analysis_cache::AnalysisCache,
+    evm::tracing::NoopTracer,
     precompiled,
     tracer::{CodeKind, MessageKind, Tracer},
 };
 use crate::{
     chain::protocol_param::{fee, param},
     execution::evm::{
-        continuation::{interrupt::*, interrupt_data::*, resume_data::*},
-        host::*,
-        AnalyzedCode, CallKind, CreateMessage, InterpreterMessage, Output, StatusCode,
+        host::*, AnalyzedCode, CallKind, CreateMessage, InterpreterMessage, Output, StatusCode,
     },
     h256_to_u256,
     models::*,
@@ -342,291 +341,12 @@ where
             &a
         };
 
-        let mut interrupt = analysis
-            .execute_resumable(false, msg, self.block_spec.revision)
-            .resume(());
+        let analysis = analysis.clone();
+        let revision = self.block_spec.revision;
 
-        let output = loop {
-            interrupt = match interrupt {
-                Interrupt::InstructionStart { .. } => unreachable!("tracing is disabled"),
-                Interrupt::AccountExists { interrupt, address } => {
-                    let exists = if self.block_spec.revision >= Revision::Spurious {
-                        !self.state.is_dead(address)?
-                    } else {
-                        self.state.exists(address)?
-                    };
-                    interrupt.resume(AccountExistsStatus { exists })
-                }
-                Interrupt::GetBalance { interrupt, address } => {
-                    let balance = self.state.get_balance(address)?;
-                    interrupt.resume(Balance { balance })
-                }
-                Interrupt::GetCodeSize { interrupt, address } => {
-                    let code_size =
-                        u64::try_from(self.state.get_code(address)?.map(|c| c.len()).unwrap_or(0))?
-                            .into();
-                    interrupt.resume(CodeSize { code_size })
-                }
-                Interrupt::GetStorage {
-                    interrupt,
-                    address,
-                    location,
-                } => {
-                    let value = self.state.get_current_storage(address, location)?;
-                    interrupt.resume(StorageValue { value })
-                }
-                Interrupt::SetStorage {
-                    interrupt,
-                    address,
-                    location,
-                    value: new_val,
-                } => {
-                    let current_val = self.state.get_current_storage(address, location)?;
+        let mut host = EvmHost { inner: self };
 
-                    let status = if current_val == new_val {
-                        StorageStatus::Unchanged
-                    } else {
-                        self.state.set_storage(address, location, new_val)?;
-
-                        let eip1283 = self.block_spec.revision >= Revision::Istanbul
-                            || self.block_spec.revision == Revision::Constantinople;
-
-                        if !eip1283 {
-                            if current_val == 0 {
-                                StorageStatus::Added
-                            } else if new_val == 0 {
-                                self.state.add_refund(fee::R_SCLEAR);
-                                StorageStatus::Deleted
-                            } else {
-                                StorageStatus::Modified
-                            }
-                        } else {
-                            let sload_cost = {
-                                if self.block_spec.revision >= Revision::Berlin {
-                                    fee::WARM_STORAGE_READ_COST
-                                } else if self.block_spec.revision >= Revision::Istanbul {
-                                    fee::G_SLOAD_ISTANBUL
-                                } else {
-                                    fee::G_SLOAD_TANGERINE_WHISTLE
-                                }
-                            };
-
-                            let mut sstore_reset_gas = fee::G_SRESET;
-                            if self.block_spec.revision >= Revision::Berlin {
-                                sstore_reset_gas -= fee::COLD_SLOAD_COST;
-                            }
-
-                            // https://eips.ethereum.org/EIPS/eip-1283
-                            let original_val =
-                                self.state.get_original_storage(address, location)?;
-
-                            // https://eips.ethereum.org/EIPS/eip-3529
-                            let sstore_clears_refund =
-                                if self.block_spec.revision >= Revision::London {
-                                    sstore_reset_gas + fee::ACCESS_LIST_STORAGE_KEY_COST
-                                } else {
-                                    fee::R_SCLEAR
-                                };
-
-                            if original_val == current_val {
-                                if original_val == 0 {
-                                    StorageStatus::Added
-                                } else {
-                                    if new_val == 0 {
-                                        self.state.add_refund(sstore_clears_refund);
-                                    }
-                                    StorageStatus::Modified
-                                }
-                            } else {
-                                if original_val != 0 {
-                                    if current_val == 0 {
-                                        self.state.subtract_refund(sstore_clears_refund);
-                                    }
-                                    if new_val == 0 {
-                                        self.state.add_refund(sstore_clears_refund);
-                                    }
-                                }
-                                if original_val == new_val {
-                                    let refund = {
-                                        if original_val == 0 {
-                                            fee::G_SSET - sload_cost
-                                        } else {
-                                            sstore_reset_gas - sload_cost
-                                        }
-                                    };
-
-                                    self.state.add_refund(refund);
-                                }
-                                StorageStatus::ModifiedAgain
-                            }
-                        }
-                    };
-
-                    interrupt.resume(StorageStatusInfo { status })
-                }
-                Interrupt::GetCodeHash { interrupt, address } => {
-                    let hash = h256_to_u256({
-                        if self.state.is_dead(address)? {
-                            H256::zero()
-                        } else {
-                            self.state.get_code_hash(address)?
-                        }
-                    });
-                    interrupt.resume(CodeHash { hash })
-                }
-                Interrupt::CopyCode {
-                    interrupt,
-                    address,
-                    offset,
-                    max_size,
-                } => {
-                    let mut buffer = vec![0; max_size];
-
-                    let code = self.state.get_code(address)?.unwrap_or_default();
-
-                    let mut copied = 0;
-                    if offset < code.len() {
-                        copied = min(max_size, code.len() - offset);
-                        buffer[..copied].copy_from_slice(&code[offset..offset + copied]);
-                    }
-
-                    buffer.truncate(copied);
-                    let code = buffer.into();
-
-                    interrupt.resume(Code { code })
-                }
-                Interrupt::Selfdestruct {
-                    interrupt,
-                    address,
-                    beneficiary,
-                } => {
-                    self.state.record_selfdestruct(address);
-                    let balance = self.state.get_balance(address)?;
-                    self.state.add_to_balance(beneficiary, balance)?;
-                    self.state.set_balance(address, 0)?;
-
-                    if let Some(tracer) = &mut self.tracer {
-                        tracer.capture_self_destruct(address, beneficiary);
-                    }
-
-                    interrupt.resume(())
-                }
-                Interrupt::Call {
-                    interrupt,
-                    call_data,
-                } => {
-                    let output = match call_data {
-                        Call::Create(message) => {
-                            let mut res = self.create(message)?;
-
-                            // https://eips.ethereum.org/EIPS/eip-211
-                            if res.status_code != StatusCode::Revert {
-                                // geth returns CREATE output only in case of REVERT
-                                res.output_data = Default::default();
-                            }
-
-                            res
-                        }
-                        Call::Call(message) => self.call(message)?,
-                    };
-
-                    interrupt.resume(CallOutput { output })
-                }
-                Interrupt::GetTxContext { interrupt } => {
-                    let base_fee_per_gas = self.header.base_fee_per_gas.unwrap_or(U256::ZERO);
-                    let tx_gas_price = self.txn.effective_gas_price(base_fee_per_gas);
-                    let tx_origin = self.txn.sender;
-                    let block_coinbase = self.beneficiary;
-                    let block_number = self.header.number.0;
-                    let block_timestamp = self.header.timestamp;
-                    let block_gas_limit = self.header.gas_limit;
-                    let block_difficulty = self.header.difficulty;
-                    let chain_id = self.block_spec.params.chain_id.0.into();
-                    let block_base_fee = base_fee_per_gas;
-
-                    let context = TxContext {
-                        tx_gas_price,
-                        tx_origin,
-                        block_coinbase,
-                        block_number,
-                        block_timestamp,
-                        block_gas_limit,
-                        block_difficulty,
-                        chain_id,
-                        block_base_fee,
-                    };
-
-                    interrupt.resume(TxContextData { context })
-                }
-                Interrupt::GetBlockHash {
-                    interrupt,
-                    block_number,
-                } => {
-                    let base_number = self.header.number;
-                    let distance = base_number.0 - block_number;
-                    assert!(distance <= 256);
-
-                    let mut hash = self.header.parent_hash;
-
-                    for i in 1..distance {
-                        hash = self
-                            .state
-                            .db()
-                            .read_header(BlockNumber(base_number.0 - i), hash)?
-                            .context("no header")?
-                            .parent_hash;
-                    }
-
-                    let hash = h256_to_u256(hash);
-                    interrupt.resume(BlockHash { hash })
-                }
-                Interrupt::EmitLog {
-                    interrupt,
-                    address,
-                    topics,
-                    data,
-                } => {
-                    self.state.add_log(Log {
-                        address,
-                        topics: topics.into_iter().map(u256_to_h256).collect(),
-                        data,
-                    });
-
-                    interrupt.resume(())
-                }
-                Interrupt::AccessAccount { interrupt, address } => {
-                    let status = if self.is_precompiled(address) {
-                        AccessStatus::Warm
-                    } else {
-                        self.state.access_account(address)
-                    };
-                    interrupt.resume(AccessAccountStatus { status })
-                }
-                Interrupt::AccessStorage {
-                    interrupt,
-                    address,
-                    location,
-                } => {
-                    let status = self.state.access_storage(address, location);
-                    interrupt.resume(AccessStorageStatus { status })
-                }
-                Interrupt::Complete { result, .. } => {
-                    let output = match result {
-                        Ok(output) => output.into(),
-                        Err(status_code) => Output {
-                            status_code,
-                            gas_left: 0,
-                            output_data: bytes::Bytes::new(),
-                            create_address: None,
-                        },
-                    };
-
-                    break output;
-                }
-            };
-        };
-
-        Ok(output)
+        Ok(analysis.execute(&mut host, &mut NoopTracer, msg, revision))
     }
 
     fn number_of_precompiles(&self) -> u8 {
@@ -651,6 +371,266 @@ where
             max_precompiled.0[ADDRESS_LENGTH - 1] = self.number_of_precompiles() as u8;
             contract <= max_precompiled
         }
+    }
+}
+
+struct EvmHost<'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, 'a, B>
+where
+    B: State,
+{
+    inner: &'a mut Evm<'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, B>,
+}
+
+impl<'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, 'a, B: State> Host
+    for EvmHost<'r, 'state, 'tracer, 'analysis, 'h, 'c, 't, 'a, B>
+{
+    fn account_exists(&mut self, address: Address) -> bool {
+        if self.inner.block_spec.revision >= Revision::Spurious {
+            !self.inner.state.is_dead(address).unwrap()
+        } else {
+            self.inner.state.exists(address).unwrap()
+        }
+    }
+
+    fn get_storage(&mut self, address: Address, location: U256) -> U256 {
+        self.inner
+            .state
+            .get_current_storage(address, location)
+            .unwrap()
+    }
+
+    fn set_storage(&mut self, address: Address, location: U256, new_val: U256) -> StorageStatus {
+        let current_val = self
+            .inner
+            .state
+            .get_current_storage(address, location)
+            .unwrap();
+
+        if current_val == new_val {
+            StorageStatus::Unchanged
+        } else {
+            self.inner
+                .state
+                .set_storage(address, location, new_val)
+                .unwrap();
+
+            let eip1283 = self.inner.block_spec.revision >= Revision::Istanbul
+                || self.inner.block_spec.revision == Revision::Constantinople;
+
+            if !eip1283 {
+                if current_val == 0 {
+                    StorageStatus::Added
+                } else if new_val == 0 {
+                    self.inner.state.add_refund(fee::R_SCLEAR);
+                    StorageStatus::Deleted
+                } else {
+                    StorageStatus::Modified
+                }
+            } else {
+                let sload_cost = {
+                    if self.inner.block_spec.revision >= Revision::Berlin {
+                        fee::WARM_STORAGE_READ_COST
+                    } else if self.inner.block_spec.revision >= Revision::Istanbul {
+                        fee::G_SLOAD_ISTANBUL
+                    } else {
+                        fee::G_SLOAD_TANGERINE_WHISTLE
+                    }
+                };
+
+                let mut sstore_reset_gas = fee::G_SRESET;
+                if self.inner.block_spec.revision >= Revision::Berlin {
+                    sstore_reset_gas -= fee::COLD_SLOAD_COST;
+                }
+
+                // https://eips.ethereum.org/EIPS/eip-1283
+                let original_val = self
+                    .inner
+                    .state
+                    .get_original_storage(address, location)
+                    .unwrap();
+
+                // https://eips.ethereum.org/EIPS/eip-3529
+                let sstore_clears_refund = if self.inner.block_spec.revision >= Revision::London {
+                    sstore_reset_gas + fee::ACCESS_LIST_STORAGE_KEY_COST
+                } else {
+                    fee::R_SCLEAR
+                };
+
+                if original_val == current_val {
+                    if original_val == 0 {
+                        StorageStatus::Added
+                    } else {
+                        if new_val == 0 {
+                            self.inner.state.add_refund(sstore_clears_refund);
+                        }
+                        StorageStatus::Modified
+                    }
+                } else {
+                    if original_val != 0 {
+                        if current_val == 0 {
+                            self.inner.state.subtract_refund(sstore_clears_refund);
+                        }
+                        if new_val == 0 {
+                            self.inner.state.add_refund(sstore_clears_refund);
+                        }
+                    }
+                    if original_val == new_val {
+                        let refund = {
+                            if original_val == 0 {
+                                fee::G_SSET - sload_cost
+                            } else {
+                                sstore_reset_gas - sload_cost
+                            }
+                        };
+
+                        self.inner.state.add_refund(refund);
+                    }
+                    StorageStatus::ModifiedAgain
+                }
+            }
+        }
+    }
+
+    fn get_balance(&mut self, address: Address) -> U256 {
+        self.inner.state.get_balance(address).unwrap()
+    }
+
+    fn get_code_size(&mut self, address: Address) -> U256 {
+        u64::try_from(
+            self.inner
+                .state
+                .get_code(address)
+                .unwrap()
+                .map(|c| c.len())
+                .unwrap_or(0),
+        )
+        .unwrap()
+        .into()
+    }
+
+    fn get_code_hash(&mut self, address: Address) -> U256 {
+        h256_to_u256({
+            if self.inner.state.is_dead(address).unwrap() {
+                H256::zero()
+            } else {
+                self.inner.state.get_code_hash(address).unwrap()
+            }
+        })
+    }
+
+    fn copy_code(&mut self, address: Address, offset: usize, buffer: &mut [u8]) -> usize {
+        let code = self
+            .inner
+            .state
+            .get_code(address)
+            .unwrap()
+            .unwrap_or_default();
+
+        let mut copied = 0;
+        if offset < code.len() {
+            copied = min(buffer.len(), code.len() - offset);
+            buffer[..copied].copy_from_slice(&code[offset..offset + copied]);
+        }
+
+        copied
+    }
+
+    fn selfdestruct(&mut self, address: Address, beneficiary: Address) {
+        self.inner.state.record_selfdestruct(address);
+        let balance = self.inner.state.get_balance(address).unwrap();
+        self.inner
+            .state
+            .add_to_balance(beneficiary, balance)
+            .unwrap();
+        self.inner.state.set_balance(address, 0).unwrap();
+
+        // if let Some(tracer) = &mut self.tracer {
+        //     tracer.capture_self_destruct(address, beneficiary);
+        // }
+    }
+
+    fn call(&mut self, msg: Call) -> Output {
+        match msg {
+            Call::Create(message) => {
+                let mut res = self.inner.create(message).unwrap();
+
+                // https://eips.ethereum.org/EIPS/eip-211
+                if res.status_code != StatusCode::Revert {
+                    // geth returns CREATE output only in case of REVERT
+                    res.output_data = Default::default();
+                }
+
+                res
+            }
+            Call::Call(message) => self.inner.call(message).unwrap(),
+        }
+    }
+
+    fn get_tx_context(&mut self) -> TxContext {
+        let base_fee_per_gas = self.inner.header.base_fee_per_gas.unwrap_or(U256::ZERO);
+        let tx_gas_price = self.inner.txn.effective_gas_price(base_fee_per_gas);
+        let tx_origin = self.inner.txn.sender;
+        let block_coinbase = self.inner.beneficiary;
+        let block_number = self.inner.header.number.0;
+        let block_timestamp = self.inner.header.timestamp;
+        let block_gas_limit = self.inner.header.gas_limit;
+        let block_difficulty = self.inner.header.difficulty;
+        let chain_id = self.inner.block_spec.params.chain_id.0.into();
+        let block_base_fee = base_fee_per_gas;
+
+        TxContext {
+            tx_gas_price,
+            tx_origin,
+            block_coinbase,
+            block_number,
+            block_timestamp,
+            block_gas_limit,
+            block_difficulty,
+            chain_id,
+            block_base_fee,
+        }
+    }
+
+    fn get_block_hash(&mut self, block_number: u64) -> U256 {
+        let base_number = self.inner.header.number;
+        let distance = base_number.0 - block_number;
+        assert!(distance <= 256);
+
+        let mut hash = self.inner.header.parent_hash;
+
+        for i in 1..distance {
+            hash = self
+                .inner
+                .state
+                .db()
+                .read_header(BlockNumber(base_number.0 - i), hash)
+                .unwrap()
+                .context("no header")
+                .unwrap()
+                .parent_hash;
+        }
+
+        h256_to_u256(hash)
+    }
+
+    fn emit_log(&mut self, address: Address, data: Bytes, topics: &[U256]) {
+        self.inner.state.add_log(Log {
+            address,
+            topics: topics.iter().copied().map(u256_to_h256).collect(),
+            data,
+        });
+    }
+
+    fn access_account(&mut self, address: Address) -> AccessStatus {
+        if self.inner.is_precompiled(address) {
+            AccessStatus::Warm
+        } else {
+            self.inner.state.access_account(address)
+        }
+    }
+
+    fn access_storage(&mut self, address: Address, location: U256) -> AccessStatus {
+        self.inner.state.access_storage(address, location)
     }
 }
 

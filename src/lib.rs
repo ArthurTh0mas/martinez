@@ -1,19 +1,13 @@
 #![feature(
     bool_to_option,
-    destructuring_assignment,
-    entry_insert,
     generator_trait,
     generators,
-    generic_associated_types,
     let_else,
     map_first_last,
     never_type,
     step_trait,
     type_alias_impl_trait,
-    integer_atomics,
-    async_closure,
-    const_try,
-    let_chains
+    adt_const_params
 )]
 #![recursion_limit = "256"]
 #![allow(
@@ -32,14 +26,12 @@ pub mod chain;
 pub mod consensus;
 pub mod crypto;
 pub mod downloader;
-mod downloader2;
 pub mod etl;
 pub mod execution;
 pub mod kv;
 pub mod models;
 pub mod res;
 pub mod sentry;
-pub mod sentry2;
 pub mod stagedsync;
 pub mod stages;
 mod state;

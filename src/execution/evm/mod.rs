@@ -11,7 +11,6 @@ pub use state::{ExecutionState, Stack};
 pub const MAX_CODE_SIZE: usize = 0x6000;
 
 mod common;
-pub mod continuation;
 pub mod host;
 #[macro_use]
 pub mod instructions;

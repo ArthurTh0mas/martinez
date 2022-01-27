@@ -227,12 +227,11 @@ pub(crate) fn codecopy(state: &mut ExecutionState, code: &[u8]) -> Result<(), St
 #[doc(hidden)]
 #[macro_export]
 macro_rules! extcodecopy {
-    ($state:expr,$rev:expr) => {
+    ($state:expr, $host:expr, $rev:expr) => {
         use core::cmp::min;
         use $crate::{
             execution::evm::{
                 common::*,
-                continuation::{interrupt_data::*, resume_data::*},
                 host::*,
                 instructions::{memory::*, properties::*},
             },
@@ -256,13 +255,7 @@ macro_rules! extcodecopy {
         }
 
         if $rev >= Revision::Berlin {
-            if ResumeData::into_access_account_status({
-                yield InterruptData::AccessAccount { address: addr }
-            })
-            .unwrap()
-            .status
-                == AccessStatus::Cold
-            {
+            if $host.access_account(addr) == AccessStatus::Cold {
                 $state.gas_left -= i64::from(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST);
                 if $state.gas_left < 0 {
                     return Err(StatusCode::OutOfGas);
@@ -273,15 +266,10 @@ macro_rules! extcodecopy {
         if let Some(region) = region {
             let src = min(U256::from(MAX_BUFFER_SIZE), input_index).as_usize();
 
-            let code = ResumeData::into_code({
-                yield InterruptData::CopyCode {
-                    address: addr,
-                    offset: src,
-                    max_size: region.size.get(),
-                }
-            })
-            .unwrap()
-            .code;
+            let mut code = vec![0; region.size.get()];
+            let copied = $host.copy_code(addr, src, &mut code[..]);
+            debug_assert!(copied <= code.len());
+            code.truncate(copied);
 
             $state.memory[region.offset..region.offset + code.len()].copy_from_slice(&code);
             if region.size.get() > code.len() {
@@ -331,27 +319,16 @@ pub(crate) fn returndatacopy(state: &mut ExecutionState) -> Result<(), StatusCod
 #[doc(hidden)]
 #[macro_export]
 macro_rules! extcodehash {
-    ($state:expr,$rev:expr) => {
+    ($state:expr,$host:expr,$rev:expr) => {
         use $crate::{
-            execution::evm::{
-                common::*,
-                continuation::{interrupt_data::*, resume_data::*},
-                host::*,
-                instructions::properties::*,
-            },
+            execution::evm::{common::*, host::*, instructions::properties::*},
             models::*,
         };
 
         let addr = u256_to_address($state.stack.pop());
 
         if $rev >= Revision::Berlin {
-            if ResumeData::into_access_account_status({
-                yield InterruptData::AccessAccount { address: addr }
-            })
-            .unwrap()
-            .status
-                == AccessStatus::Cold
-            {
+            if $host.access_account(addr) == AccessStatus::Cold {
                 $state.gas_left -= i64::from(ADDITIONAL_COLD_ACCOUNT_ACCESS_COST);
                 if $state.gas_left < 0 {
                     return Err(StatusCode::OutOfGas);
@@ -359,10 +336,6 @@ macro_rules! extcodehash {
             }
         }
 
-        let code_hash =
-            ResumeData::into_code_hash({ yield InterruptData::GetCodeHash { address: addr } })
-                .unwrap()
-                .hash;
-        $state.stack.push(code_hash);
+        $state.stack.push($host.get_code_hash(addr));
     };
 }

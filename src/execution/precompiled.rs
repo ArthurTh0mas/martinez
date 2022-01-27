@@ -1,7 +1,6 @@
 use crate::{chain::protocol_param::param, crypto::*, models::*, util::*};
 use arrayref::array_ref;
 use bytes::{Buf, Bytes};
-use evmodin::Revision;
 use num_bigint::BigUint;
 use num_traits::Zero;
 use ripemd::*;
@@ -15,7 +14,6 @@ use std::{
     cmp::min,
     convert::TryFrom,
     io::{repeat, Read},
-    mem::size_of,
 };
 use substrate_bn::*;
 
@@ -441,7 +439,7 @@ fn blake2_f_run(input: Bytes) -> Option<Bytes> {
 
     crate::crypto::blake2::compress(&mut h, m, [t_0, t_1], f, rounds as usize);
 
-    let mut output_buf = [0u8; 8 * size_of::<u64>()];
+    let mut output_buf = [0u8; u64::BITS as usize];
     for (i, state_word) in h.iter().enumerate() {
         output_buf[i * 8..(i + 1) * 8].copy_from_slice(&state_word.to_le_bytes());
     }
