@@ -3,10 +3,9 @@ use super::{
     common::{InterpreterMessage, *},
     instructions::{control::*, stack_manip::*, *},
     state::*,
-    tracing::Tracer,
     *,
 };
-use crate::models::*;
+use crate::{execution::tracer::Tracer, models::*};
 use ethnum::U256;
 use std::sync::Arc;
 
@@ -120,19 +119,19 @@ impl AnalyzedCode {
     }
 
     /// Execute analyzed EVM bytecode using provided `Host` context.
-    pub fn execute<H: Host, T: Tracer>(
+    pub fn execute<H, T>(
         self,
         host: &mut H,
         tracer: &mut T,
         message: InterpreterMessage,
         revision: Revision,
-    ) -> Output {
-        if !T::DUMMY {
-            tracer.notify_execution_start(revision, message.clone(), self.code.clone());
-        }
-
+    ) -> Output
+    where
+        H: Host,
+        T: Tracer + ?Sized,
+    {
         let state = ExecutionState::new(message);
-        let f = match (!T::DUMMY, revision) {
+        let f = match (tracer.trace_instructions(), revision) {
             (true, Revision::Frontier) => execute_message::<H, T, true, { Revision::Frontier }>,
             (true, Revision::Homestead) => execute_message::<H, T, true, { Revision::Homestead }>,
             (true, Revision::Tangerine) => execute_message::<H, T, true, { Revision::Tangerine }>,
@@ -173,21 +172,23 @@ impl AnalyzedCode {
             },
         };
 
-        if !T::DUMMY {
-            tracer.notify_execution_end(&output);
-        }
+        tracer.capture_end(&output);
 
         output
     }
 }
 
 #[allow(clippy::needless_borrow)]
-fn execute_message<H: Host, T: Tracer, const TRACE: bool, const REVISION: Revision>(
+fn execute_message<H, T, const TRACE: bool, const REVISION: Revision>(
     s: AnalyzedCode,
     mut state: ExecutionState,
     host: &mut H,
     tracer: &mut T,
-) -> Result<SuccessfulOutput, StatusCode> {
+) -> Result<SuccessfulOutput, StatusCode>
+where
+    H: Host,
+    T: Tracer + ?Sized,
+{
     let instruction_table = get_instruction_table(REVISION);
 
     let mut reverted = false;
@@ -197,10 +198,20 @@ fn execute_message<H: Host, T: Tracer, const TRACE: bool, const REVISION: Revisi
     loop {
         let op = OpCode(s.padded_code[pc]);
 
+        let metrics = instruction_table[op.to_usize()]
+            .as_ref()
+            .ok_or(StatusCode::UndefinedInstruction)?;
+
         if TRACE {
             // Do not print stop on the final STOP
             if pc < s.code.len() {
-                tracer.notify_instruction_start(pc, op, &state);
+                tracer.capture_state(
+                    &state,
+                    pc,
+                    op,
+                    metrics.gas_cost as u64,
+                    state.message.depth as u16,
+                );
             }
         }
 

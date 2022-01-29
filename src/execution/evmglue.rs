@@ -1,14 +1,16 @@
 use super::{
     address::*,
     analysis_cache::AnalysisCache,
-    evm::tracing::NoopTracer,
     precompiled,
     tracer::{CodeKind, MessageKind, Tracer},
 };
 use crate::{
     chain::protocol_param::{fee, param},
-    execution::evm::{
-        host::*, AnalyzedCode, CallKind, CreateMessage, InterpreterMessage, Output, StatusCode,
+    execution::{
+        evm::{
+            host::*, AnalyzedCode, CallKind, CreateMessage, InterpreterMessage, Output, StatusCode,
+        },
+        tracer::NoopTracer,
     },
     h256_to_u256,
     models::*,
@@ -41,10 +43,10 @@ where
     beneficiary: Address,
 }
 
-pub fn execute<B: State>(
-    state: &mut IntraBlockState<'_, B>,
-    tracer: Option<&mut dyn Tracer>,
-    analysis_cache: &mut AnalysisCache,
+pub fn execute<'db, 'tracer, 'analysis, B: State>(
+    state: &mut IntraBlockState<'db, B>,
+    tracer: Option<&'tracer mut dyn Tracer>,
+    analysis_cache: &'analysis mut AnalysisCache,
     header: &PartialHeader,
     block_spec: &BlockExecutionSpec,
     txn: &MessageWithSender,
@@ -346,7 +348,11 @@ where
 
         let mut host = EvmHost { inner: self };
 
-        Ok(analysis.execute(&mut host, &mut NoopTracer, msg, revision))
+        Ok(if let Some(tracer) = self.tracer {
+            analysis.execute(&mut host, tracer, msg, revision)
+        } else {
+            analysis.execute(&mut host, &mut NoopTracer, msg, revision)
+        })
     }
 
     fn number_of_precompiles(&self) -> u8 {

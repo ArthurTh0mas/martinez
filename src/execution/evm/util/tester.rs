@@ -1,8 +1,10 @@
 use crate::{
-    execution::evm::{
-        tracing::*,
-        util::{mocked_host::*, *},
-        *,
+    execution::{
+        evm::{
+            util::{mocked_host::*, *},
+            *,
+        },
+        tracer::{NoopTracer, StdoutTracer},
     },
     models::*,
 };

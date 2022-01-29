@@ -17,7 +17,6 @@ pub mod instructions;
 mod interpreter;
 pub mod opcode;
 mod state;
-pub mod tracing;
 pub mod util;
 
 #[cfg(test)]
